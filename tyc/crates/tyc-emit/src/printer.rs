@@ -1281,20 +1281,32 @@ impl Emitter {
                     self.emit_expr(&c.func);
                 }
                 self.write("(");
-                let mut first = true;
-                for arg in c.arguments.args.iter() {
-                    if !first {
-                        self.write(", ");
+                // A generator that is the call's only argument takes the
+                // call's own parentheses (`sum(x for x in xs)`); doubling
+                // them is legal but trips `ruff check` (UP034).
+                if let ([Expr::Generator(g)], true) =
+                    (&c.arguments.args[..], c.arguments.keywords.is_empty())
+                {
+                    self.emit_expr(&g.elt);
+                    for gen in &g.generators {
+                        self.emit_comprehension(gen);
                     }
-                    self.emit_expr(arg);
-                    first = false;
-                }
-                for kw in c.arguments.keywords.iter() {
-                    if !first {
-                        self.write(", ");
+                } else {
+                    let mut first = true;
+                    for arg in c.arguments.args.iter() {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.emit_expr(arg);
+                        first = false;
                     }
-                    self.emit_keyword(kw);
-                    first = false;
+                    for kw in c.arguments.keywords.iter() {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.emit_keyword(kw);
+                        first = false;
+                    }
                 }
                 self.write(")");
             }

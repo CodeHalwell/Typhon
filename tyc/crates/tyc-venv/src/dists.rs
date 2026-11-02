@@ -111,7 +111,10 @@ const KNOWN_DIST_IMPORTS: &[(&str, &[&str])] = &[
     ("python-pptx", &["pptx"]),
     ("python-telegram-bot", &["telegram"]),
     ("pyusb", &["usb"]),
-    ("pywin32", &["win32api", "win32con", "win32com", "pywintypes"]),
+    (
+        "pywin32",
+        &["win32api", "win32con", "win32com", "pywintypes"],
+    ),
     ("pyyaml", &["yaml"]),
     ("pyzmq", &["zmq"]),
     ("ruamel-yaml", &["ruamel"]),
@@ -127,7 +130,15 @@ const KNOWN_DIST_IMPORTS: &[(&str, &[&str])] = &[
 /// different package: `pydantic-ai-slim` installs `pydantic_ai`,
 /// `psycopg-binary` installs into `psycopg`, `opencv-python-headless` …
 const VARIANT_SUFFIXES: &[&str] = &[
-    "-slim", "-core", "-lite", "-binary", "-headless", "-cpu", "-gpu", "-api", "-sdk",
+    "-slim",
+    "-core",
+    "-lite",
+    "-binary",
+    "-headless",
+    "-cpu",
+    "-gpu",
+    "-api",
+    "-sdk",
 ];
 
 /// Distribution prefixes that are namespace packages: every
@@ -325,8 +336,7 @@ fn installed_dists(site: &Path) -> Vec<InstalledDist> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Some(target) = text.lines().next().map(str::trim).filter(|l| !l.is_empty())
-            else {
+            let Some(target) = text.lines().next().map(str::trim).filter(|l| !l.is_empty()) else {
                 continue;
             };
             let target = PathBuf::from(target);
@@ -390,7 +400,8 @@ fn dir_has_python(dir: &Path) -> bool {
     };
     entries.flatten().any(|e| {
         let p = e.path();
-        p.extension().is_some_and(|x| x == "py" || x == "pyi" || x == "so" || x == "pyd")
+        p.extension()
+            .is_some_and(|x| x == "py" || x == "pyi" || x == "so" || x == "pyd")
             || (p.is_dir() && dir_has_python(&p))
     })
 }
@@ -417,12 +428,18 @@ fn roots_from_pth(site: &Path, pth: &Path) -> Vec<String> {
                 .next()
                 .unwrap_or("");
             if module.starts_with("__editable__") {
-                out.extend(roots_from_editable_finder(&site.join(format!("{module}.py"))));
+                out.extend(roots_from_editable_finder(
+                    &site.join(format!("{module}.py")),
+                ));
             }
             continue;
         }
         let dir = PathBuf::from(line);
-        let dir = if dir.is_absolute() { dir } else { site.join(dir) };
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            site.join(dir)
+        };
         out.extend(modules_in_dir(&dir));
     }
     out
@@ -436,7 +453,8 @@ fn roots_from_editable_finder(path: &Path) -> Vec<String> {
         return out;
     };
     for marker in ["MAPPING", "NAMESPACES"] {
-        let Some(start) = text.find(&format!("{marker}: dict"))
+        let Some(start) = text
+            .find(&format!("{marker}: dict"))
             .or_else(|| text.find(&format!("{marker} =")))
         else {
             continue;
@@ -524,7 +542,9 @@ fn roots_of(dist: &InstalledDist) -> Vec<String> {
             let mut parts = rel.split('/');
             let head = parts.next().unwrap_or("");
             let nested = parts.next().is_some();
-            if head.ends_with(".dist-info") || head.ends_with(".egg-info") || head.ends_with(".data")
+            if head.ends_with(".dist-info")
+                || head.ends_with(".egg-info")
+                || head.ends_with(".data")
             {
                 continue;
             }
@@ -568,9 +588,14 @@ fn roots_of(dist: &InstalledDist) -> Vec<String> {
     // 3. Stub-only distributions: `foo-stubs/` provides types for `foo`.
     out = out
         .into_iter()
-        .map(|r| match r.strip_suffix("-stubs").or_else(|| r.strip_suffix("_stubs")) {
-            Some(base) => base.to_owned(),
-            None => r,
+        .map(|r| {
+            match r
+                .strip_suffix("-stubs")
+                .or_else(|| r.strip_suffix("_stubs"))
+            {
+                Some(base) => base.to_owned(),
+                None => r,
+            }
         })
         .collect();
     out.sort();
@@ -643,11 +668,17 @@ mod tests {
 
     #[test]
     fn dependency_name_strips_extras_markers_and_specifiers() {
-        assert_eq!(dependency_name("pydantic-ai-slim[anthropic]"), "pydantic-ai-slim");
+        assert_eq!(
+            dependency_name("pydantic-ai-slim[anthropic]"),
+            "pydantic-ai-slim"
+        );
         assert_eq!(dependency_name("requests>=2,<3"), "requests");
         assert_eq!(dependency_name("pkg @ git+https://x/y"), "pkg");
         assert_eq!(dependency_name("tomli; python_version < '3.11'"), "tomli");
-        assert_eq!(pep503_normalise("Pydantic_AI.Slim[logfire]"), "pydantic-ai-slim");
+        assert_eq!(
+            pep503_normalise("Pydantic_AI.Slim[logfire]"),
+            "pydantic-ai-slim"
+        );
     }
 
     #[test]
@@ -714,7 +745,10 @@ mod tests {
             ["google-cloud-storage", "ujson", "types-requests"],
         );
         for want in ["google", "ujson", "requests"] {
-            assert!(roots.contains(&want.to_owned()), "{want} missing: {roots:?}");
+            assert!(
+                roots.contains(&want.to_owned()),
+                "{want} missing: {roots:?}"
+            );
         }
     }
 

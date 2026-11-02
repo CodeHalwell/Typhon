@@ -5,7 +5,7 @@
 //! Writes `.py` files into the output directory, mirroring the source tree.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use miette::{miette, Result};
@@ -91,27 +91,44 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
-    // A single `.ty` file is not a project root — without this guard the
-    // path gets joined with `src/` and the user sees the baffling
-    // "source directory 'foo.ty/src' does not exist".
-    if args.path.is_file() {
-        return Err(miette!(
-            "tyc build expects a project directory (with typhon.toml), not a \
-             single file. Run `tyc run --compile {}` to build-and-execute the \
-             file via a throwaway scaffold, `tyc run {}` for the in-process \
-             VM, or `tyc init` to start a project.",
-            args.path.display(),
-            args.path.display()
-        ));
-    }
-    let invocation_path = args
-        .path
-        .canonicalize()
-        .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
+    // A single `.ty` file is not a project root. Inside a project it names
+    // one file to build (`tyc build tests/test_app.ty`); outside one there
+    // is nothing to anchor it to — without this guard the path got joined
+    // with `src/` and the user saw "source directory 'foo.ty/src' does not
+    // exist".
+    let single_file: Option<PathBuf> = if args.path.is_file() {
+        let file = args
+            .path
+            .canonicalize()
+            .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
+        let in_project = file
+            .parent()
+            .is_some_and(|dir| matches!(TyphonConfig::load(dir), Ok(Some(_))));
+        if file.extension().is_none_or(|e| e != "ty") || !in_project {
+            return Err(miette!(
+                "tyc build expects a project directory (with typhon.toml), or a \
+                 `.ty` file inside one. Run `tyc run --compile {}` to \
+                 build-and-execute the file via a throwaway scaffold, `tyc run {}` \
+                 for the in-process VM, or `tyc init` to start a project.",
+                args.path.display(),
+                args.path.display()
+            ));
+        }
+        Some(file)
+    } else {
+        None
+    };
+    let invocation_path = match &single_file {
+        Some(file) => file.parent().map(Path::to_path_buf).unwrap_or_default(),
+        None => args
+            .path
+            .canonicalize()
+            .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?,
+    };
 
     // Load typhon.toml, anchoring src/out to the directory that contains it
     // so that `tyc build` works correctly when invoked from a subdirectory.
-    let (project_root, config) = match TyphonConfig::load(&invocation_path) {
+    let (project_root, mut config) = match TyphonConfig::load(&invocation_path) {
         Ok(Some((toml_path, cfg))) => {
             let dir = toml_path
                 .parent()
@@ -192,6 +209,45 @@ pub fn run(args: BuildArgs) -> Result<()> {
     };
 
     let config_dir = project_root.clone();
+
+    // A path inside the project that is neither the project root nor inside
+    // the source tree — `tyc build tests/` — names a separate compilation
+    // unit. It used to be ignored: the walk-up found `typhon.toml` and the
+    // build silently recompiled `src/` instead. Now that directory (or the
+    // single file) is compiled on its own, type-checked against the
+    // project's modules, into `<out>/<path>` (or `--out`). The project's own
+    // build output and `pyproject.toml` are left alone.
+    let project_src_dir = config_dir.join(&config.project.src);
+    let project_out_dir = config_dir.join(&config.project.out);
+    let unit_rel: Option<PathBuf> = {
+        let canon_root = config_dir
+            .canonicalize()
+            .unwrap_or_else(|_| config_dir.clone());
+        let canon_src = project_src_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_src_dir.clone());
+        if invocation_path == canon_root || invocation_path.starts_with(&canon_src) {
+            None
+        } else {
+            invocation_path
+                .strip_prefix(&canon_root)
+                .ok()
+                .map(Path::to_path_buf)
+        }
+    };
+    if let Some(rel) = &unit_rel {
+        let canon_out = project_out_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_out_dir.clone());
+        if invocation_path.starts_with(&canon_out) {
+            return Err(miette!(
+                "'{}' is inside the build output directory; pass the project \
+                 directory or a source directory such as `tests/`",
+                args.path.display()
+            ));
+        }
+        config.project.src = rel.to_string_lossy().into_owned();
+    }
     let src_dir = config_dir.join(&config.project.src);
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
@@ -209,7 +265,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 config_dir.join(out)
             }
         }
-        None => config_dir.join(&config.project.out),
+        None => match &unit_rel {
+            Some(rel) => project_out_dir.join(rel),
+            None => project_out_dir.clone(),
+        },
     };
     // Where artifacts must land. For a repo-controlled `out`, that is the
     // project root: a `build/` symlink planted in git would otherwise
@@ -248,6 +307,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let check_mode = args.check;
     // Counter for `would write …` lines so the final summary is honest.
     let mut would_write_count: usize = 0;
+    // Every file this build writes, for the stale-output sweep at the end.
+    let mut written_outputs: Vec<PathBuf> = Vec::new();
 
     // Fail fast if any required env vars are missing (declared in [env] required).
     for var in &config.env.required {
@@ -271,7 +332,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // emits an `__init__.py` and is run as a module (`python -m pkg.main`),
     // so its modules keep their relative imports; a flat root does not.
     let src_root_is_package = src_dir.join("__init__.ty").exists();
-    let ty_files = collect_ty_files(&src_dir)?;
+    let mut ty_files = collect_ty_files(&src_dir)?;
+    if let Some(file) = &single_file {
+        ty_files.retain(|p| p.canonicalize().is_ok_and(|c| &c == file));
+    }
 
     if ty_files.is_empty() {
         // Build *progress* goes to stderr, as every compiler's does: the
@@ -356,7 +420,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
     // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
     // check mode and reported like every other write.
-    if args.check {
+    if unit_rel.is_some() {
+        // The manifest describes the whole project, and its dependencies
+        // (pydantic for `model`, say) are derived from `src/`. A partial
+        // build must not rewrite it from a partial view.
+    } else if args.check {
         eprintln!(
             "would update {}",
             display_relative(&config_dir.join("pyproject.toml"), &config_dir)
@@ -418,6 +486,32 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let (shapes, facts) = extract_shapes_and_facts_for_path(&path.to_string_lossy(), source);
         project_shapes.insert(dotted.clone(), shapes);
         project_facts.insert(dotted, facts);
+    }
+    // Building a separate unit (`tyc build tests/`): its modules import the
+    // project's, so seed the project's shapes (`.dty` first, then `.ty`)
+    // under their own dotted names — exactly as a whole-project build sees
+    // them — so cross-module calls stay checked.
+    if unit_rel.is_some() {
+        let project_src_root = Path::new(&project_src_dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("src")
+            .to_owned();
+        let mut project_files: Vec<PathBuf> =
+            crate::commands::util::collect_dty_files(&project_src_dir).unwrap_or_default();
+        project_files.extend(collect_ty_files(&project_src_dir).unwrap_or_default());
+        for file in project_files {
+            let dotted = crate::commands::util::path_to_dotted(&file, &project_src_root);
+            if project_shapes.contains_key(&dotted) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let (shapes, facts) =
+                    extract_shapes_and_facts_for_path(&file.to_string_lossy(), &text);
+                project_shapes.insert(dotted.clone(), shapes);
+                project_facts.insert(dotted, facts);
+            }
+        }
     }
     // Aggregate `pub *` package facades into their __init__ shape so a
     // downstream `from <pkg> import X` resolves through the facade.
@@ -1333,6 +1427,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // `line_offsets` must stay keyed to the buffer we actually write.
         // The formatting step below can reflow lines, so it re-keys this.
         let mut line_offsets = emitted_line_offsets;
+        // The injected `from typhon_runtime import Ok, Err, Result` names all
+        // three whenever any is used; drop the ones the module never
+        // mentions so the output passes `ruff check` (F401). Edits one line
+        // in place, so the source map is unaffected.
+        python_src = prune_unused_runtime_names(&python_src);
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -1368,6 +1467,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             line_offsets =
                 remap_line_offsets_through_format(&line_offsets, &python_src, &result.output);
             python_src = result.output;
+            // Then sort the import block (compiler-injected imports land
+            // ahead of the user's, unsorted) so the artifact passes a
+            // `ruff check` with isort enabled. Same re-keying as above.
+            let out_hint = path
+                .strip_prefix(&src_dir)
+                .map(|rel| out_dir.join(rel).with_extension("py"))
+                .unwrap_or_else(|_| path.with_extension("py"));
+            if let Some(sorted) = tyc_format::sort_imports(&python_src, &out_hint.to_string_lossy())
+            {
+                if sorted != python_src && tyc_syntax::parse_module(&sorted).is_ok() {
+                    line_offsets =
+                        remap_line_offsets_through_format(&line_offsets, &python_src, &sorted);
+                    python_src = sorted;
+                }
+            }
         }
 
         // Post-emit parse gate.
@@ -1436,6 +1550,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
             tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
+            written_outputs.push(out_file.clone());
         }
 
         // Emit a v2 `.py.map` sidecar under `<out>/.sourcemaps/<rel>.py.map`.
@@ -1491,6 +1606,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             confine_output_path(&confine_root, confine_label, &map_path)?;
             tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
+            written_outputs.push(map_path.clone());
         }
 
         emitted += 1;
@@ -1557,6 +1673,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     dest.display()
                 )
             })?;
+            written_outputs.push(dest.clone());
         }
         py_copied += 1;
     }
@@ -1685,6 +1802,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             confine_output_path(&confine_root, confine_label, &out_file)?;
             tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
+            written_outputs.push(out_file.clone());
         }
         stubs_emitted += 1;
     }
@@ -1736,8 +1854,53 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 confine_output_path(&confine_root, confine_label, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
+                written_outputs.push(path.clone());
             }
             eprintln!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
+        }
+    }
+
+    // A separately built unit (tests, typically) imports the project's
+    // compiled modules, which live in the project's build output rather than
+    // beside it. Give pytest a `conftest.py` that puts that directory on
+    // `sys.path`, unless the unit brings its own.
+    if unit_rel.is_some() && emitted > 0 {
+        let user_conftest =
+            src_dir.join("conftest.ty").exists() || src_dir.join("conftest.py").exists();
+        let conftest = out_dir.join("conftest.py");
+        let ours = std::fs::read_to_string(&conftest)
+            .map(|t| t.starts_with(GENERATED_CONFTEST_HEADER))
+            .unwrap_or(true);
+        if !user_conftest && ours {
+            let rel = relative_path(&out_dir, &project_out_dir);
+            let body = generated_conftest(&rel);
+            if check_mode {
+                eprintln!("would write {}", display_relative(&conftest, &project_root));
+                would_write_count += 1;
+            } else {
+                confine_output_path(&confine_root, confine_label, &conftest)?;
+                tyc_format::atomic_write(&conftest, body.as_bytes())
+                    .map_err(|e| miette!("cannot write '{}': {e}", conftest.display()))?;
+                written_outputs.push(conftest.clone());
+            }
+        }
+    }
+
+    // Stale outputs: anything a previous build wrote that this one did not.
+    if !check_mode {
+        remove_stale_outputs(&out_dir, &written_outputs, &project_root);
+    }
+
+    // `tyc build` compiles the source tree; say so when tests sit beside it
+    // un-built, rather than leave `pytest` to find nothing.
+    if unit_rel.is_none() && !check_mode {
+        let tests_dir = config_dir.join("tests");
+        if collect_ty_files(&tests_dir).is_ok_and(|f| !f.is_empty()) {
+            eprintln!(
+                "note: tests/ holds .ty files, which `tyc build` does not compile; \
+                 build them with `tyc build tests/` (output: {})",
+                display_relative(&out_dir.join("tests"), &project_root)
+            );
         }
     }
 
@@ -2806,6 +2969,209 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
     parts.join(".")
 }
 
+/// Narrow the injected `from typhon_runtime import Ok, Err, Result` line to
+/// the names the rest of the module mentions. The test is a conservative
+/// whole-word search over everything else in the file — strings and
+/// comments included — so a name is only dropped when it provably never
+/// appears; at least one always remains (the import is only injected when
+/// one is used). The edit stays on its own line, so line numbers hold.
+fn prune_unused_runtime_names(src: &str) -> String {
+    const INJECTED: &str = "from typhon_runtime import Ok, Err, Result";
+    let Some(start) = src
+        .match_indices(INJECTED)
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || src.as_bytes()[i - 1] == b'\n')
+    else {
+        return src.to_owned();
+    };
+    let end = start + INJECTED.len();
+    if !matches!(src.as_bytes().get(end), None | Some(b'\n') | Some(b'\r')) {
+        return src.to_owned();
+    }
+    // Other `typhon_runtime` imports (`from typhon_runtime import Err as
+    // __typhon_Err__`) name the runtime's own binding, not this one.
+    let rest: String = format!("{}{}", &src[..start], &src[end..])
+        .lines()
+        .filter(|l| !l.starts_with("from typhon_runtime import "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mentions = |name: &str| {
+        rest.match_indices(name).any(|(i, _)| {
+            let before = rest[..i].chars().next_back();
+            let after = rest[i + name.len()..].chars().next();
+            let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !ident(before) && !ident(after)
+        })
+    };
+    let kept: Vec<&str> = ["Ok", "Err", "Result"]
+        .into_iter()
+        .filter(|n| mentions(n))
+        .collect();
+    if kept.is_empty() || kept.len() == 3 {
+        return src.to_owned();
+    }
+    format!(
+        "{}from typhon_runtime import {}{}",
+        &src[..start],
+        kept.join(", "),
+        &src[end..]
+    )
+}
+
+/// Name of the per-output-directory list of files a build wrote, used to
+/// find (and remove) what a later build no longer produces.
+const BUILD_MANIFEST: &str = ".tyc-build-manifest";
+
+/// Delete files an earlier build wrote into `out_dir` that this build did
+/// not (a renamed or deleted `.ty`, a `typhon_runtime/` no longer needed),
+/// then record what this build wrote. Without it, `build/` kept dead
+/// modules that were committed and shipped.
+///
+/// Only files `tyc` provably owns are removed: those listed in the previous
+/// build's manifest, or — for a build directory from before the manifest
+/// existed — compiled modules whose `.sourcemaps/<rel>.py.map` sidecar
+/// remains, and the generated `typhon_runtime/` package. Symlinks are never
+/// followed or removed; failures are warnings, never a failed build.
+fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path) {
+    let rel_of = |p: &Path| -> Option<String> {
+        p.strip_prefix(out_dir)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+    };
+    let keep: std::collections::BTreeSet<String> =
+        written.iter().filter_map(|p| rel_of(p)).collect();
+    let manifest_path = out_dir.join(BUILD_MANIFEST);
+    let mut candidates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => {
+            candidates.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        Err(_) => {
+            // No manifest yet: fall back to outputs whose ownership is
+            // evident from the layout.
+            let maps_root = out_dir.join(".sourcemaps");
+            if let Ok(maps) = crate::commands::util::walk_files(&maps_root, "map") {
+                for map in maps {
+                    let Ok(rel) = map.strip_prefix(&maps_root) else {
+                        continue;
+                    };
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    let Some(py) = rel.strip_suffix(".py.map") else {
+                        continue;
+                    };
+                    candidates.insert(format!(".sourcemaps/{rel}"));
+                    candidates.insert(format!("{py}.py"));
+                }
+            }
+            let runtime = out_dir.join("typhon_runtime");
+            if let Ok(entries) = std::fs::read_dir(&runtime) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".py") {
+                        candidates.insert(format!("typhon_runtime/{name}"));
+                    }
+                }
+            }
+        }
+    }
+    let mut removed: Vec<String> = Vec::new();
+    for rel in candidates.difference(&keep) {
+        // Refuse anything that could escape the output directory.
+        if rel.starts_with('/') || rel.split('/').any(|c| c == ".." || c.is_empty()) {
+            continue;
+        }
+        let path = out_dir.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                removed.push(rel.clone());
+                // Tidy directories the removal emptied, up to `out_dir`.
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if d == out_dir || !d.starts_with(out_dir) {
+                        break;
+                    }
+                    // A package directory left holding only its bytecode
+                    // cache is empty for our purposes.
+                    let only_cache = std::fs::read_dir(d)
+                        .is_ok_and(|it| it.flatten().all(|e| e.file_name() == "__pycache__"));
+                    if only_cache {
+                        let _ = std::fs::remove_dir_all(d.join("__pycache__"));
+                    }
+                    if std::fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+            }
+            Err(e) => eprintln!("warning: cannot remove stale '{}': {e}", path.display()),
+        }
+    }
+    if !removed.is_empty() {
+        eprintln!(
+            "removed {} stale file(s) from '{}': {}",
+            removed.len(),
+            display_relative(out_dir, project_root),
+            removed.join(", ")
+        );
+    }
+    if written.is_empty() {
+        return;
+    }
+    let mut body = String::new();
+    for rel in &keep {
+        body.push_str(rel);
+        body.push('\n');
+    }
+    if let Err(e) = tyc_format::atomic_write(&manifest_path, body.as_bytes()) {
+        eprintln!("warning: cannot write '{}': {e}", manifest_path.display());
+    }
+}
+
+/// First line of the `conftest.py` written for a separately built unit; a
+/// file that starts with anything else is the user's and is left alone.
+const GENERATED_CONFTEST_HEADER: &str = "# Generated by tyc build";
+
+fn generated_conftest(rel_to_build: &Path) -> String {
+    let rel = rel_to_build.to_string_lossy().replace('\\', "/");
+    let rel = if rel.is_empty() { ".".to_owned() } else { rel };
+    format!(
+        "{GENERATED_CONFTEST_HEADER}: puts the project's compiled modules on sys.path\n\
+         # so these tests import them. Add your own conftest (.ty or .py) to replace it.\n\
+         import sys\n\
+         from pathlib import Path\n\
+         \n\
+         _BUILD = (Path(__file__).resolve().parent / {rel:?}).resolve()\n\
+         if str(_BUILD) not in sys.path:\n\
+         \x20   sys.path.insert(0, str(_BUILD))\n"
+    )
+}
+
+/// `to` expressed relative to `from` (both absolute), lexically.
+fn relative_path(from: &Path, to: &Path) -> PathBuf {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for c in &to[common..] {
+        out.push(c.as_os_str());
+    }
+    out
+}
+
 /// Return `true` if any source file declares a `model X:` class. Used to
 /// auto-inject `pydantic` into `[dependencies]` before the pyproject.toml
 /// merge, since the emitter will produce `from pydantic import …`
@@ -3565,9 +3931,10 @@ const TYPHON_RUNTIME_INIT_PY: &str = "\
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Generic, TypeAlias, TypeVar, Union
 
-from . import lazy, parallel, result, stdlib, tasks  # re-exported for `typhon_runtime.<sub>.…`
+# Submodules re-exported for `typhon_runtime.<sub>.…`.
+from . import lazy, parallel, result, stdlib, tasks
 
 _T = TypeVar(\"_T\")
 _E = TypeVar(\"_E\")
@@ -3664,7 +4031,6 @@ class Err(Generic[_E]):
 # `typing.get_type_hints` resolves a `Result[int, str]` field instead of
 # raising `TypeError: ... is not a generic class`. The runtime itself only
 # relies on `isinstance(x, Err)` and the dataclass shape.
-from typing import TypeAlias, Union
 Result: TypeAlias = Union[Ok[_T], Err[_E]]
 
 
@@ -3971,8 +4337,7 @@ class _LazyValue:
         return complex(self._materialise())
 
     def __index__(self) -> int:
-        import operator
-        return operator.index(self._materialise())
+        return self._materialise().__index__()
 
     def __format__(self, spec: str) -> str:
         return format(self._materialise(), spec)
@@ -3988,21 +4353,6 @@ class _LazyValue:
 
     def __exit__(self, *exc: object) -> object:
         return self._materialise().__exit__(*exc)
-
-    def __invert__(self) -> object:
-        return ~self._materialise()
-
-    def __int__(self) -> int:
-        return int(self._materialise())
-
-    def __float__(self) -> float:
-        return float(self._materialise())
-
-    def __index__(self) -> int:
-        return self._materialise().__index__()
-
-    def __contains__(self, item: object) -> bool:
-        return item in self._materialise()
 
 
 _UNSET = object()
@@ -4216,7 +4566,9 @@ __all__ = [
 
 
 def _types() -> tuple[type, type]:
-    from . import Err as _Err, Ok as _Ok  # local to dodge import cycle
+    # Local to dodge an import cycle.
+    from . import Err as _Err
+    from . import Ok as _Ok
 
     return _Ok, _Err
 
@@ -6696,7 +7048,28 @@ print('ok')
     fn pub_model_counts_as_a_model() {
         assert!(source_uses_model("pub model Review:\n    summary: str\n"));
         assert!(source_uses_model("model Review:\n    summary: str\n"));
-        assert!(!source_uses_model("pub def model_name() -> str:\n    return \"x\"\n"));
+        assert!(!source_uses_model(
+            "pub def model_name() -> str:\n    return \"x\"\n"
+        ));
     }
 
+    #[test]
+    fn prune_unused_runtime_names_keeps_only_mentioned_names() {
+        let src =
+            "from typhon_runtime import Ok, Err, Result\n\ndef f() -> int:\n    return Ok(1)\n";
+        assert_eq!(
+            prune_unused_runtime_names(src),
+            "from typhon_runtime import Ok\n\ndef f() -> int:\n    return Ok(1)\n"
+        );
+        // A mention anywhere — even a string — keeps the name.
+        let src = "from typhon_runtime import Ok, Err, Result\nx = 'Result'\ny = Err(1)\n";
+        assert!(
+            prune_unused_runtime_names(src).starts_with("from typhon_runtime import Err, Result\n")
+        );
+        // `OkThing` is not `Ok`.
+        let src = "from typhon_runtime import Ok, Err, Result\nOkThing = Err(Result)\n";
+        assert!(
+            prune_unused_runtime_names(src).starts_with("from typhon_runtime import Err, Result\n")
+        );
+    }
 }

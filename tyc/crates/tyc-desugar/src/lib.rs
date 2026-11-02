@@ -328,10 +328,15 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
         // Place `__all__` AFTER the last injected import so it never
         // splits the import block. `insert_at + imports_inserted` is
         // the index right after the run of imports that landed above.
-        body.insert(
-            insert_at + imports_inserted,
-            make_dunder_all(&options.pub_names),
-        );
+        // Skip past the user's own leading imports as well: a `__all__`
+        // between two imports makes every later one `E402` (module import
+        // not at top of file) and splits the block isort / `ruff check`
+        // sorts, so generated modules failed a stock `ruff check`.
+        let mut at = insert_at + imports_inserted;
+        while at < body.len() && matches!(body[at], Stmt::Import(_) | Stmt::ImportFrom(_)) {
+            at += 1;
+        }
+        body.insert(at, make_dunder_all(&options.pub_names));
     }
     // Last, so it lands ahead of every import above, synthesised ones
     // included; otherwise those would run eagerly.

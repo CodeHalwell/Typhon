@@ -489,11 +489,121 @@ pub fn bootstrap_python_env_with(
     config: &TyphonConfig,
     skip_sync: bool,
 ) -> Result<()> {
+    let before = read_dependency_lists(&project_root.join("pyproject.toml"));
     merge_pyproject(project_root, config)?;
+    let after = read_dependency_lists(&project_root.join("pyproject.toml"));
+    let changed = before != after;
+    if changed {
+        report_manifest_change(before.as_ref(), after.as_ref());
+    }
     if !skip_sync {
+        // `uv sync` re-resolves and rewrites `uv.lock` itself.
         run_uv_sync_warning(project_root, config);
+    } else if changed && project_root.join("uv.lock").exists() {
+        // `--no-sync` used to leave `uv.lock` describing the *old*
+        // dependency list, so a later `uv sync --locked` in CI failed on a
+        // manifest the build had just rewritten. Relock (resolution only —
+        // nothing is installed) so the two stay in step.
+        run_uv_lock_warning(project_root, config);
     }
     Ok(())
+}
+
+/// `[project].dependencies` and `[dependency-groups].dev` of a
+/// `pyproject.toml`, or `None` when there is no readable file.
+type DependencyLists = (Vec<String>, Vec<String>);
+
+fn read_dependency_lists(path: &Path) -> Option<DependencyLists> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: toml_edit::DocumentMut = text.parse().ok()?;
+    let strings = |item: Option<&toml_edit::Item>| -> Vec<String> {
+        item.and_then(toml_edit::Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deps = strings(doc.get("project").and_then(|p| p.get("dependencies")));
+    let dev = strings(doc.get("dependency-groups").and_then(|g| g.get("dev")));
+    Some((deps, dev))
+}
+
+/// Say what the merge changed. `tyc build` owns `[project].dependencies`,
+/// so a dependency added with `uv add` (rather than `tyc add`) is replaced
+/// by `typhon.toml`'s list — that used to happen silently.
+fn report_manifest_change(before: Option<&DependencyLists>, after: Option<&DependencyLists>) {
+    let empty: DependencyLists = (Vec::new(), Vec::new());
+    let before = before.unwrap_or(&empty);
+    let after = after.unwrap_or(&empty);
+    let mut lines: Vec<String> = Vec::new();
+    for (label, old, new) in [
+        ("dependencies", &before.0, &after.0),
+        ("dev dependencies", &before.1, &after.1),
+    ] {
+        let added: Vec<&str> = new
+            .iter()
+            .filter(|d| !old.contains(d))
+            .map(String::as_str)
+            .collect();
+        let removed: Vec<&str> = old
+            .iter()
+            .filter(|d| !new.contains(d))
+            .map(String::as_str)
+            .collect();
+        if !added.is_empty() {
+            lines.push(format!("  + {label}: {}", added.join(", ")));
+        }
+        if !removed.is_empty() {
+            lines.push(format!("  - {label}: {}", removed.join(", ")));
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: updated pyproject.toml from typhon.toml:\n{}",
+        lines.join("\n")
+    );
+    if !before.0.is_empty() || !before.1.is_empty() {
+        let dropped = before
+            .0
+            .iter()
+            .chain(before.1.iter())
+            .any(|d| !after.0.contains(d) && !after.1.contains(d));
+        if dropped {
+            eprintln!(
+                "  typhon.toml owns the dependency list; declare packages with \
+                 `tyc add` (or in [dependencies]) rather than `uv add`."
+            );
+        }
+    }
+}
+
+/// `uv lock` pinned like `uv sync`; failure is a warning, as for sync.
+fn run_uv_lock_warning(project_root: &Path, config: &TyphonConfig) {
+    if !has_uv() {
+        eprintln!(
+            "warning: pyproject.toml changed but `uv` is not on PATH, so uv.lock \
+             is now stale — run `uv lock` before `uv sync --locked`."
+        );
+        return;
+    }
+    let status = Command::new("uv")
+        .arg("lock")
+        .arg("--python")
+        .arg(uv_python_request(config))
+        .current_dir(project_root)
+        .status();
+    match status {
+        Ok(s) if s.success() => eprintln!("note: refreshed uv.lock (--no-sync: nothing installed)"),
+        Ok(s) => eprintln!(
+            "warning: `uv lock` exited with {s} — uv.lock may be stale; run `uv lock` \
+             before `uv sync --locked`"
+        ),
+        Err(e) => eprintln!("warning: cannot spawn `uv`: {e} — uv.lock may be stale"),
+    }
 }
 
 /// Read-modify-write `pyproject.toml` with [`toml_edit::DocumentMut`] so
