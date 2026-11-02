@@ -615,6 +615,16 @@ fn newer_typed_dict_keywords(
             walk_pattern(self, pattern);
         }
         fn visit_expr(&mut self, expr: &'ast Expr) {
+            // `X if sys.version_info >= (3, 15) else Y` is a feature probe
+            // too, like the statement form.
+            if let Expr::If(e) = expr {
+                if reads_version(&e.test) {
+                    self.guarded += 1;
+                    walk_expr(self, expr);
+                    self.guarded -= 1;
+                    return;
+                }
+            }
             match expr {
                 Expr::Call(call) => {
                     let head = call.func.as_ref().clone();
@@ -8854,6 +8864,8 @@ mod lint_tests {
             "class Base:\n    pass\nclass M(Base, closed=True):\n    pass\n",
             // A feature probe.
             "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
+            // A conditional-expression feature probe.
+            "import sys\nfrom typing import TypedDict\nM = TypedDict(\"M\", {}, closed=True) if sys.version_info >= (3, 15) else dict\n",
             // A parameter shadows the import.
             "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nlet items = [(TypedDict := Backport) for _ in [1]]\nclass M(TypedDict, closed=True):\n    name: str\n",
             "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nmatch {\"factory\": Backport}:\n    case {\"factory\": TypedDict}:\n        print(TypedDict(\"M\", {}, closed=True))\n    case _:\n        pass\n",
