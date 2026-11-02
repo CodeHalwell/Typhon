@@ -2104,6 +2104,29 @@ fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
     leaf(c, &b.left, &mut saw_type) && leaf(c, &b.right, &mut saw_type) && saw_type
 }
 
+/// Run the ordinary checks over the leaves of a PEP 604 value union that
+/// [`is_runtime_type_union`] accepted, without judging the union itself:
+/// subscript arguments and module attributes are inferred, while `None` and
+/// bare type names have nothing to check.
+fn infer_runtime_union_operands(c: &mut Checker, e: &Expr) {
+    match e {
+        Expr::BinOp(inner) if matches!(inner.op, Operator::BitOr) => {
+            infer_runtime_union_operands(c, &inner.left);
+            infer_runtime_union_operands(c, &inner.right);
+        }
+        Expr::Subscript(sub) => {
+            if let Expr::Attribute(_) = sub.value.as_ref() {
+                infer_expr(c, &sub.value);
+            }
+            infer_expr(c, &sub.slice);
+        }
+        Expr::Attribute(_) => {
+            infer_expr(c, e);
+        }
+        _ => {}
+    }
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -21722,7 +21745,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // `int | None` as a *value* is a `types.UnionType` (PEP 604),
             // valid on every supported target: `let t = int | None`,
             // `TypeForm[str | None]` (PEP 747). `None` there is a type, not
-            // a possibly-None operand.
+            // a possibly-None operand. The leaves still get their own checks
+            // (`list[1 / 0] | None` divides by zero all the same).
+            infer_runtime_union_operands(c, &b.left);
+            infer_runtime_union_operands(c, &b.right);
             Type::Unknown
         }
         Expr::BinOp(b) => {
@@ -28150,6 +28176,15 @@ def describe(m: Maybe[int]) -> str:
         // A value that is really possibly-None is still reported.
         let d = check("def f(x: int?) -> None:\n    print(x | 1)\n");
         assert!(!d.errors().is_empty());
+        // The leaves keep their own checks.
+        let d = check("def f() -> None:\n    let t = list[1 / 0] | None\n    print(t)\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::DivByZeroLiteral { .. })),
+            "{:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -39329,6 +39364,31 @@ def main(agent: Agent) -> None:
             &followed_external(),
         );
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn a_local_binding_shadows_a_deprecated_module_function() {
+        let d = check(
+            "\
+from typing import Callable
+from warnings import deprecated
+
+@deprecated(\"gone\")
+def old() -> int:
+    return 1
+
+def main(old: Callable[[], int]) -> None:
+    print(old())
+
+def other() -> None:
+    print(old())
+",
+        );
+        assert_eq!(
+            deprecations(&d),
+            vec!["`old()` is deprecated: gone".to_owned()],
+            "only the module-level call warns"
+        );
     }
 
     #[test]

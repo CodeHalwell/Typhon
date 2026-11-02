@@ -91,17 +91,22 @@ pub(super) fn check_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
             let name = n.id.as_str();
             // A local binding shadows everything below.
             let bound = c.env.lookup(name).map(|b| b.narrowed.clone());
+            // Module-level functions live in the outermost scope; a parameter
+            // or local of the same name in an inner scope is a different value.
+            let shadowed_locally = c.env.scope_of(name).is_some_and(|idx| idx > 0);
             if let Some(msg) = c
                 .function_arity_info
                 .get(name)
                 .and_then(|info| info.deprecated.clone())
             {
-                if !matches!(bound, Some(Type::Class(_) | Type::Generic(..))) {
+                if !shadowed_locally && !matches!(bound, Some(Type::Class(_) | Type::Generic(..))) {
                     report(c, format!("{name}()"), &msg, span);
                     return;
                 }
             }
-            if c.classes.iter().any(|k| k == name) || c.class_shapes.contains_key(name) {
+            if !shadowed_locally
+                && (c.classes.iter().any(|k| k == name) || c.class_shapes.contains_key(name))
+            {
                 if let Some(msg) = c
                     .class_shapes
                     .get(name)
