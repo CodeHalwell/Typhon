@@ -338,16 +338,22 @@ fn newer_typed_dict_keywords(
     target: (u8, u8),
 ) -> Vec<(&'static str, (u8, u8), TextRange)> {
     use ruff_python_ast::visitor::source_order::{walk_expr, walk_stmt, SourceOrderVisitor};
+    /// What a name is bound to in one scope.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Bound {
+        /// `from typing import TypedDict [as X]`.
+        TypedDict,
+        /// `import typing [as t]`.
+        Typing,
+        /// Anything else, including a later rebinding of either.
+        Other,
+    }
     #[derive(Default)]
     struct V {
-        /// Local names bound to `typing.TypedDict`.
-        typed_dict: HashSet<String>,
-        /// Local names bound to the `typing` module.
-        typing: HashSet<String>,
-        /// Every other binding of a name, per lexical scope (`0` is the
-        /// module; each `def` and `lambda` opens one). A binding shadows
-        /// either import only inside its own scope and the scopes it encloses.
-        scopes: Vec<HashSet<String>>,
+        /// The bindings of each lexical scope (`0` is the module; each
+        /// class body, `def` and `lambda` opens one). A name resolves to its
+        /// nearest visible binding.
+        scopes: Vec<HashMap<String, Bound>>,
         /// Which of `scopes` are class bodies. A class body's names are seen
         /// by the class body itself, never by the functions nested in it.
         class_scope: Vec<bool>,
@@ -381,11 +387,19 @@ fn newer_typed_dict_keywords(
     }
     impl V {
         fn bind(&mut self, name: String) {
+            self.bind_as(name, Bound::Other);
+        }
+        /// A scope that binds a name both ways (an import, then an
+        /// assignment) holds anything: `Other` wins.
+        fn bind_as(&mut self, name: String, kind: Bound) {
             let top = self.stack.last().copied().unwrap_or(0);
-            self.scopes[top].insert(name);
+            let slot = self.scopes[top].entry(name).or_insert(kind);
+            if *slot != kind {
+                *slot = Bound::Other;
+            }
         }
         fn open_scope(&mut self, class: bool) {
-            self.scopes.push(HashSet::new());
+            self.scopes.push(HashMap::new());
             self.class_scope.push(class);
             self.stack.push(self.scopes.len() - 1);
         }
@@ -467,7 +481,7 @@ fn newer_typed_dict_keywords(
                                     alias.name.split('.').next().unwrap_or_default().to_owned()
                                 });
                         if alias.name.as_str() == "typing" {
-                            self.typing.insert(bound);
+                            self.bind_as(bound, Bound::Typing);
                         } else {
                             self.bind(bound);
                         }
@@ -479,7 +493,7 @@ fn newer_typed_dict_keywords(
                     for alias in &i.names {
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if from_typing && alias.name.as_str() == "TypedDict" {
-                            self.typed_dict.insert(bound);
+                            self.bind_as(bound, Bound::TypedDict);
                         } else {
                             self.bind(bound);
                         }
@@ -533,7 +547,10 @@ fn newer_typed_dict_keywords(
                 }
                 Stmt::Global(g) => {
                     for name in &g.names {
-                        self.scopes[0].insert(name.to_string());
+                        let slot = self.scopes[0]
+                            .entry(name.to_string())
+                            .or_insert(Bound::Other);
+                        *slot = Bound::Other;
                     }
                 }
                 _ => {}
@@ -567,20 +584,25 @@ fn newer_typed_dict_keywords(
         }
     }
     let mut v = V {
-        scopes: vec![HashSet::new()],
+        scopes: vec![HashMap::new()],
         class_scope: vec![false],
         stack: vec![0],
         ..V::default()
     };
     v.visit_body(&module.body);
-    let rebound =
-        |name: &str, enclosing: &[usize]| enclosing.iter().any(|&i| v.scopes[i].contains(name));
+    // The nearest visible binding of `name`, innermost scope first.
+    let resolve = |name: &str, enclosing: &[usize]| {
+        enclosing
+            .iter()
+            .rev()
+            .find_map(|&i| v.scopes[i].get(name).copied())
+    };
     let is_typed_dict = |head: &Expr, enclosing: &[usize]| match head {
-        Expr::Name(n) => v.typed_dict.contains(n.id.as_str()) && !rebound(n.id.as_str(), enclosing),
+        Expr::Name(n) => resolve(n.id.as_str(), enclosing) == Some(Bound::TypedDict),
         Expr::Attribute(a) => {
             a.attr.as_str() == "TypedDict"
                 && matches!(a.value.as_ref(), Expr::Name(m)
-                    if v.typing.contains(m.id.as_str()) && !rebound(m.id.as_str(), enclosing))
+                    if resolve(m.id.as_str(), enclosing) == Some(Bound::Typing))
         }
         _ => false,
     };
@@ -8708,6 +8730,8 @@ mod lint_tests {
             "from typing import TypedDict\nM = TypedDict(\"M\", {\"name\": str}, closed=True)\n",
             "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
             "import typing\nprint(typing.disjoint_base)\n",
+            // A local stdlib import beats a module-level backport.
+            "from typing_extensions import TypedDict\ndef build() -> object:\n    from typing import TypedDict\n    return TypedDict(\"M\", {}, closed=True)\n",
             // A class attribute is not visible from the class's methods.
             "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\n    def build(self) -> object:\n        return TypedDict(\"M\", {}, closed=True)\n",
             // Defaults are evaluated in the enclosing scope.

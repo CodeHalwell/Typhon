@@ -2130,6 +2130,96 @@ fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
     leaf(c, &b.left, &mut saw_type) && leaf(c, &b.right, &mut saw_type) && saw_type
 }
 
+/// How a module spells `typing.TypedDict` / `typing_extensions.TypedDict`:
+/// the names its top-level imports bind to the class itself and to the two
+/// modules. A name the module also binds some other way (a class, a def,
+/// an assignment) does not count.
+struct TypedDictImports {
+    class_names: HashSet<String>,
+    module_names: HashSet<String>,
+}
+
+impl TypedDictImports {
+    fn of(body: &[Stmt]) -> Self {
+        let mut class_names = HashSet::new();
+        let mut module_names = HashSet::new();
+        let mut other = HashSet::new();
+        let is_typing = |m: &str| matches!(m, "typing" | "typing_extensions");
+        for stmt in body {
+            match stmt {
+                Stmt::ImportFrom(i) => {
+                    let from_typing =
+                        i.level == 0 && i.module.as_ref().is_some_and(|m| is_typing(m.as_str()));
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        if from_typing && alias.name.as_str() == "TypedDict" {
+                            class_names.insert(bound);
+                        } else {
+                            other.insert(bound);
+                        }
+                    }
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        match &alias.asname {
+                            Some(a) if is_typing(alias.name.as_str()) => {
+                                module_names.insert(a.to_string());
+                            }
+                            None if is_typing(alias.name.as_str()) => {
+                                module_names.insert(alias.name.to_string());
+                            }
+                            Some(a) => {
+                                other.insert(a.to_string());
+                            }
+                            None => {
+                                other.insert(
+                                    alias.name.split('.').next().unwrap_or_default().to_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+                Stmt::ClassDef(cd) => {
+                    other.insert(cd.name.to_string());
+                }
+                Stmt::FunctionDef(f) => {
+                    other.insert(f.name.to_string());
+                }
+                Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        if let Expr::Name(n) = t {
+                            other.insert(n.id.to_string());
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        other.insert(n.id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        class_names.retain(|n| !other.contains(n));
+        module_names.retain(|n| !other.contains(n));
+        Self {
+            class_names,
+            module_names,
+        }
+    }
+
+    fn is_typed_dict(&self, base: &Expr) -> bool {
+        match base {
+            Expr::Name(n) => self.class_names.contains(n.id.as_str()),
+            Expr::Attribute(a) => {
+                a.attr.as_str() == "TypedDict"
+                    && matches!(a.value.as_ref(), Expr::Name(m) if self.module_names.contains(m.id.as_str()))
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Run the ordinary checks over the leaves of a PEP 604 value union that
 /// [`is_runtime_type_union`] accepted, without judging the union itself:
 /// subscript arguments and module attributes are inferred, while `None` and
@@ -10665,6 +10755,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // programming error: there is no concrete type the chain can resolve
     // to, so reject it at check time.
     detect_cyclic_type_aliases(c, body);
+    let typed_dict_imports = TypedDictImports::of(body);
     // Second pass: now that every class name is known, collect each class's
     // member shape so interface conformance can resolve nominal types in
     // field annotations.
@@ -10685,12 +10776,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // PEP 728: `closed=True` means "no extra items", so CPython
                 // refuses the pair when the class is created (`TypeError:
                 // Cannot combine closed=True and extra_items`).
+                // Only a base that really is `typing[_extensions].TypedDict`:
+                // a user class that happens to be called `TypedDict` may
+                // accept these keywords in its `__init_subclass__`.
                 let is_typed_dict = cd.arguments.as_deref().is_some_and(|a| {
-                    a.args.iter().any(|base| match base {
-                        Expr::Name(n) => n.id.as_str() == "TypedDict",
-                        Expr::Attribute(at) => at.attr.as_str() == "TypedDict",
-                        _ => false,
-                    })
+                    a.args
+                        .iter()
+                        .any(|base| typed_dict_imports.is_typed_dict(base))
                 });
                 if let Some(closed) = class_keyword("closed").filter(|k| {
                     is_typed_dict && matches!(k.value, Expr::BooleanLiteral(ref b) if b.value)
@@ -28189,6 +28281,25 @@ def describe(m: Maybe[int]) -> str:
             let d = check(ok);
             assert!(d.errors().is_empty(), "{ok:?}: {:?}", d.errors());
         }
+        // Any spelling of the real class counts.
+        let bad = check(
+            "import typing_extensions as te\nclass M(te.TypedDict, closed=True, extra_items=int):\n    name: str\n",
+        );
+        assert!(bad
+            .errors()
+            .iter()
+            .any(|e| e.to_string().contains("cannot combine `closed=True`")));
+        // A user class that happens to be called `TypedDict` may accept both.
+        let own = check(
+            "from typing import Any\n\nplain class TypedDict:\n    def __init_subclass__(cls, **kwargs: Any) -> None:\n        pass\n\nplain class M(TypedDict, closed=True, extra_items=int):\n    pass\n",
+        );
+        assert!(
+            !own.errors()
+                .iter()
+                .any(|e| e.to_string().contains("cannot combine `closed=True`")),
+            "{:?}",
+            own.errors()
+        );
     }
 
     #[test]
