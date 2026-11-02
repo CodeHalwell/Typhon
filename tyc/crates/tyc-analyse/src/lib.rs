@@ -456,6 +456,13 @@ fn newer_typed_dict_keywords(
                             self.candidates(base, &args.keywords);
                         }
                     }
+                    // The bases above are read in the enclosing scope; the
+                    // body's bindings (`TypedDict: int = 1`) are class
+                    // attributes and shadow nothing outside it.
+                    self.open_scope();
+                    walk_stmt(self, stmt);
+                    self.stack.pop();
+                    return;
                 }
                 Stmt::FunctionDef(f) => {
                     self.bind(f.name.to_string());
@@ -8643,6 +8650,7 @@ mod lint_tests {
             "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
             "import typing\nprint(typing.disjoint_base)\n",
             // A parameter elsewhere does not shadow the module-level import.
+            "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\nclass M(TypedDict, closed=True):\n    name: str\n",
             "from typing import TypedDict, Any\ndef helper(TypedDict: Any) -> None:\n    pass\nclass M(TypedDict, closed=True):\n    name: str\n",
         ] {
             let on_313 = target_errors(src, (3, 13));
