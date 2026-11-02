@@ -258,7 +258,7 @@ impl IntrospectionCache {
 /// "anything about this venv changed" signal we can detect without a
 /// dedicated filesystem watcher.
 fn stat_pyvenv_cfg(project_root: &Path) -> Option<SystemTime> {
-    let cfg = project_root.join(".venv").join("pyvenv.cfg");
+    let cfg = tyc_venv::find_venv(project_root)?.join("pyvenv.cfg");
     std::fs::metadata(&cfg).ok().and_then(|m| m.modified().ok())
 }
 

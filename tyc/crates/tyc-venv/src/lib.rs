@@ -47,7 +47,10 @@
 //!   `.venv/pyvenv.cfg` mtime change (a `uv sync`).
 
 pub mod config;
+pub mod dists;
 pub mod walk;
+
+pub use dists::{dependency_name, find_venv, pep503_normalise, resolve_import_roots};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -338,21 +341,16 @@ pub fn discover_python(project_root: &Path) -> Option<PathBuf> {
     if std::env::var_os("TYC_NO_INTROSPECT").is_some() {
         return None;
     }
-    let venv = project_root.join(".venv");
-    // Probe the current platform's native layout first. On WSL / Docker mounts
-    // / shared folders both layouts can be present, and picking the foreign
-    // one yields an interpreter that won't run.
-    let unix = venv.join("bin").join("python");
-    let windows = venv.join("Scripts").join("python.exe");
-    let candidates = if cfg!(windows) {
-        [windows, unix]
-    } else {
-        [unix, windows]
-    };
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    // The project's venv — `.venv`, `$UV_PROJECT_ENVIRONMENT`, an
+    // ancestor workspace `.venv`, or an activated `$VIRTUAL_ENV` (see
+    // [`find_venv`]). The path is absolute: the interpreter is spawned with
+    // its working directory set to a private scratch directory (see
+    // [`ScratchDir`]), so a relative `./.venv/bin/python` — what a
+    // `tyc check` run from the project root used to produce — resolved
+    // against *that* directory, failed to exec, and every third-party
+    // module was reported as unintrospectable and went unchecked.
+    if let Some(python) = find_venv(project_root).and_then(|v| dists::venv_python(&v)) {
+        return Some(python);
     }
     which_python3()
 }
@@ -361,7 +359,7 @@ pub fn discover_python(project_root: &Path) -> Option<PathBuf> {
 /// materialising an environment. Its mtime is the cleanest single signal
 /// that the venv changed (sync, recreate, package add/remove).
 fn stat_pyvenv_cfg(project_root: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(project_root.join(".venv").join("pyvenv.cfg"))
+    std::fs::metadata(find_venv(project_root)?.join("pyvenv.cfg"))
         .and_then(|m| m.modified())
         .ok()
 }
@@ -379,7 +377,9 @@ fn which_python3() -> Option<PathBuf> {
         for name in names {
             let candidate = dir.join(name);
             if candidate.is_file() {
-                return Some(candidate);
+                // A relative `PATH` entry would resolve against the
+                // subprocess's scratch working directory; anchor it.
+                return Some(std::path::absolute(&candidate).unwrap_or(candidate));
             }
         }
     }
@@ -635,7 +635,17 @@ def introspect_one(mod_name):
     except BaseException:
         return {"members": []}
     members = []
-    for name in dir(m):
+    # `dir(m)` misses names a module only produces on demand through a PEP 562
+    # module `__getattr__` (lazy re-export facades); `__all__` lists them, and
+    # `getattr` below resolves them. Sorted for a stable payload.
+    names = set(dir(m))
+    try:
+        exported = getattr(m, "__all__", None)
+        if isinstance(exported, (list, tuple, set, frozenset)):
+            names.update(n for n in exported if isinstance(n, str))
+    except BaseException:
+        pass
+    for name in sorted(names):
         if name.startswith("_"):
             continue
         try:
@@ -1518,24 +1528,23 @@ pub fn allowed_top_level_from_project(project_root: &Path) -> HashSet<String> {
     let Ok(value) = toml::from_str::<toml::Value>(&text) else {
         return out;
     };
-    let mut declared_normalised: HashSet<String> = HashSet::new();
+    let mut declared: Vec<String> = Vec::new();
     for table in ["dependencies", "dev-dependencies"] {
         if let Some(toml::Value::Table(deps)) = value.get(table) {
-            for name in deps.keys() {
-                // The distribution name's first segment — a reasonable guess
-                // for the import root, correct for most packages.
-                out.insert(top_level(name).to_owned());
-                declared_normalised.insert(pep503_normalise(name));
-            }
+            declared.extend(deps.keys().cloned());
         }
     }
-    // Expand via installed `.dist-info` metadata so packages whose import
-    // root differs from the PyPI name (`beautifulsoup4` → `bs4`,
-    // `agent-framework-core` → `agent_framework`) are allow-listed too —
-    // keeping `tyc build` and the LSP consistent with `tyc check`, which
-    // already performs this expansion. A no-op without a `.venv`.
-    for import_root in top_level_imports_from_venv(project_root, &declared_normalised) {
-        out.insert(top_level(&import_root).to_owned());
+    // The distribution name's own spelling is a reasonable guess for most
+    // packages; the shared resolver adds what installed metadata (or, with
+    // no venv, the well-known-mapping table) says each declared distribution
+    // really provides (`beautifulsoup4` → `bs4`, `pydantic-ai-slim` →
+    // `pydantic_ai`) — keeping `tyc build` and the LSP consistent with
+    // `tyc check`.
+    for name in &declared {
+        out.insert(dependency_name(name).replace('-', "_"));
+    }
+    for root in resolve_import_roots(project_root, declared.iter().map(String::as_str)) {
+        out.insert(top_level(&root).to_owned());
     }
     out
 }
@@ -1584,182 +1593,6 @@ rather than failing the build."
 
 // ── dist→import name resolution (shared by `tyc check` / `tyc build` /
 // LSP, so all three allow-list the same set of third-party imports) ──
-
-/// Normalise a PyPI distribution name per PEP 503: replace runs of
-/// `[-_.]+` with a single `-` and lowercase. `tyc` uses this to match
-/// `[dependencies]` keys against `.dist-info` directory names regardless
-/// of casing or separator drift (`Agent-Framework-Core`,
-/// `agent_framework_core`, `agent.framework.core` all normalise the
-/// same).
-pub fn pep503_normalise(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_sep = false;
-    for ch in name.chars() {
-        if ch == '-' || ch == '_' || ch == '.' {
-            if !prev_sep && !out.is_empty() {
-                out.push('-');
-                prev_sep = true;
-            }
-        } else {
-            out.push(ch.to_ascii_lowercase());
-            prev_sep = false;
-        }
-    }
-    if out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
-/// Scan the project's local virtualenv for installed Python
-/// distributions and return the top-level import names each one
-/// provides — restricted to distributions actually declared in
-/// `[dependencies]` / `[dev-dependencies]`. Used by `tyc check` to vet
-/// imports whose package name differs from the PyPI distribution name
-/// (e.g. `agent-framework-core` -> `agent_framework`,
-/// `beautifulsoup4` -> `bs4`).
-///
-/// Looks for a venv at `<project_root>/.venv` — the default `uv` /
-/// `tyc sync` location — and reads `<dist>-<ver>.dist-info/top_level.txt`
-/// from each declared distribution's metadata. If `top_level.txt` is
-/// absent (newer wheels often omit it) we fall back to scanning the
-/// `RECORD` manifest for top-level `<pkg>/__init__.py` paths.
-///
-/// `declared` is a set of PEP 503-normalised distribution names; only
-/// `.dist-info` directories whose dist-name normalises into that set
-/// contribute import roots. This keeps `tyc check` reproducible across
-/// machines: a developer with extra packages in their local venv
-/// won't accidentally pass imports that would fail on a fresh clone.
-///
-/// Returns an empty list when no venv exists.
-pub fn top_level_imports_from_venv(
-    project_root: &std::path::Path,
-    declared: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if declared.is_empty() {
-        return out;
-    }
-    let venv_root = project_root.join(".venv");
-    if !venv_root.is_dir() {
-        return out;
-    }
-    // `site-packages` lives under `lib/pythonX.Y` on POSIX,
-    // `Lib/site-packages` on Windows. Probe both.
-    let mut site_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(venv_root.join("lib")) {
-        for entry in entries.flatten() {
-            let p = entry.path().join("site-packages");
-            if p.is_dir() {
-                site_dirs.push(p);
-            }
-        }
-    }
-    let win_site = venv_root.join("Lib").join("site-packages");
-    if win_site.is_dir() {
-        site_dirs.push(win_site);
-    }
-    for site in site_dirs {
-        let Ok(entries) = std::fs::read_dir(&site) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let dir_name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let Some(stem) = dir_name.strip_suffix(".dist-info") else {
-                continue;
-            };
-            // `<dist>-<version>.dist-info` — the dist-name is the part
-            // before the LAST `-<version>` segment. Strip the trailing
-            // `-…` component (versions are PEP 440 and don't contain `/`
-            // or whitespace, so trimming the rightmost `-` block is safe).
-            let dist_name = stem.rsplit_once('-').map(|(d, _)| d).unwrap_or(stem);
-            let normalised = pep503_normalise(dist_name);
-            if !declared.contains(&normalised) {
-                continue;
-            }
-            // Prefer top_level.txt — one package name per line.
-            let tlt = path.join("top_level.txt");
-            if let Ok(content) = std::fs::read_to_string(&tlt) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    // Filter out empty lines and namespace-package markers.
-                    // top_level.txt may also list dotted paths for
-                    // sub-packages; we only need the root component.
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let root = line.split('/').next().unwrap_or(line);
-                    let root = root.split('.').next().unwrap_or(root);
-                    if !root.is_empty() && !root.starts_with('_') {
-                        out.push(root.to_owned());
-                    }
-                }
-                continue;
-            }
-            // Fallback: derive top-level packages from RECORD.
-            // Each entry is `<path>,<hash>,<size>`; the path may be
-            // double-quoted (PEP 376) if it contains commas, may be a
-            // relative `../bin/script` for installed-outside-site
-            // files, or absolute. We accept only paths that point at
-            // a Python module (`<name>.py`) or at a Python source file
-            // inside a top-level directory (`<name>/.../*.py(i)`) — the
-            // narrower filter avoids picking up shipped `bin/`,
-            // `docs/`, or `tests/` directories.
-            if let Ok(record) = std::fs::read_to_string(path.join("RECORD")) {
-                for line in record.lines() {
-                    let raw = line.split(',').next().unwrap_or("").trim();
-                    let path_field = raw.trim_matches('"');
-                    if path_field.is_empty()
-                        || path_field.starts_with("../")
-                        || path_field.starts_with("..\\")
-                        || path_field.starts_with('/')
-                        || path_field.starts_with('\\')
-                    {
-                        continue;
-                    }
-                    let head = path_field.split('/').next().unwrap_or(path_field);
-                    if head.is_empty()
-                        || head == "."
-                        || head == ".."
-                        || head.starts_with('_')
-                        || head.ends_with(".dist-info")
-                        || head.ends_with(".data")
-                    {
-                        continue;
-                    }
-                    let import_name = if let Some(stem) = head.strip_suffix(".py") {
-                        // Top-level single-file module (`foo.py`).
-                        stem
-                    } else if head.ends_with(".pyi") {
-                        // Pure-stub package — uncommon but valid.
-                        head.strip_suffix(".pyi").unwrap_or(head)
-                    } else if path_field.contains('/')
-                        && (path_field.ends_with(".py") || path_field.ends_with(".pyi"))
-                    {
-                        // Python source nested under a top-level
-                        // directory — treat the directory as a package.
-                        head
-                    } else {
-                        continue;
-                    };
-                    if !import_name.is_empty() && !import_name.starts_with('_') {
-                        out.push(import_name.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
 
 #[cfg(test)]
 mod tests {

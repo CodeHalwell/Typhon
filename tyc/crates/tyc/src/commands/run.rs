@@ -328,17 +328,14 @@ pub(crate) fn project_interpreter(
     if let Some(explicit) = explicit {
         return explicit.to_owned();
     }
-    // A Windows virtualenv puts its interpreter somewhere else entirely.
-    let venv = if cfg!(windows) {
-        project_root
-            .join(".venv")
-            .join("Scripts")
-            .join("python.exe")
-    } else {
-        project_root.join(".venv").join("bin").join("python")
-    };
-    if venv.exists() {
-        return venv.to_string_lossy().into_owned();
+    // The project's venv (`.venv`, `$UV_PROJECT_ENVIRONMENT`, a workspace
+    // `.venv` in an ancestor, or `$VIRTUAL_ENV`) — the same discovery the
+    // type checker's introspection uses, so the program runs on the
+    // interpreter its third-party calls were checked against.
+    if let Some(python) =
+        tyc_venv::find_venv(project_root).and_then(|v| tyc_venv::dists::venv_python(&v))
+    {
+        return python.to_string_lossy().into_owned();
     }
     let target = TyphonConfig::load(project_root)
         .ok()

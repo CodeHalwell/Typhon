@@ -2868,6 +2868,14 @@ fn source_uses_model(text: &str) -> bool {
             continue;
         }
 
+        // `pub model X:` is a model too — the visibility marker must not
+        // hide it, or the build drops `pydantic` from the manifest the
+        // moment a model is exported (and `uv sync --locked` then fails on
+        // the drifted lockfile).
+        let trimmed = trimmed
+            .strip_prefix("pub ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
         if !trimmed.starts_with("model ") {
             continue;
         }
@@ -6681,4 +6689,14 @@ print('ok')
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    /// `pub model X:` must still pull `pydantic` into the manifest. Missing
+    /// the `pub` form dropped it on the next build and drifted `uv.lock`.
+    #[test]
+    fn pub_model_counts_as_a_model() {
+        assert!(source_uses_model("pub model Review:\n    summary: str\n"));
+        assert!(source_uses_model("model Review:\n    summary: str\n"));
+        assert!(!source_uses_model("pub def model_name() -> str:\n    return \"x\"\n"));
+    }
+
 }
