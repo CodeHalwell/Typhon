@@ -45,6 +45,7 @@ use crate::ComptimeValue;
 /// accepted. This and the other word sets below are the single source both
 /// consumers of the heuristic share.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    "OAUTHTOKEN",
     "PASSPHRASE",
     "CREDENTIAL",
     "APISECRET",
@@ -903,7 +904,7 @@ mod tests {
             name_tokens("dbPASSWORDString"),
             ["DB", "PASSWORD", "STRING"]
         );
-        assert_eq!(name_tokens("OAUTHTOKEN"), ["OAUTH", "TOKEN"]);
+        assert_eq!(name_tokens("OAUTHTOKEN"), ["OAUTHTOKEN"]);
         assert_eq!(name_tokens("MONKEY"), ["MONKEY"]);
         assert_eq!(name_tokens("PASSPORT"), ["PASSPORT"]);
         assert_eq!(name_tokens("myTokenValue"), ["MY", "TOKEN", "VALUE"]);
