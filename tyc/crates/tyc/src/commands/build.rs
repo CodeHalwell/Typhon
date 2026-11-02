@@ -356,6 +356,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // the middle of that program's output. Diagnostics already went to
         // stderr; this makes the whole non-data surface consistent.
         eprintln!("no .ty files found in '{}'", src_dir.display());
+        // The unit's last source may just have been deleted: its outputs
+        // are now stale like any other.
+        if !args.check && single_file.is_none() && out_dir.is_dir() {
+            remove_stale_outputs(&out_dir, &[], &project_root, false);
+        }
         return Ok(());
     }
 
@@ -1893,7 +1898,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map(|t| t.starts_with(GENERATED_CONFTEST_HEADER))
             .unwrap_or(true);
         if !user_conftest && ours {
-            let rel = relative_path(&out_dir, &project_out_dir);
+            // Resolve both ends first: `--out ../test-build` would otherwise
+            // count its `..` as one more directory to climb out of.
+            let rel = relative_path(
+                &canonical_or_lexical(&out_dir),
+                &canonical_or_lexical(&project_out_dir),
+            );
             let body = generated_conftest(&rel);
             if check_mode {
                 eprintln!("would write {}", display_relative(&conftest, &project_root));
@@ -3186,7 +3196,9 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
             removed.join(", ")
         );
     }
-    if written.is_empty() {
+    if keep.is_empty() {
+        // Nothing left to own: drop the manifest rather than write an empty one.
+        let _ = std::fs::remove_file(&manifest_path);
         return;
     }
     let mut body = String::new();
@@ -6776,6 +6788,21 @@ let pet: Animal = Dog(name=\"Rex\")
         .unwrap();
         run(build_args(&tests.join("test_other.ty"))).unwrap();
         assert!(out.join("tests").join("test_other.py").is_file());
+        // An override with `..` still points the conftest at the real build.
+        let elsewhere = tmp.path().join("tests").join("..").join("test-build");
+        run(BuildArgs {
+            out: Some(elsewhere.clone()),
+            ..build_args(&tests)
+        })
+        .unwrap();
+        let conftest = std::fs::read_to_string(elsewhere.join("conftest.py")).unwrap();
+        assert!(conftest.contains("\"../build\""), "{conftest}");
+        // Deleting the unit's last sources leaves no stale tests behind.
+        std::fs::remove_file(tests.join("test_calc.ty")).unwrap();
+        std::fs::remove_file(tests.join("test_other.ty")).unwrap();
+        run(build_args(&tests)).unwrap();
+        assert!(!out.join("tests").join("test_calc.py").exists());
+        assert!(!out.join("tests").join("test_other.py").exists());
     }
 
     /// Outputs an earlier build wrote that this one does not are removed:
