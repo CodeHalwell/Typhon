@@ -235,7 +235,11 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
     let may_use_newer_stdlib = NEWER_STDLIB
         .iter()
         .any(|(_, name, added)| (major, minor) < *added && source.contains(name));
-    if !may_use_newer_builtin && !may_use_newer_stdlib {
+    let may_use_newer_typed_dict = NEWER_TYPED_DICT_KEYWORDS
+        .iter()
+        .any(|(kw, added)| (major, minor) < *added && source.contains(kw))
+        && source.contains("TypedDict");
+    if !may_use_newer_builtin && !may_use_newer_stdlib && !may_use_newer_typed_dict {
         return diags;
     }
     if let Ok(parsed) = tyc_syntax::parse_module(source) {
@@ -244,6 +248,19 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
             diags.push_error(TycError::requires_newer_python(
                 format!(
                     "`{name}` is a builtin added in Python 3.{} and the project targets {major}.{minor}",
+                    added.1
+                ),
+                path.to_owned(),
+                source.to_owned(),
+                usize::from(range.start()),
+                usize::from(range.len()),
+            ));
+        }
+        for (keyword, added, range) in newer_typed_dict_keywords(&module, (major, minor)) {
+            diags.push_error(TycError::requires_newer_python(
+                format!(
+                    "`TypedDict(..., {keyword}=...)` needs Python 3.{} (PEP 728) and the project targets {major}.{minor}; \
+                     import `TypedDict` from `typing_extensions` to use it on {major}.{minor}",
                     added.1
                 ),
                 path.to_owned(),
@@ -304,6 +321,410 @@ pub fn target_version_check_may_fire(source: &str, major: u8, minor: u8) -> bool
         || NEWER_STDLIB
             .iter()
             .any(|(_, name, added)| (major, minor) < *added && source.contains(name))
+        || (source.contains("TypedDict")
+            && NEWER_TYPED_DICT_KEYWORDS
+                .iter()
+                .any(|(kw, added)| (major, minor) < *added && source.contains(kw)))
+}
+
+/// Every [`NEWER_TYPED_DICT_KEYWORDS`] keyword `target` does not have,
+/// passed to `typing.TypedDict`: as a class keyword (`class M(TypedDict,
+/// closed=True)`) or to the functional form (`TypedDict("M", {...},
+/// closed=True)`). `TypedDict` counts when it is bound only by `from typing
+/// import TypedDict [as X]`, or reached as `typing.TypedDict` /
+/// `t.TypedDict` through `import typing [as t]`.
+fn newer_typed_dict_keywords(
+    module: &ModModule,
+    target: (u8, u8),
+) -> Vec<(&'static str, (u8, u8), TextRange)> {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+    /// What a name is bound to in one scope.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Bound {
+        /// `from typing import TypedDict [as X]`.
+        TypedDict,
+        /// `import typing [as t]`.
+        Typing,
+        /// Anything else, including a later rebinding of either.
+        Other,
+    }
+    #[derive(Default)]
+    struct V {
+        /// The bindings of each lexical scope (`0` is the module; each
+        /// class body, `def` and `lambda` opens one). A name resolves to its
+        /// nearest visible binding.
+        scopes: Vec<HashMap<String, Bound>>,
+        /// Which of `scopes` are class bodies. A class body's names are seen
+        /// by the class body itself, never by the functions nested in it.
+        class_scope: Vec<bool>,
+        /// Which of `scopes` are comprehensions, which a walrus target
+        /// skips: `[(x := v) for _ in xs]` binds `x` outside.
+        comprehension_scope: Vec<bool>,
+        /// The scopes enclosing the current node, innermost last.
+        stack: Vec<usize>,
+        /// `(callee/base, keyword, range, enclosing scopes)` candidates.
+        uses: Vec<(Expr, String, TextRange, Vec<usize>)>,
+        /// Inside a feature probe (see [`newer_stdlib_uses`]).
+        guarded: u32,
+    }
+    fn reads_version(expr: &Expr) -> bool {
+        #[derive(Default)]
+        struct T(bool);
+        impl<'a> SourceOrderVisitor<'a> for T {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Attribute(a) if a.attr.as_str() == "version_info" => self.0 = true,
+                    Expr::Name(n)
+                        if matches!(n.id.as_str(), "version_info" | "hasattr" | "getattr") =>
+                    {
+                        self.0 = true
+                    }
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let mut t = T::default();
+        t.visit_expr(expr);
+        t.0
+    }
+    impl V {
+        fn bind(&mut self, name: String) {
+            self.bind_as(name, Bound::Other);
+        }
+        /// A scope that binds a name both ways (an import, then an
+        /// assignment) holds anything: `Other` wins.
+        fn bind_as(&mut self, name: String, kind: Bound) {
+            let top = self.stack.last().copied().unwrap_or(0);
+            let slot = self.scopes[top].entry(name).or_insert(kind);
+            if *slot != kind {
+                *slot = Bound::Other;
+            }
+        }
+        fn open_scope(&mut self, class: bool) {
+            self.scopes.push(HashMap::new());
+            self.class_scope.push(class);
+            self.comprehension_scope.push(false);
+            self.stack.push(self.scopes.len() - 1);
+        }
+        /// The scopes a bare name read here resolves through: every
+        /// enclosing scope except a class body that is not the innermost.
+        fn visible(&self) -> Vec<usize> {
+            let top = self.stack.last().copied();
+            self.stack
+                .iter()
+                .copied()
+                .filter(|&i| !self.class_scope[i] || Some(i) == top)
+                .collect()
+        }
+        /// A comprehension is its own scope: its targets bind only inside
+        /// it, while the first iterable is evaluated in the enclosing scope.
+        fn visit_comprehension(
+            &mut self,
+            generators: &[ruff_python_ast::Comprehension],
+            results: &[&Expr],
+        ) {
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            self.open_scope(false);
+            if let Some(last) = self.comprehension_scope.last_mut() {
+                *last = true;
+            }
+            for (i, g) in generators.iter().enumerate() {
+                if i > 0 {
+                    self.visit_expr(&g.iter);
+                }
+                self.visit_expr(&g.target);
+                for cond in &g.ifs {
+                    self.visit_expr(cond);
+                }
+            }
+            for e in results {
+                self.visit_expr(e);
+            }
+            self.stack.pop();
+        }
+        /// A function's or lambda's defaults and annotations, which Python
+        /// evaluates in the enclosing scope.
+        fn visit_outer_parameter_parts(&mut self, params: &ruff_python_ast::Parameters) {
+            for p in params
+                .posonlyargs
+                .iter()
+                .chain(&params.args)
+                .chain(&params.kwonlyargs)
+            {
+                if let Some(default) = &p.default {
+                    self.visit_expr(default);
+                }
+                if let Some(ann) = &p.parameter.annotation {
+                    self.visit_expr(ann);
+                }
+            }
+            for p in params.vararg.iter().chain(&params.kwarg) {
+                if let Some(ann) = &p.annotation {
+                    self.visit_expr(ann);
+                }
+            }
+        }
+        fn candidates(&mut self, head: &Expr, keywords: &[ruff_python_ast::Keyword]) {
+            if self.guarded > 0 {
+                return;
+            }
+            for kw in keywords {
+                if let Some(arg) = &kw.arg {
+                    self.uses.push((
+                        head.clone(),
+                        arg.as_str().to_owned(),
+                        kw.range,
+                        self.visible(),
+                    ));
+                }
+            }
+        }
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            let guard = match stmt {
+                Stmt::Try(t) => !t.handlers.is_empty(),
+                Stmt::If(i) => {
+                    reads_version(&i.test)
+                        || i.elif_else_clauses
+                            .iter()
+                            .any(|c| c.test.as_ref().is_some_and(reads_version))
+                }
+                _ => false,
+            };
+            if guard {
+                self.guarded += 1;
+                walk_stmt(self, stmt);
+                self.guarded -= 1;
+                return;
+            }
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let bound =
+                            alias
+                                .asname
+                                .as_ref()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| {
+                                    alias.name.split('.').next().unwrap_or_default().to_owned()
+                                });
+                        if alias.name.as_str() == "typing" {
+                            self.bind_as(bound, Bound::Typing);
+                        } else {
+                            self.bind(bound);
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let from_typing =
+                        i.level == 0 && i.module.as_ref().is_some_and(|m| m.as_str() == "typing");
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        if from_typing && alias.name.as_str() == "TypedDict" {
+                            self.bind_as(bound, Bound::TypedDict);
+                        } else {
+                            self.bind(bound);
+                        }
+                    }
+                }
+                Stmt::ClassDef(c) => {
+                    self.bind(c.name.to_string());
+                    // Decorators, bases and keywords are read in the
+                    // enclosing scope; the body's bindings (`TypedDict: int
+                    // = 1`) are class attributes and shadow nothing outside
+                    // the class body, not even in its methods.
+                    for d in &c.decorator_list {
+                        self.visit_expr(&d.expression);
+                    }
+                    if let Some(args) = c.arguments.as_deref() {
+                        for base in args.args.iter() {
+                            self.candidates(base, &args.keywords);
+                        }
+                        for e in args.args.iter() {
+                            self.visit_expr(e);
+                        }
+                        for kw in args.keywords.iter() {
+                            self.visit_expr(&kw.value);
+                        }
+                    }
+                    self.open_scope(true);
+                    self.visit_body(&c.body);
+                    self.stack.pop();
+                    return;
+                }
+                Stmt::FunctionDef(f) => {
+                    self.bind(f.name.to_string());
+                    // Decorators, defaults and annotations are evaluated in
+                    // the enclosing scope. The body, parameters included, is
+                    // its own: `def f(TypedDict: Any)` shadows the import
+                    // only there.
+                    for d in &f.decorator_list {
+                        self.visit_expr(&d.expression);
+                    }
+                    self.visit_outer_parameter_parts(&f.parameters);
+                    if let Some(ret) = &f.returns {
+                        self.visit_expr(ret);
+                    }
+                    self.open_scope(false);
+                    for p in f.parameters.iter() {
+                        self.bind(p.name().to_string());
+                    }
+                    self.visit_body(&f.body);
+                    self.stack.pop();
+                    return;
+                }
+                Stmt::Global(g) => {
+                    for name in &g.names {
+                        let slot = self.scopes[0]
+                            .entry(name.to_string())
+                            .or_insert(Bound::Other);
+                        *slot = Bound::Other;
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_pattern(&mut self, pattern: &'ast ruff_python_ast::Pattern) {
+            // `case {"factory": TypedDict}:` binds a name like an assignment.
+            use ruff_python_ast::Pattern;
+            match pattern {
+                Pattern::MatchAs(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.to_string());
+                    }
+                }
+                Pattern::MatchStar(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.to_string());
+                    }
+                }
+                Pattern::MatchMapping(p) => {
+                    if let Some(name) = &p.rest {
+                        self.bind(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+            walk_pattern(self, pattern);
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            // `X if sys.version_info >= (3, 15) else Y` is a feature probe
+            // too, like the statement form.
+            if let Expr::If(e) = expr {
+                if reads_version(&e.test) {
+                    self.guarded += 1;
+                    walk_expr(self, expr);
+                    self.guarded -= 1;
+                    return;
+                }
+            }
+            match expr {
+                Expr::Call(call) => {
+                    let head = call.func.as_ref().clone();
+                    self.candidates(&head, &call.arguments.keywords);
+                }
+                Expr::Name(n) if n.ctx != ruff_python_ast::ExprContext::Load => {
+                    self.bind(n.id.to_string());
+                }
+                Expr::ListComp(ruff_python_ast::ExprListComp {
+                    elt, generators, ..
+                })
+                | Expr::SetComp(ruff_python_ast::ExprSetComp {
+                    elt, generators, ..
+                })
+                | Expr::Generator(ruff_python_ast::ExprGenerator {
+                    elt, generators, ..
+                }) => {
+                    self.visit_comprehension(generators, &[elt]);
+                    return;
+                }
+                Expr::Named(n) => {
+                    self.visit_expr(&n.value);
+                    if let Expr::Name(target) = n.target.as_ref() {
+                        let scope = self
+                            .stack
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|&i| !self.comprehension_scope[i])
+                            .unwrap_or(0);
+                        self.scopes[scope].insert(target.id.to_string(), Bound::Other);
+                    }
+                    return;
+                }
+                Expr::DictComp(d) => {
+                    let results: Vec<&Expr> = d
+                        .key
+                        .as_deref()
+                        .into_iter()
+                        .chain([d.value.as_ref()])
+                        .collect();
+                    self.visit_comprehension(&d.generators, &results);
+                    return;
+                }
+                Expr::Lambda(l) => {
+                    if let Some(params) = l.parameters.as_deref() {
+                        self.visit_outer_parameter_parts(params);
+                    }
+                    self.open_scope(false);
+                    for p in l.parameters.iter().flat_map(|ps| ps.iter()) {
+                        self.bind(p.name().to_string());
+                    }
+                    self.visit_expr(&l.body);
+                    self.stack.pop();
+                    return;
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut v = V {
+        scopes: vec![HashMap::new()],
+        class_scope: vec![false],
+        comprehension_scope: vec![false],
+        stack: vec![0],
+        ..V::default()
+    };
+    v.visit_body(&module.body);
+    // The nearest visible binding of `name`, innermost scope first.
+    let resolve = |name: &str, enclosing: &[usize]| {
+        enclosing
+            .iter()
+            .rev()
+            .find_map(|&i| v.scopes[i].get(name).copied())
+    };
+    let is_typed_dict = |head: &Expr, enclosing: &[usize]| match head {
+        Expr::Name(n) => resolve(n.id.as_str(), enclosing) == Some(Bound::TypedDict),
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "TypedDict"
+                && matches!(a.value.as_ref(), Expr::Name(m)
+                    if resolve(m.id.as_str(), enclosing) == Some(Bound::Typing))
+        }
+        _ => false,
+    };
+    let mut out = Vec::new();
+    for (head, keyword, range, enclosing) in &v.uses {
+        let Some((kw, added)) = NEWER_TYPED_DICT_KEYWORDS
+            .iter()
+            .find(|(kw, added)| *kw == keyword && target < *added)
+        else {
+            continue;
+        };
+        if is_typed_dict(head, enclosing) {
+            out.push((*kw, *added, *range));
+        }
+    }
+    out.sort_by_key(|(_, _, r)| r.start());
+    out.dedup_by_key(|(_, _, r)| r.start());
+    out
 }
 
 /// Builtins newer than the 3.13 floor, with the version that added them.
@@ -322,7 +743,17 @@ const NEWER_STDLIB: &[(&str, &str, (u8, u8))] = &[
     ("re", "prefixmatch", (3, 15)),
     // PEP 791
     ("math", "integer", (3, 15)),
+    // PEP 747
+    ("typing", "TypeForm", (3, 15)),
+    // PEP 800
+    ("typing", "disjoint_base", (3, 15)),
 ];
+
+/// `TypedDict` class keywords newer than the 3.13 floor (PEP 728). On an
+/// older `typing.TypedDict` they are a `TypeError` when the class is
+/// created; `typing_extensions.TypedDict` accepts them everywhere.
+const NEWER_TYPED_DICT_KEYWORDS: &[(&str, (u8, u8))] =
+    &[("closed", (3, 15)), ("extra_items", (3, 15))];
 
 /// Every use of a [`NEWER_STDLIB`] attribute `target` does not have:
 /// `module.name` where `module` is bound only by `import module` (or
@@ -8390,6 +8821,61 @@ mod lint_tests {
             assert!(
                 target_errors(src, (3, 13)).is_empty(),
                 "false positive on 3.13 for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pep_728_typed_dict_keywords_and_3_15_typing_names_are_gated() {
+        for src in [
+            "from typing import TypedDict\nclass M(TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict as TD\nclass M(TD, extra_items=int):\n    name: str\n",
+            "import typing\nclass M(typing.TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict\nM = TypedDict(\"M\", {\"name\": str}, closed=True)\n",
+            "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
+            "import typing\nprint(typing.disjoint_base)\n",
+            // A local stdlib import beats a module-level backport.
+            "from typing_extensions import TypedDict\ndef build() -> object:\n    from typing import TypedDict\n    return TypedDict(\"M\", {}, closed=True)\n",
+            // A class attribute is not visible from the class's methods.
+            "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\n    def build(self) -> object:\n        return TypedDict(\"M\", {}, closed=True)\n",
+            // Defaults are evaluated in the enclosing scope.
+            "from typing import TypedDict\ndef build(TypedDict=TypedDict(\"M\", {}, closed=True)) -> None:\n    pass\n",
+            // A comprehension target binds only inside the comprehension.
+            "from typing import TypedDict\nlet items = [TypedDict for TypedDict in [1, 2]]\nclass M(TypedDict, closed=True):\n    name: str\n",
+            // A parameter elsewhere does not shadow the module-level import.
+            "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\nclass M(TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict, Any\ndef helper(TypedDict: Any) -> None:\n    pass\nclass M(TypedDict, closed=True):\n    name: str\n",
+        ] {
+            let on_313 = target_errors(src, (3, 13));
+            assert!(
+                on_313.iter().any(|c| c.contains("requires_newer_python")),
+                "expected requires_newer_python on 3.13 for {src:?}; got {on_313:?}"
+            );
+            assert!(
+                target_errors(src, (3, 15)).is_empty(),
+                "3.15 has it: {src:?}"
+            );
+        }
+        for src in [
+            // typing_extensions backports PEP 728 to every target.
+            "from typing_extensions import TypedDict\nclass M(TypedDict, closed=True):\n    name: str\n",
+            // Not a TypedDict keyword.
+            "from typing import TypedDict\nclass M(TypedDict, total=False):\n    name: str\n",
+            "class Base:\n    pass\nclass M(Base, closed=True):\n    pass\n",
+            // A feature probe.
+            "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
+            // A conditional-expression feature probe.
+            "import sys\nfrom typing import TypedDict\nM = TypedDict(\"M\", {}, closed=True) if sys.version_info >= (3, 15) else dict\n",
+            // A parameter shadows the import.
+            "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nlet items = [(TypedDict := Backport) for _ in [1]]\nclass M(TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nmatch {\"factory\": Backport}:\n    case {\"factory\": TypedDict}:\n        print(TypedDict(\"M\", {}, closed=True))\n    case _:\n        pass\n",
+            "from typing import TypedDict, Any\ndef build(TypedDict: Any) -> Any:\n    return TypedDict(\"M\", {}, closed=True)\n",
+            "from typing import TypedDict\nlet build = lambda TypedDict: TypedDict(\"M\", {}, closed=True)\n",
+        ] {
+            assert!(
+                target_errors(src, (3, 13)).is_empty(),
+                "false positive on 3.13 for {src:?}: {:?}",
+                target_errors(src, (3, 13))
             );
         }
     }

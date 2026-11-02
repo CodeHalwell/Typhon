@@ -64,6 +64,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::non_exhaustive_match`](./non_exhaustive_match.md) — `match` on a sealed union misses variants without a wildcard.
 - [`tyc::not_a_context_manager`](./not_a_context_manager.md) — `with` over a local class that lacks the context-manager protocol.
 - [`tyc::not_callable`](./not_callable.md) — call on a non-callable value.
+- [`tyc::deprecated`](./deprecated.md) — call of a PEP 702 `@deprecated` API, in a dependency or in `.ty` source (warning).
 - [`tyc::nullable_use`](./nullable_use.md) — possibly-`None` value used where a non-`None` value was expected.
 - [`tyc::operator_type_mismatch`](./operator_type_mismatch.md) — binary operator with incompatible operand types.
 - [`tyc::orphan_py_import`](./orphan_py_import.md) — warning: relative `.py` import resolves outside `src/`.

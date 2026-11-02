@@ -75,6 +75,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "comptime",
         "contains_secret_literal",
         "cyclic_type_alias",
+        "deprecated",
         "div_by_zero_literal",
         "duplicate_class",
         "duplicate_method",
@@ -372,6 +373,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "typevar_import_rejected" => {
             include_str!("../../../../../docs/diagnostics/typevar_import_rejected.md")
         }
+        "deprecated" => include_str!("../../../../../docs/diagnostics/deprecated.md"),
         "typing_alias_deprecated" => {
             include_str!("../../../../../docs/diagnostics/typing_alias_deprecated.md")
         }
