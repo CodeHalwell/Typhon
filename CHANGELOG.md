@@ -4,6 +4,20 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+### Changed
+
+- **`pub` on a method or field now explains itself.** `pub` stays
+  module-level only, since it works by adding the name to `__all__` and
+  class members are always public in Python. Writing it on an indented
+  declaration (a method or field in `class`, `model` or `impl`, a nested
+  `def`, or a binding under a module-level `if`) is still a parse error,
+  but the error now says why and points at the leading-underscore
+  convention for internal helpers. `tyc explain pub` covers the same
+  ground, including why an underscore is a bad idea on `model` fields and
+  pydantic-ai tool functions.
+
 ## 1.0.0-beta.4 — 2026-10-21 — making more of Python 3.15
 
 Python 3.15.0 shipped on 9 October. This release makes 3.15 the starting

@@ -4813,6 +4813,24 @@ pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Op
                     .to_owned(),
             );
         }
+        // `pub` on an indented declaration: a method or field in a
+        // `class` / `impl` / `model` body, a nested `def`, or a binding
+        // under a module-level `if` / `try`. The preprocessor strips
+        // `pub` only at indent 0, because `pub` means "list this name in
+        // the module's `__all__`" and only module-level names can be
+        // there. Class members are always reachable as `obj.name` in
+        // Python, so there is no visibility for `pub` to grant.
+        if indent_len > 0 && is_indented_pub_decl(trimmed) {
+            return Some(
+                "`pub` only marks unindented module-level declarations: it adds the \
+                 name to the module's `__all__`. Methods and fields are always public \
+                 in the emitted Python, so drop `pub` here. To mark a helper as \
+                 internal, the Python convention is a leading underscore \
+                 (`def _helper(self)`); avoid that on `model` fields, where pydantic \
+                 treats `_name` as a private attribute rather than a field."
+                    .to_owned(),
+            );
+        }
     }
 
     // `?` error-propagation inside an f-string expression part. The
@@ -4885,6 +4903,44 @@ pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Op
     }
 
     None
+}
+
+/// Whether `trimmed` (a line with its indentation removed) starts with
+/// `pub` followed by a declaration keyword or a `name:` field
+/// annotation — the shapes an indented `pub` takes when a user tries to
+/// mark a method, field, or nested declaration public. A bare
+/// expression such as `pub(x)` or `pub = 1` is a call or assignment to
+/// a variable named `pub` and must not match.
+fn is_indented_pub_decl(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("pub ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    const KEYWORDS: &[&str] = &[
+        "def ",
+        "async ",
+        "class ",
+        "class!",
+        "plain ",
+        "model ",
+        "enum ",
+        "interface ",
+        "newtype ",
+        "type ",
+        "let ",
+        "mut ",
+        "freeze ",
+        "comptime ",
+        "lazy ",
+    ];
+    if KEYWORDS.iter().any(|kw| rest.starts_with(kw)) {
+        return true;
+    }
+    // `pub name: T` — a field annotation in a class / model body.
+    let ident_end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    ident_end > 0 && rest[ident_end..].trim_start().starts_with(':')
 }
 
 /// Cached newline offsets for [`source_line`] / [`line_for_offset`].
@@ -5948,6 +6004,57 @@ mod tests {
             hint.contains("module-level"),
             "hint should mention module-level only, got: {hint}"
         );
+    }
+
+    #[test]
+    fn parse_error_hint_pub_on_impl_method() {
+        // `pub` on a method inside `impl` (or any indented declaration)
+        // is not stripped by the preprocessor, so the Python parser
+        // fails on it. The hint explains that `pub` is module-level
+        // only and points at the underscore convention.
+        let source = "impl Workspace:\n    pub def inside(self) -> bool:\n        return True\n";
+        let offset = source.find("    pub").unwrap();
+        let hint = parse_error_hint(
+            "Simple statements must be separated by newlines or semicolons",
+            source,
+            offset,
+        )
+        .expect("pub-on-method hint must fire");
+        assert!(hint.contains("module-level"), "got: {hint}");
+        assert!(hint.contains("__all__"), "got: {hint}");
+    }
+
+    #[test]
+    fn parse_error_hint_pub_on_field_and_async_method() {
+        for line in [
+            "    pub name: str",
+            "    pub async def run(self) -> None:",
+            "    pub let x: int = 1",
+        ] {
+            let source = format!("model User:\n{line}\n");
+            let offset = source.find("    pub").unwrap();
+            assert!(
+                parse_error_hint("unexpected token", &source, offset).is_some(),
+                "hint must fire for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_hint_ignores_variable_named_pub() {
+        for line in [
+            "    pub(x)",
+            "    pub = 1",
+            "    pub.attr = 2",
+            "    pub: int = 3",
+        ] {
+            let source = format!("def f() -> None:\n{line}\n");
+            let offset = source.find("    pub").unwrap();
+            assert!(
+                parse_error_hint("unexpected token", &source, offset).is_none(),
+                "hint must not fire for {line:?}"
+            );
+        }
     }
 
     #[test]
