@@ -2073,9 +2073,21 @@ fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
         match e {
             Expr::NoneLiteral(_) => true,
             Expr::Name(n) => {
-                let shadowed = c.env.lookup(n.id.as_str()).is_some_and(|binding| {
-                    !matches!(binding.narrowed, Type::Class(_) | Type::Unknown | Type::Any)
-                });
+                let name = n.id.as_str();
+                // A module-scope class name is bound to its class. A parameter
+                // or local of the same name is a value (`def f(Box: Box)`
+                // holds an instance), unless its type is unknown.
+                let shadowed = match c.env.scope_of(name) {
+                    None => false,
+                    Some(idx) => c
+                        .env
+                        .lookup(name)
+                        .is_some_and(|binding| match binding.narrowed {
+                            Type::Unknown | Type::Any => false,
+                            Type::Class(_) => idx > 0,
+                            _ => true,
+                        }),
+                };
                 let ok = !shadowed && expr_is_type_shaped(e, &c.classes, &c.active_type_params);
                 *saw_type |= ok;
                 ok
@@ -28190,6 +28202,16 @@ def describe(m: Maybe[int]) -> str:
         // A value that is really possibly-None is still reported.
         let d = check("def f(x: int?) -> None:\n    print(x | 1)\n");
         assert!(!d.errors().is_empty());
+        // A parameter named after a class holds an instance, not the class.
+        let d =
+            check("class Box:\n    x: int\n\ndef f(Box: Box) -> None:\n    print(Box | None)\n");
+        assert!(
+            !d.errors().is_empty(),
+            "an instance `| None` is a TypeError"
+        );
+        // The class itself, at module scope, is still a type.
+        let d = check("class Box:\n    x: int\n\ndef f() -> None:\n    print(Box | None)\n");
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
         // The leaves keep their own checks.
         let d = check("def f() -> None:\n    let t = list[1 / 0] | None\n    print(t)\n");
         assert!(

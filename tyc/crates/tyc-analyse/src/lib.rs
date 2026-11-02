@@ -344,10 +344,14 @@ fn newer_typed_dict_keywords(
         typed_dict: HashSet<String>,
         /// Local names bound to the `typing` module.
         typing: HashSet<String>,
-        /// Every other binding of a name, which may shadow either.
-        rebound: HashSet<String>,
-        /// `(callee/base, keyword, range)` candidates.
-        uses: Vec<(Expr, String, TextRange)>,
+        /// Every other binding of a name, per lexical scope (`0` is the
+        /// module; each `def` and `lambda` opens one). A binding shadows
+        /// either import only inside its own scope and the scopes it encloses.
+        scopes: Vec<HashSet<String>>,
+        /// The scopes enclosing the current node, innermost last.
+        stack: Vec<usize>,
+        /// `(callee/base, keyword, range, enclosing scopes)` candidates.
+        uses: Vec<(Expr, String, TextRange, Vec<usize>)>,
         /// Inside a feature probe (see [`newer_stdlib_uses`]).
         guarded: u32,
     }
@@ -373,14 +377,26 @@ fn newer_typed_dict_keywords(
         t.0
     }
     impl V {
+        fn bind(&mut self, name: String) {
+            let top = self.stack.last().copied().unwrap_or(0);
+            self.scopes[top].insert(name);
+        }
+        fn open_scope(&mut self) {
+            self.scopes.push(HashSet::new());
+            self.stack.push(self.scopes.len() - 1);
+        }
         fn candidates(&mut self, head: &Expr, keywords: &[ruff_python_ast::Keyword]) {
             if self.guarded > 0 {
                 return;
             }
             for kw in keywords {
                 if let Some(arg) = &kw.arg {
-                    self.uses
-                        .push((head.clone(), arg.as_str().to_owned(), kw.range));
+                    self.uses.push((
+                        head.clone(),
+                        arg.as_str().to_owned(),
+                        kw.range,
+                        self.stack.clone(),
+                    ));
                 }
             }
         }
@@ -417,7 +433,7 @@ fn newer_typed_dict_keywords(
                         if alias.name.as_str() == "typing" {
                             self.typing.insert(bound);
                         } else {
-                            self.rebound.insert(bound);
+                            self.bind(bound);
                         }
                     }
                 }
@@ -429,12 +445,12 @@ fn newer_typed_dict_keywords(
                         if from_typing && alias.name.as_str() == "TypedDict" {
                             self.typed_dict.insert(bound);
                         } else {
-                            self.rebound.insert(bound);
+                            self.bind(bound);
                         }
                     }
                 }
                 Stmt::ClassDef(c) => {
-                    self.rebound.insert(c.name.to_string());
+                    self.bind(c.name.to_string());
                     if let Some(args) = c.arguments.as_deref() {
                         for base in args.args.iter() {
                             self.candidates(base, &args.keywords);
@@ -442,10 +458,20 @@ fn newer_typed_dict_keywords(
                     }
                 }
                 Stmt::FunctionDef(f) => {
-                    self.rebound.insert(f.name.to_string());
-                    // A parameter is a binding too: `def f(TypedDict: Any)`.
+                    self.bind(f.name.to_string());
+                    // The body, parameters included, is its own scope:
+                    // `def f(TypedDict: Any)` shadows the import only there.
+                    self.open_scope();
                     for p in f.parameters.iter() {
-                        self.rebound.insert(p.name().to_string());
+                        self.bind(p.name().to_string());
+                    }
+                    walk_stmt(self, stmt);
+                    self.stack.pop();
+                    return;
+                }
+                Stmt::Global(g) => {
+                    for name in &g.names {
+                        self.scopes[0].insert(name.to_string());
                     }
                 }
                 _ => {}
@@ -459,38 +485,48 @@ fn newer_typed_dict_keywords(
                     self.candidates(&head, &call.arguments.keywords);
                 }
                 Expr::Name(n) if n.ctx != ruff_python_ast::ExprContext::Load => {
-                    self.rebound.insert(n.id.to_string());
+                    self.bind(n.id.to_string());
                 }
                 Expr::Lambda(l) => {
+                    self.open_scope();
                     for p in l.parameters.iter().flat_map(|ps| ps.iter()) {
-                        self.rebound.insert(p.name().to_string());
+                        self.bind(p.name().to_string());
                     }
+                    walk_expr(self, expr);
+                    self.stack.pop();
+                    return;
                 }
                 _ => {}
             }
             walk_expr(self, expr);
         }
     }
-    let mut v = V::default();
+    let mut v = V {
+        scopes: vec![HashSet::new()],
+        stack: vec![0],
+        ..V::default()
+    };
     v.visit_body(&module.body);
-    let is_typed_dict = |head: &Expr| match head {
-        Expr::Name(n) => v.typed_dict.contains(n.id.as_str()) && !v.rebound.contains(n.id.as_str()),
+    let rebound =
+        |name: &str, enclosing: &[usize]| enclosing.iter().any(|&i| v.scopes[i].contains(name));
+    let is_typed_dict = |head: &Expr, enclosing: &[usize]| match head {
+        Expr::Name(n) => v.typed_dict.contains(n.id.as_str()) && !rebound(n.id.as_str(), enclosing),
         Expr::Attribute(a) => {
             a.attr.as_str() == "TypedDict"
                 && matches!(a.value.as_ref(), Expr::Name(m)
-                    if v.typing.contains(m.id.as_str()) && !v.rebound.contains(m.id.as_str()))
+                    if v.typing.contains(m.id.as_str()) && !rebound(m.id.as_str(), enclosing))
         }
         _ => false,
     };
     let mut out = Vec::new();
-    for (head, keyword, range) in &v.uses {
+    for (head, keyword, range, enclosing) in &v.uses {
         let Some((kw, added)) = NEWER_TYPED_DICT_KEYWORDS
             .iter()
             .find(|(kw, added)| *kw == keyword && target < *added)
         else {
             continue;
         };
-        if is_typed_dict(head) {
+        if is_typed_dict(head, enclosing) {
             out.push((*kw, *added, *range));
         }
     }
@@ -8606,6 +8642,8 @@ mod lint_tests {
             "from typing import TypedDict\nM = TypedDict(\"M\", {\"name\": str}, closed=True)\n",
             "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
             "import typing\nprint(typing.disjoint_base)\n",
+            // A parameter elsewhere does not shadow the module-level import.
+            "from typing import TypedDict, Any\ndef helper(TypedDict: Any) -> None:\n    pass\nclass M(TypedDict, closed=True):\n    name: str\n",
         ] {
             let on_313 = target_errors(src, (3, 13));
             assert!(
