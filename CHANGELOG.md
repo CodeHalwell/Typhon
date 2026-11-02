@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — agent-feedback fixes
+## 1.0.0-beta.5 — 2026-11-02 — agent-feedback fixes
 
 Fixes from a coding agent's session building a pydantic-ai tool with
 Typhon. No language change; the only new error is `tyc build <path>` on a

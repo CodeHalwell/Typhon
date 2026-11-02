@@ -10,6 +10,14 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.5) — 2026-11-02.**
+Fixes from a coding agent's real-world session. Third-party dependencies are
+introspected again when `tyc check` runs from the project root, through a
+general distribution → import-name resolver. `tyc build tests/` builds that
+unit with a generated `conftest.py`. `pyproject.toml` changes are reported and
+`uv.lock` kept fresh. Generated code passes `ruff check`, and stale files are
+swept from `build/`. No language change.
+
 **[v1.0.0-beta.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.4) — 2026-10-21.**
 Making more of Python 3.15. `tyc init` scaffolds `target = "3.15"`,
 `tyc profile` samples with 3.15's Tachyon profiler and maps the stacks back

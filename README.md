@@ -181,7 +181,7 @@ The single canonical design doc is **[the long-term plan](docs/long-term-plan.md
 
 ## Project status
 
-**Current release: [v1.0.0-beta.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.4)** (2026-10-21).
+**Current release: [v1.0.0-beta.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.5)** (2026-11-02).
 
 Typhon reached its **first feature-complete alpha** in
 [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha): the
@@ -192,8 +192,10 @@ soundness, robustness, performance, release-engineering, and codebase-review
 hardening pass. **v1.0.0-beta.1** closed four review-remediation waves and froze
 the surface under the [compatibility policy](docs/compatibility.md);
 **v1.0.0-beta.3** added Python 3.15 targets and a long run of VM ↔ CPython
-parity fixes, and **v1.0.0-beta.4** makes 3.15 the starting point for new
-projects, with `tyc profile` on 3.15's sampling profiler.
+parity fixes, **v1.0.0-beta.4** made 3.15 the starting point for new
+projects, and **v1.0.0-beta.5** fixes gaps a coding agent hit in real use:
+third-party checking, test builds, `pyproject.toml` drift, ruff-clean output
+and stale files in `build/`.
 
 - ✅ **The production path is stable.** `tyc build` → CPython 3.13+ carries no runtime dependency on the toolchain; the full `examples/` + `examples/apps/` corpus builds to runnable Python and checks clean.
 - ✅ **The language is additive on *correct* programs** across the whole v0.3.0 → v1.0.0-alpha line — every program that type-checked *and ran correctly* continues to behave identically. (A few deliberate diagnostics reject only code that already crashed at runtime.) The deliberate exceptions in v1.0.0-beta.1, chiefly `[strictness] nullable-use` now defaulting to `"error"`, are listed in the compatibility policy.
