@@ -443,6 +443,10 @@ fn newer_typed_dict_keywords(
                 }
                 Stmt::FunctionDef(f) => {
                     self.rebound.insert(f.name.to_string());
+                    // A parameter is a binding too: `def f(TypedDict: Any)`.
+                    for p in f.parameters.iter() {
+                        self.rebound.insert(p.name().to_string());
+                    }
                 }
                 _ => {}
             }
@@ -456,6 +460,11 @@ fn newer_typed_dict_keywords(
                 }
                 Expr::Name(n) if n.ctx != ruff_python_ast::ExprContext::Load => {
                     self.rebound.insert(n.id.to_string());
+                }
+                Expr::Lambda(l) => {
+                    for p in l.parameters.iter().flat_map(|ps| ps.iter()) {
+                        self.rebound.insert(p.name().to_string());
+                    }
                 }
                 _ => {}
             }
@@ -8616,6 +8625,9 @@ mod lint_tests {
             "class Base:\n    pass\nclass M(Base, closed=True):\n    pass\n",
             // A feature probe.
             "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
+            // A parameter shadows the import.
+            "from typing import TypedDict, Any\ndef build(TypedDict: Any) -> Any:\n    return TypedDict(\"M\", {}, closed=True)\n",
+            "from typing import TypedDict\nlet build = lambda TypedDict: TypedDict(\"M\", {}, closed=True)\n",
         ] {
             assert!(
                 target_errors(src, (3, 13)).is_empty(),

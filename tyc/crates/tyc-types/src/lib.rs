@@ -2087,7 +2087,21 @@ fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
                 ok
             }
             Expr::Attribute(a) => {
-                let ok = matches!(infer_expr_readonly(c, &a.value), Type::Module(_));
+                // `mod.Class`, but not `mod.func` or a module-level value:
+                // `helpers.make | None` is a `TypeError`.
+                let ok = match infer_expr_readonly(c, &a.value) {
+                    Type::Module(module) => {
+                        let is_function = c.module_registry.get(&module).is_some_and(|shapes| {
+                            shapes.function_arities.contains_key(a.attr.as_str())
+                        });
+                        !is_function
+                            && matches!(
+                                infer_expr_readonly(c, e),
+                                Type::Unknown | Type::Any | Type::Class(_) | Type::Generic(..)
+                            )
+                    }
+                    _ => false,
+                };
                 *saw_type |= ok;
                 ok
             }
@@ -39166,6 +39180,27 @@ def main(dogs: list[Dog]) -> None:
             &consumer_prep.impl_distributed_lines,
             Some(external),
         )
+    }
+
+    #[test]
+    fn a_module_function_in_a_value_union_is_not_a_type() {
+        let (_, external) = cross_module_external(
+            "def make() -> int:\n    return 1\n\nclass Box:\n    x: int\n",
+            &[],
+        );
+        let d = check_consumer(
+            "import producer\n\ndef main() -> None:\n    let t = producer.Box | None\n    print(t)\n",
+            &external,
+        );
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        let d = check_consumer(
+            "import producer\n\ndef main() -> None:\n    let t = producer.make | None\n    print(t)\n",
+            &external,
+        );
+        assert!(
+            !d.errors().is_empty(),
+            "`producer.make | None` is a TypeError"
+        );
     }
 
     /// A method / property signature for the followed-class fixtures.
