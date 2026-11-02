@@ -10,6 +10,12 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.7) — 2026-11-02.**
+Fixes from testing beta.6: a dependency's generic class built without type
+arguments (`Agent(model, output_type=Review)`) fits an annotation that names
+them, the `__all__` generated for `pub *` follows ruff's RUF022 order, and
+`build/.tyc-build-manifest` carries a header saying to commit it with `build/`.
+
 **[v1.0.0-beta.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.6) — 2026-11-02.**
 Third-party checking reaches past the first call: venv introspection follows
 return types into their classes, so a property used as a method

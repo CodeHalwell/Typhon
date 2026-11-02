@@ -4,6 +4,36 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-beta.7 — 2026-11-02 — beta.6 feedback fixes
+
+Fixes from the beta.6 feedback session. No language change.
+
+### Fixed
+
+- **`-> Agent[None, Review]` for a bare constructor.** A dependency's generic
+  class built without explicit type arguments (`Agent(model,
+  output_type=Review)`) was a `tyc::type_mismatch` against an annotation that
+  names them, while `AgentRunResult[Any]` already fitted
+  `AgentRunResult[Review]`. When the checker doesn't know the class's type
+  parameters, the bare class now fits its own parameterised form. A different
+  class in the same position is still a mismatch.
+- **`__all__` order passes ruff RUF022.** The `__all__` synthesised for
+  `pub *` was sorted plain alphabetically; it now follows ruff's isort-style
+  order (SCREAMING_CASE constants, then CamelCase names, then the rest, with
+  natural ordering inside each group), so `SEVERITIES` comes first.
+- **`build/.tyc-build-manifest` says what it is.** The manifest starts with a
+  comment header explaining that it lists the files `tyc build` generated and
+  should be committed alongside `build/`. `docs/cli.md`, the `tyc build` docs
+  page and the skill say the same.
+
+### Skill
+
+- Both copies of the Typhon skill cover beta.6: the 3.15 typing gates under
+  `tyc::requires_newer_python`, PEP 604 unions as values, followed return
+  types, and new pitfalls for property-vs-method calls on dependencies,
+  `@deprecated` in `.ty` source, PEP 728 keywords on older targets, and the
+  `Agent[None, Review]` fix.
+
 ## 1.0.0-beta.6 — 2026-11-02 — following third-party return types
 
 Third-party checking now reaches past the first call. The pydantic-ai bug

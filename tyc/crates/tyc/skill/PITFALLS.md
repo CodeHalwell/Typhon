@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v1.0.0-beta.6**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
+Current release: **v1.0.0-beta.7**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
 
 ---
 
@@ -1483,6 +1483,53 @@ pub lazy let CFG: dict[str, int] = load()   # ❌ tyc::parse
 ```
 
 **Trigger:** stacking `pub` onto a `lazy let`. **Why:** `pub` stacks with every other modifier — including `comptime` (`pub comptime let` works as of v0.15.4) — but the `lazy let` lowering runs in a separate text pass that would silently drop the laziness under a leading `pub `, so the combination is rejected rather than shipped half-working. **Fix:** drop `pub` — a module-level `lazy let CFG = …` is still importable by name (`from config import CFG`); it just won't appear in a synthesised `__all__`. If a build-time constant fits instead, `pub comptime let` is fully supported.
+
+---
+
+## 85. Calling a dependency's property like a method (v1.0.0-beta.6)
+
+```python
+let result = agent.run_sync("hi")
+let used = result.usage()      # ❌ tyc::not_callable — `usage` is a property in current pydantic-ai
+```
+
+**Trigger:** a library turned a method into a property (or deprecated it) and the call site still uses the old form. **Why:** introspection now follows return types into the dependency's classes, so `result`'s attributes are known; before beta.6 this only showed up as a runtime `DeprecationWarning` or `TypeError`. A PEP 702 `@deprecated` API you still call warns as `tyc::deprecated`. **Fix:** read the property (`result.usage`) or move to the replacement the warning names.
+
+---
+
+## 86. `@deprecated` in `.ty` source needs the call form (v1.0.0-beta.6)
+
+```python
+@deprecated                      # ❌ not recognised — no message
+def old_api() -> int: ...
+
+@deprecated("use new_api()")     # ✅ callers get tyc::deprecated
+def old_api() -> int: ...
+```
+
+**Trigger:** a bare `@deprecated` or a message built at runtime. **Why:** the checker reads the message from a string literal, as PEP 702 requires. **Fix:** `from warnings import deprecated` (or `typing_extensions`) and pass a string literal.
+
+---
+
+## 87. `TypedDict(closed=..., extra_items=...)` on a 3.13 / 3.14 target (v1.0.0-beta.6)
+
+```python
+class Movie(TypedDict, extra_items=int):   # ❌ tyc::requires_newer_python on target 3.13
+    title: str
+```
+
+**Trigger:** PEP 728 keywords, `typing.TypeForm` or `typing.disjoint_base` below a 3.15 target. **Fix:** `from typing_extensions import TypedDict` (exempt), or raise `[python] target` to `"3.15"`. `closed=True` together with `extra_items=` is an error on every target, because CPython rejects the class.
+
+---
+
+## 88. `-> Agent[None, Review]` rejected for a bare constructor (fixed in v1.0.0-beta.7)
+
+```python
+def agent() -> Agent[None, Review]:
+    return Agent(model, output_type=Review)   # beta.6: tyc::type_mismatch; beta.7: accepted
+```
+
+**Trigger:** returning a dependency's generic class built without explicit type arguments into a parameterised annotation. **Why:** the checker doesn't infer type arguments from `output_type=`, and beta.6 treated the bare `Agent` as not fitting `Agent[None, Review]`, even though `AgentRunResult[Any]` already fitted `AgentRunResult[Review]`. **Fix:** upgrade; on beta.6, annotate `-> Agent`. A *different* class in the same position is still a mismatch.
 
 ---
 

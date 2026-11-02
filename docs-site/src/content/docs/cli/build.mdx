@@ -85,7 +85,7 @@ Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs a
 
 ## Stale files and lint
 
-Each output directory keeps a `.tyc-build-manifest` of what the build wrote. Files an earlier build wrote that the current one does not — a renamed module, a `typhon_runtime/` the code no longer needs — are removed; files `tyc` did not write are never touched.
+Each output directory keeps a `.tyc-build-manifest` of what the build wrote. Files an earlier build wrote that the current one does not — a renamed module, a `typhon_runtime/` the code no longer needs — are removed; files `tyc` did not write are never touched. If you commit `build/`, commit `build/.tyc-build-manifest` with it (check that a `.*` rule in `.gitignore` doesn't drop it): a build on a fresh clone reads it to know which files it may remove.
 
 With `[emit] format = true` and `ruff` on `PATH`, the emitted imports are also sorted (`ruff check --fix --select I`, using your project's ruff settings), so the output passes `ruff check` with isort enabled.
 

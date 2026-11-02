@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v1.0.0-beta.6**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`); third-party introspection rides on the side crate `tyc-venv`. The current release is **v1.0.0-beta.7**.
 
 ```bash
 # One-time: build the compiler
@@ -35,6 +35,8 @@ Exits non-zero on any `tyc::*` diagnostic at `"error"` severity. Diagnostics are
 
 **v0.12.0: third-party argument-type checking.** `tyc check` now consults venv signature introspection (the `tyc-venv` crate) for the *types* of arguments to fully-typed third-party functions / constructors, not just their arity — a wrong-typed argument fires `tyc::type_mismatch`. A declared dependency that's imported but can't be introspected surfaces the `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`). `--with-ty` (normally emit-free `check` builds to a throwaway directory first) additionally runs the `ty` typeshed pass — see [`tyc ty`](#tyc-ty) and `[checker]` below.
 
+**v1.0.0-beta.6: return types are followed.** Introspection follows a third-party function's, method's or property's annotated return class into that class, so calls and attribute reads on a dependency's *return values* are checked too (`result.usage()` on a property is `tyc::not_callable`; a PEP 702 `@deprecated` API warns as `tyc::deprecated`). From v1.0.0-beta.7, a dependency's generic class built without explicit type arguments (`Agent(model, output_type=Review)`) fits an annotation that names them (`-> Agent[None, Review]`), the same way `AgentRunResult[Any]` already fit `AgentRunResult[Review]`.
+
 ### `tyc build [PATHS]`
 
 Full pipeline: parse → check → analyse → desugar → emit → format. Writes:
@@ -47,7 +49,7 @@ Full pipeline: parse → check → analyse → desugar → emit → format. Writ
 
 `[emit] format = true` (the default) runs `ruff format` post-emit, then sorts imports with `ruff check --fix --select I` (project ruff settings), so the output passes `ruff check`.
 
-`tyc build tests/` (or `tyc build tests/test_x.ty`) compiles that directory/file instead of `src/`, type-checked against the project's modules, into `build/tests/` with a generated `conftest.py` that puts `build/` on `sys.path` — then `pytest build/tests`. Files an earlier build wrote that the current one does not are removed (tracked in `<out>/.tyc-build-manifest`). The build prints any change it makes to `pyproject.toml`'s dependency lists; `typhon.toml` owns them (`tyc add`, not `uv add`), and `--no-sync` refreshes an existing `uv.lock`.
+`tyc build tests/` (or `tyc build tests/test_x.ty`) compiles that directory/file instead of `src/`, type-checked against the project's modules, into `build/tests/` with a generated `conftest.py` that puts `build/` on `sys.path` — then `pytest build/tests`. Files an earlier build wrote that the current one does not are removed (tracked in `<out>/.tyc-build-manifest` — commit it alongside a committed `build/`, so a build on a fresh clone knows what it may remove). The build prints any change it makes to `pyproject.toml`'s dependency lists; `typhon.toml` owns them (`tyc add`, not `uv add`), and `--no-sync` refreshes an existing `uv.lock`.
 
 | Flag | Effect |
 |---|---|
