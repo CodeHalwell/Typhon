@@ -2079,12 +2079,13 @@ fn inject_memoise_decorators(
     // Names this module binds for itself — a user or third-party `pure` /
     // `memo` / `gatherable` is not Typhon's marker and must survive.
     let shadowed = user_bound_marker_names(&body);
+    let shadowed_owned: std::collections::HashSet<String> = shadowed.into_iter().map(|s| s.to_string()).collect();
     let new_body: Vec<Stmt> = body
         .into_iter()
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
-                f.decorator_list = strip_purity_decorators_with(f.decorator_list, &shadowed);
-                f.body = strip_purity_decorators_in_body_with(f.body, &shadowed);
+                f.decorator_list = strip_purity_decorators_with(f.decorator_list, &shadowed_owned);
+                f.body = strip_purity_decorators_in_body_with(f.body, &shadowed_owned);
                 if !has_cache_decorator(&f.decorator_list) {
                     if memoise.iter().any(|n| n == f.name.as_str()) {
                         f.decorator_list
@@ -2102,8 +2103,8 @@ fn inject_memoise_decorators(
                 // A top-level class drops its `@covariant` / `@contravariant`
                 // marker exactly like a nested one does.
                 c.decorator_list
-                    .retain(|d| !is_variance_marker_with(&d.expression, &shadowed));
-                c.body = strip_purity_decorators_in_body_with(c.body, &shadowed);
+                    .retain(|d| !is_variance_marker_with(&d.expression, &shadowed_owned));
+                c.body = strip_purity_decorators_in_body_with(c.body, &shadowed_owned);
                 Stmt::ClassDef(c)
             }
             other => other,
