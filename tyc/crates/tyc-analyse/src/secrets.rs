@@ -47,6 +47,7 @@ use crate::ComptimeValue;
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "PASSPHRASE",
     "CREDENTIAL",
+    "OAUTHTOKEN",
     "APISECRET",
     "PASSWORD",
     "APITOKEN",
@@ -903,7 +904,7 @@ mod tests {
             name_tokens("dbPASSWORDString"),
             ["DB", "PASSWORD", "STRING"]
         );
-        assert_eq!(name_tokens("OAUTHTOKEN"), ["OAUTH", "TOKEN"]);
+        assert_eq!(name_tokens("OAUTHTOKEN"), ["OAUTHTOKEN"]);
         assert_eq!(name_tokens("MONKEY"), ["MONKEY"]);
         assert_eq!(name_tokens("PASSPORT"), ["PASSPORT"]);
         assert_eq!(name_tokens("myTokenValue"), ["MY", "TOKEN", "VALUE"]);
