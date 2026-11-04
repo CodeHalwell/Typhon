@@ -61,3 +61,7 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-11-28 - Zero-Allocation user_bound_marker_names
+**Learning:** `user_bound_marker_names` originally mapped AST nodes to a new `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to verify decorators inside hot paths, the repeated allocation of strings negatively impacted compilation times.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&[Stmt]` reference, we can avoid String allocations entirely when building the `shadowed` set and rely on dereferencing pointers for fast lookups. Callers to `.contains()` just need to pass the string slice. We can drop `shadowed` or re-map it to `HashSet<String>` when it is strictly required to be owned across scopes that move the original `body` AST.

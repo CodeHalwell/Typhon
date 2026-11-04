@@ -44,17 +44,17 @@ pub use ruff_python_ast as ast;
 /// make correlated decisions about the same three names, so a private copy in
 /// either crate is a drift hazard that would make the pipeline half-strip or
 /// half-honour a marker.
-pub fn user_bound_marker_names(
-    body: &[ruff_python_ast::Stmt],
-) -> std::collections::HashSet<String> {
+pub fn user_bound_marker_names<'a>(
+    body: &'a [ruff_python_ast::Stmt],
+) -> std::collections::HashSet<&'a str> {
     use ruff_python_ast::{Expr, Stmt};
     // `covariant` / `contravariant` are the class-level variance overrides;
     // like the three function markers they have no Python runtime form.
     const MARKERS: [&str; 5] = ["pure", "memo", "gatherable", "covariant", "contravariant"];
     let mut out = std::collections::HashSet::new();
-    let mut note = |name: &str| {
+    let mut note = |name: &'a str| {
         if MARKERS.contains(&name) {
-            out.insert(name.to_owned());
+            out.insert(name);
         }
     };
     for stmt in body {
@@ -136,7 +136,8 @@ def unrelated():
     pass
 ";
         let parsed = parse_module(src).expect("test source parses");
-        let names = user_bound_marker_names(&parsed.into_syntax().body);
+        let module = parsed.into_syntax();
+        let names = user_bound_marker_names(&module.body);
         assert!(names.contains("memo"));
         assert!(names.contains("pure"));
         assert!(names.contains("gatherable"));
@@ -144,7 +145,8 @@ def unrelated():
 
         let src2 = "memo = object()\npure: int = 1\nclass gatherable:\n    pass\n";
         let parsed2 = parse_module(src2).expect("test source parses");
-        let names2 = user_bound_marker_names(&parsed2.into_syntax().body);
+        let module2 = parsed2.into_syntax();
+        let names2 = user_bound_marker_names(&module2.body);
         assert_eq!(names2.len(), 3);
     }
     use super::*;
