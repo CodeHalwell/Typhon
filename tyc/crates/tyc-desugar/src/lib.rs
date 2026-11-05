@@ -2118,7 +2118,7 @@ fn inject_memoise_decorators(
 /// class methods and nested functions.
 fn strip_purity_decorators_in_body_with(
     body: Vec<Stmt>,
-    shadowed: &std::collections::HashSet<String>,
+    shadowed: &std::collections::HashSet<&str>,
 ) -> Vec<Stmt> {
     body.into_iter()
         .map(|stmt| match stmt {
@@ -2144,7 +2144,7 @@ fn strip_purity_decorators_in_body_with(
 
 /// A bare `@covariant` / `@contravariant` class decorator (see
 /// [`strip_purity_decorators_in_body_with`]).
-fn is_variance_marker_with(d: &Expr, shadowed: &std::collections::HashSet<String>) -> bool {
+fn is_variance_marker_with(d: &Expr, shadowed: &std::collections::HashSet<&str>) -> bool {
     match d {
         Expr::Name(n) => {
             matches!(n.id.as_str(), "covariant" | "contravariant")
@@ -2166,7 +2166,7 @@ use tyc_syntax::user_bound_marker_names;
 /// are Typhon-only metadata, not actual Python runtime decorators.
 fn strip_purity_decorators_with(
     decorators: Vec<Decorator>,
-    shadowed: &std::collections::HashSet<String>,
+    shadowed: &std::collections::HashSet<&str>,
 ) -> Vec<Decorator> {
     decorators
         .into_iter()
@@ -2174,7 +2174,7 @@ fn strip_purity_decorators_with(
         .collect()
 }
 
-fn is_purity_marker_with(d: &Expr, shadowed: &std::collections::HashSet<String>) -> bool {
+fn is_purity_marker_with(d: &Expr, shadowed: &std::collections::HashSet<&str>) -> bool {
     match d {
         // `gatherable` lives alongside `pure` / `memo` as a Typhon-internal
         // attestation: the user marks `async def fetch_user(...)` with it

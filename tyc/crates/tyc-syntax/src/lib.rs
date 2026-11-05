@@ -46,15 +46,15 @@ pub use ruff_python_ast as ast;
 /// half-honour a marker.
 pub fn user_bound_marker_names(
     body: &[ruff_python_ast::Stmt],
-) -> std::collections::HashSet<String> {
+) -> std::collections::HashSet<&'static str> {
     use ruff_python_ast::{Expr, Stmt};
     // `covariant` / `contravariant` are the class-level variance overrides;
     // like the three function markers they have no Python runtime form.
     const MARKERS: [&str; 5] = ["pure", "memo", "gatherable", "covariant", "contravariant"];
     let mut out = std::collections::HashSet::new();
     let mut note = |name: &str| {
-        if MARKERS.contains(&name) {
-            out.insert(name.to_owned());
+        if let Some(marker) = MARKERS.iter().find(|&&m| m == name) {
+            out.insert(*marker);
         }
     };
     for stmt in body {
