@@ -61,3 +61,15 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-11-29 - Zero-Allocation user_bound_marker_names
+**Learning:** `user_bound_marker_names` returned a `HashSet<String>` by cloning statically known marker strings (like "pure", "memo") when building sets of shadowed decorators. Because this function is called inside hot paths (e.g. `strip_purity_decorators_in_body_with` and `decorator_intent`) for every function node during analysis and desugaring, these string allocations introduce unnecessary memory pressure.
+**Action:** Change `user_bound_marker_names` to return a `HashSet<&'static str>` instead by borrowing from the static `MARKERS` array, eliminating heap allocation. Update downstream references (like `shadowed: &HashSet<&str>`) accordingly.
+
+## 2024-11-29 - Zero-Allocation user_bound_marker_names
+**Learning:** `user_bound_marker_names` returned a `HashSet<String>` by cloning statically known marker strings (like "pure", "memo") when building sets of shadowed decorators. Because this function is called inside hot paths (e.g. `strip_purity_decorators_in_body_with` and `decorator_intent`) for every function node during analysis and desugaring, these string allocations introduce unnecessary memory pressure.
+**Action:** Change `user_bound_marker_names` to return a `HashSet<&'static str>` instead by borrowing from the static `MARKERS` array, eliminating heap allocation. Update downstream references (like `shadowed: &HashSet<&str>`) accordingly.
+
+## 2024-11-29 - Zero-Allocation user_bound_marker_names
+**Learning:** `user_bound_marker_names` returned a `HashSet<String>` by cloning statically known marker strings (like "pure", "memo") when building sets of shadowed decorators. Because this function is called inside hot paths (e.g. `strip_purity_decorators_in_body_with` and `decorator_intent`) for every function node during analysis and desugaring, these string allocations introduce unnecessary memory pressure.
+**Action:** Change `user_bound_marker_names` to return a `HashSet<&'static str>` instead by borrowing from the static `MARKERS` array, eliminating heap allocation. Update downstream references (like `shadowed: &HashSet<&str>`) accordingly.
