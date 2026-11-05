@@ -66,3 +66,15 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
     transform: none;
   }
 }
+.sl-link-card:hover, .sl-link-card:focus-within {
+  transform: translateY(-2px);
+}
+.hero .sl-link-button:hover, .hero .sl-link-button:focus-visible {
+  transform: translateY(-2px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sl-link-card:hover, .sl-link-card:focus-within,
+  .hero .sl-link-button:hover, .hero .sl-link-button:focus-visible {
+    transform: none;
+  }
+}
