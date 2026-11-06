@@ -1726,15 +1726,15 @@ pub fn resolve_module_with(
     // names are scraped by name from the original Typhon source (robust
     // against preprocess line shifts); raw (`class!`) names are read off
     // the `ClassKind::Raw` markers the resolver already tagged.
-    let plain_classes = r
+    let plain_classes: std::collections::HashSet<String> = r
         .original_source
         .as_deref()
-        .map(plain_class_names)
+        .map(|src| plain_class_names(src).into_iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
-    let mut raw_classes = r
+    let mut raw_classes: std::collections::HashSet<String> = r
         .original_source
         .as_deref()
-        .map(raw_class_names)
+        .map(|src| raw_class_names(src).into_iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
     for scope in &r.scopes {
         for b in &scope.bindings {
@@ -1786,7 +1786,7 @@ fn report_impl_forward_references(r: &mut Resolver, body: &[Stmt]) {
 /// false-positive risk (the exact text `plain class X:` inside a
 /// docstring) is benign: at worst it suppresses two lint diagnostics on a
 /// class that does not exist.
-fn plain_class_names(original: &str) -> std::collections::HashSet<String> {
+fn plain_class_names(original: &str) -> std::collections::HashSet<&str> {
     scrape_class_names(original, "plain class ")
 }
 
@@ -1796,11 +1796,11 @@ fn plain_class_names(original: &str) -> std::collections::HashSet<String> {
 /// aren't wired into a resolve entry point (the `tyc check` path doesn't
 /// thread them) — keeping `tyc::manual_init` from firing on a `class!` with
 /// a hand-written `__init__`.
-fn raw_class_names(original: &str) -> std::collections::HashSet<String> {
+fn raw_class_names(original: &str) -> std::collections::HashSet<&str> {
     scrape_class_names(original, "class! ")
 }
 
-fn scrape_class_names(original: &str, prefix: &str) -> std::collections::HashSet<String> {
+fn scrape_class_names<'a>(original: &'a str, prefix: &str) -> std::collections::HashSet<&'a str> {
     let mut names = std::collections::HashSet::new();
     for line in original.lines() {
         let trimmed = line.trim_start();
@@ -1809,10 +1809,8 @@ fn scrape_class_names(original: &str, prefix: &str) -> std::collections::HashSet
             .map(str::trim_start)
             .unwrap_or(trimmed);
         if let Some(after) = rest.strip_prefix(prefix) {
-            let name: String = after
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            let end = after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len());
+            let name = &after[..end];
             if !name.is_empty() {
                 names.insert(name);
             }
