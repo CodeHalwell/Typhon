@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2024-03-21 - [Focus indicators for tabs and scrollable regions]
+**Learning:** In Astro/Starlight documentation sites, interactive and scrollable regions such as `starlight-tabs [role="tab"]`, elements with `[tabindex="0"]`, and Expressive Code blocks (`.expressive-code pre`) lack explicit focus indicators by default. Ensure keyboard accessibility by applying `:focus-visible` styles to these elements. Avoid using unscoped global attribute selectors to prevent unintended side effects.
+**Action:** Scoped `:focus-visible` styles to `starlight-tabs [role="tab"]`, `.sl-markdown-content [tabindex="0"]`, and `.expressive-code pre` in `docs-site/src/styles/custom.css`.
