@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2026-07-01 - [Focus indicators on interactive and scrollable regions]
+**Learning:** Found that scrollable regions (like code blocks with `tabindex="0"` and Expressive Code blocks) and interactive elements (like `starlight-tabs [role="tab"]`) lacked explicitly scoped focus indicators in the UI. While global selectors might catch some, scoping them ensures consistent visual feedback for keyboard users without causing side effects.
+**Action:** Appended explicitly scoped `:focus-visible` rules for `.sl-markdown-content [tabindex="0"]`, `.expressive-code pre`, and `starlight-tabs [role="tab"]` to `custom.css` to ensure an equitable experience for keyboard navigation.
