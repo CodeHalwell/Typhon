@@ -43,3 +43,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## 2024-11-08 - Fix keyword tokenization overlapping prefix issue
+**Vulnerability:** Sequential keyword matching allowed shorter overlapping substrings (like `TOKEN`) to match before longer ones (like `OAUTHTOKEN`), potentially causing incorrect segmentations.
+**Learning:** Arrays of keywords used for segmentation must be sorted in descending order by length to ensure correct longest-prefix matching.
+**Prevention:** Sort string arrays by length descending before using them for longest-prefix matching heuristics.
