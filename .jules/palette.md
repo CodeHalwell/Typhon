@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2024-05-18 - Add focus states to Starlight Tabs
+**Learning:** Starlight documentation tabs (`starlight-tabs [role="tab"]`) lack an explicit focus indicator by default, which can impact keyboard accessibility for navigating code examples.
+**Action:** Always ensure interactive elements like tabs have a visible `:focus-visible` outline for keyboard navigation.
