@@ -43,3 +43,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## 2026-10-04 - Longest-first Matching for Secret Detection in String Arrays
+**Vulnerability:** String arrays used for sequential keyword matching in security analysis were not completely sorted in strictly descending order by length, potentially allowing shorter substrings to match prematurely and causing false negatives for longer, specific variations.
+**Learning:** Arrays like `SECRET_KEY_NOUNS`, `SECRET_VALUE_GATED_NOUNS`, etc., when used in bounded matching (e.g. `is_credential_noun`), should follow the longest-first rule to ensure correctness, similar to what was previously learned for `SECRET_NAME_KEYWORDS`.
+**Prevention:** Ensured all hardcoded string arrays related to secret scanning are consistently ordered by length descending.
