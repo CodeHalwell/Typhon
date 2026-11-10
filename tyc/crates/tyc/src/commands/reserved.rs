@@ -75,14 +75,15 @@ pub(crate) fn user_runtime(src_dir: &Path) -> Option<UserRuntime> {
 /// Names a generated Python module binds at top level (what `from it import
 /// NAME` can import): `class`/`def` names, assignment targets, and names bound
 /// by imports. A line scan is enough for the templates `tyc` itself writes.
-fn bound_names(python: &str) -> HashSet<String> {
-    let ident = |s: &str| -> Option<String> {
-        let name: String = s
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        (!name.is_empty()).then_some(name)
+fn bound_names<'a>(python: &'a str) -> HashSet<&'a str> {
+    let ident = |s: &'a str| -> Option<&'a str> {
+        let s = s.trim_start();
+        let len = s
+            .char_indices()
+            .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        (len > 0).then_some(&s[..len])
     };
     let mut names = HashSet::new();
     for line in python.lines() {
@@ -180,7 +181,7 @@ pub(crate) fn broken_imports(
         files
             .iter()
             .find(|(name, _)| name.strip_suffix(".py") == Some(stem))
-            .map(|(_, body)| bound_names(body))
+            .map(|(_, body)| bound_names(body).into_iter().map(String::from).collect())
             .unwrap_or_default()
     };
     // User submodules whose files survive: the runtime only writes its own
