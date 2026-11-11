@@ -43,3 +43,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## 2024-05-18 - Secrets Keyword Sorting
+**Vulnerability:** In `tyc/crates/tyc-analyse/src/secrets.rs`, overlapping keywords in arrays could lead to shorter strings matching prematurely in security checks if the array elements weren't ordered correctly (e.g. `TOKEN` matching before `OAUTHTOKEN`).
+**Learning:** Arrays used for sequential keyword matching need to be sorted descending by length to ensure correct tokenization, as Typhon segments identifiers into parts based on these arrays. If a shorter segment matches, the longer encompassing word isn't correctly identified, causing false positives or missing matches during tokenization.
+**Prevention:** All string arrays used for sequential keyword matching in security analysis (`SECRET_NAME_KEYWORDS` etc.) must be sorted in strictly descending order by length.
