@@ -372,7 +372,7 @@ pub fn aggregate_pub_star_shapes(
                 continue;
             };
             let mut visited: HashSet<PathBuf> = HashSet::new();
-            let surface = effective_pub_surface(
+            let visible_set = effective_pub_surface(
                 sub_dir,
                 paths,
                 &init_pub_names,
@@ -380,7 +380,6 @@ pub fn aggregate_pub_star_shapes(
                 &module_pub_names,
                 &mut visited,
             );
-            let visible_set: HashSet<&str> = surface.iter().map(|s| s.as_str()).collect();
             let sub_shape = tyc_db::absolutise_extension_sentinels(sub_shape, &sub_dotted, true);
             merge_pub_visible(&mut merged, &sub_shape, Some(&visible_set));
         }
@@ -395,15 +394,15 @@ pub fn aggregate_pub_star_shapes(
 /// `pub *`. Cycle-safe via the `visited` set. Used by
 /// [`aggregate_pub_star_shapes`] to filter sub-package merges so a
 /// parent `pub *` only re-exports its sub-packages' intended exports.
-fn effective_pub_surface(
+fn effective_pub_surface<'a>(
     pkg_dir: &Path,
     paths: &[PathBuf],
-    init_pub_names: &HashMap<PathBuf, Vec<String>>,
+    init_pub_names: &'a HashMap<PathBuf, Vec<String>>,
     init_has_pub_star: &std::collections::HashSet<PathBuf>,
-    module_pub_names: &HashMap<PathBuf, Vec<String>>,
+    module_pub_names: &'a HashMap<PathBuf, Vec<String>>,
     visited: &mut std::collections::HashSet<PathBuf>,
-) -> std::collections::HashSet<String> {
-    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+) -> std::collections::HashSet<&'a str> {
+    let mut out: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     if !visited.insert(pkg_dir.to_path_buf()) {
         return out;
     }
@@ -417,7 +416,7 @@ fn effective_pub_surface(
     };
     if let Some(names) = init_pub_names.get(init_path) {
         for n in names {
-            out.insert(n.clone());
+            out.insert(n.as_str());
         }
     }
     if !init_has_pub_star.contains(init_path) {
@@ -436,7 +435,7 @@ fn effective_pub_surface(
             }
             if let Some(pubs) = module_pub_names.get(sib_path) {
                 for n in pubs {
-                    out.insert(n.clone());
+                    out.insert(n.as_str());
                 }
             }
             continue;
