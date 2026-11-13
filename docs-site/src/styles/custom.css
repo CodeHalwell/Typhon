@@ -66,3 +66,9 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
     transform: none;
   }
 }
+
+/* Accessible focus styling for all scrollable regions without specific component classes */
+[tabindex="0"]:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 3px;
+}
