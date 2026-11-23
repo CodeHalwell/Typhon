@@ -1,4 +1,3 @@
-
 ## 2024-06-04 - Optimize Source Map Generation string formatting
 **Learning:** `format!` macros inside `build_source_map_v2` to join dynamically allocated strings (`n.to_string()`) causes excessive heap allocations and overhead. Given `lines.len()` could be huge for long files, it negatively impacts compilation speeds in hot paths. Using `itoa::Buffer` was an option but required adding a new dependency which violated the constraints.
 **Action:** Use manual `String::with_capacity` and manual string building using `push_str`/`push` alongside `std::fmt::Write::write_fmt` via the `write!` macro to avoid multiple runtime allocations while retaining correct output format without adding new dependencies.
@@ -61,3 +60,7 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-11-28 - Zero-Allocation `effective_pub_surface`
+**Learning:** `effective_pub_surface` in `tyc/crates/tyc/src/commands/util.rs` originally created a new `HashSet<String>` by cloning string identifiers when determining the effective public surface names of packages. As this function is recursively called during the build process to aggregate `pub *` exports, the repeated allocation of strings negatively impacted compilation times, particularly in projects with deep package hierarchies and numerous exports.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&HashMap<PathBuf, Vec<String>>` reference (`init_pub_names` and `module_pub_names`), we can avoid `String` allocations entirely when building the `out` set and rely on string slices for fast lookups and aggregation.
