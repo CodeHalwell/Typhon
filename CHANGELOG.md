@@ -4,6 +4,65 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — security review (2026-11-27)
+
+Fixes from a full security review of the toolchain, the generated code, the
+release pipeline and the installers. No language change.
+
+### Security
+
+- **t-string literal braces were emitted as code.** `t"{{run()}}"` was
+  written back as `t"{run()}"`, so text that reads as inert in `.ty` became
+  an interpolation that calls `run()` in the emitted Python; `!r` and format
+  specs were dropped as well. t-strings now go through the f-string printer.
+- **`--no-sync` could still run a project's code.** When the dependency list
+  changed and a `uv.lock` existed, the build ran `uv lock`, which executes
+  the build backend of any path, git or sdist dependency — including one the
+  project points at itself with `[tool.uv.sources]`. The relock now uses
+  `uv lock --no-build`. `tyc check --with-ty` no longer merges
+  `pyproject.toml` or runs `uv` at all.
+- **`[python] target` reached `uv --python` unvalidated.** uv reads a value
+  it cannot parse as a version as a path, so `target = "3.14post1"` executed
+  `./3.14post1/bin/python`. The target must now be a plain version, and the
+  request passed to uv is rebuilt from the parsed numbers.
+- **A `.venv` in a parent directory is only used when it belongs to the
+  project's owner** (or root), on Unix. Previously the first `.venv` found
+  anywhere up to `/` supplied the interpreter that introspection runs.
+- **`tyc debug` and `tyc repl` ran their script from the shared temp
+  directory**, which CPython puts first on `sys.path`: a `json.py` left in
+  `/tmp` by another user was imported. The script now lives in a private
+  directory.
+- **`tyc profile --instrument` wrote through symlinks** in the build
+  directory and followed linked directories, rewriting `.py` files outside
+  the project. It now writes the way `tyc build` does and skips links.
+- **The stale-file sweep trusted the manifest.** With `out = "."`, a
+  committed `.tyc-build-manifest` could have `tyc build` delete `.git/config`
+  or the project's own sources. Only `.py`, `.pyi` and `.sourcemaps/*.py.map`
+  entries outside the source directory are swept.
+- **`src` may not be a symlink out of the project**, and **`tyc init` does
+  not scaffold through a symlink**.
+- **`tyc trace` and the generated traceback remapper only quote `.ty` /
+  `.dty` files.** A tampered `.py.map` could name any file and have a line of
+  it printed into a traceback.
+- **`comptime` no longer echoes a value it failed to parse** (`int(env("…"))`
+  printed the variable's value from `tyc check`), and `str.replace`,
+  `str.join`, `str.split` and list / tuple / dict literals are charged
+  against the memory budget before they allocate — three small programs
+  aborted `tyc check` with an allocation failure.
+
+### Release pipeline and packaging
+
+- The release workflow's build jobs run with a read-only token, without
+  persisted credentials or a restored cargo cache, and with `--locked`; the
+  publish job attests build provenance for every archive
+  (`gh attestation verify <file> --repo CodeHalwell/Typhon`).
+- `install.sh` runs inside a function called on its last line, so a download
+  cut short executes nothing; both installers end with a sentinel line.
+- The VS Code extension's `typhon.server.path` / `typhon.server.arguments`
+  are `machine`-scoped. They were `machine-overridable`, which a workspace's
+  `.vscode/settings.json` *can* set.
+- A scheduled workflow runs `cargo deny` daily.
+
 ## 1.0.0-beta.7 — 2026-11-02 — beta.6 feedback fixes
 
 Fixes from the beta.6 feedback session. No language change.

@@ -1,0 +1,28 @@
+name: Dependency advisories
+
+# `ci.yml` runs cargo-deny on every push and pull request, which only notices a
+# new RustSec advisory when somebody happens to push. This runs the same audit
+# once a day so an advisory against a crate that is already shipped in a
+# released `tyc` binary surfaces on its own.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny (scheduled)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Dependency audit (advisories + licences + bans)
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          manifest-path: tyc/Cargo.toml

@@ -159,8 +159,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         let src = std::fs::read_to_string(path)
             .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
         let instrumented_src = instrument_module(&src);
-        std::fs::write(path, instrumented_src)
-            .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
+        write_in_build_dir(&out_dir, path, instrumented_src.as_bytes())?;
         instrumented += 1;
         Ok(())
     })?;
@@ -168,8 +167,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     // Drop the profiler helper next to the emitted code so the injected
     // imports resolve at runtime without requiring a separate install.
     let helper_path = out_dir.join("typhon_profile.py");
-    std::fs::write(&helper_path, TYPHON_PROFILE_PY)
-        .map_err(|e| miette!("cannot write '{}': {e}", helper_path.display()))?;
+    write_in_build_dir(&out_dir, &helper_path, TYPHON_PROFILE_PY.as_bytes())?;
 
     println!(
         "instrumented {} file(s); profile data will be written to typhon-profile.json on exit",
@@ -476,7 +474,25 @@ fn summarise(collapsed: &str, top: usize) -> String {
     out
 }
 
-/// Walk every `.py` file under `root`, invoking `f` for each.
+/// Write `bytes` to `dest`, a file under the build directory `out_dir`, the
+/// way `tyc build` writes its own outputs: never through a symlink (the file
+/// itself or a directory on the way to it) and never outside `out_dir`. A
+/// checked-out project can carry `build/typhon_profile.py -> ~/.bashrc`.
+fn write_in_build_dir(
+    out_dir: &std::path::Path,
+    dest: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    crate::commands::build::confine_output_path(out_dir, "the build directory", dest)?;
+    tyc_format::atomic_write(dest, bytes)
+        .map_err(|e| miette!("cannot write '{}': {e}", dest.display()))
+}
+
+/// Walk every `.py` file under `root`, invoking `f` for each. Symlinks —
+/// to files or to directories — are skipped, not followed: the files found
+/// are rewritten in place, and a link such as `build/vendor -> ~` would
+/// otherwise hand every `.py` under the home directory to the instrumenter
+/// (and a link back up the tree would recurse without end).
 fn walk_py_files(
     root: &std::path::Path,
     f: &mut dyn FnMut(&std::path::Path) -> Result<()>,
@@ -487,7 +503,13 @@ fn walk_py_files(
         let entry =
             entry.map_err(|e| miette!("cannot read entry under '{}': {e}", root.display()))?;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             walk_py_files(&path, f)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("py") {
             f(&path)?;
@@ -601,6 +623,46 @@ def _flush() -> None:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Instrumentation rewrites files in place, so it must not follow a
+    /// symlink out of the build directory — neither a linked directory of
+    /// `.py` files nor a link sitting where the helper module is written.
+    #[cfg(unix)]
+    #[test]
+    fn instrument_does_not_write_through_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let foreign = outside.path().join("lib.py");
+        std::fs::write(&foreign, "def f():\n    return 1\n").unwrap();
+        let target = outside.path().join("bashrc");
+        std::fs::write(&target, "PRECIOUS\n").unwrap();
+
+        let out = tmp.path().join("build");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("main.py"), "def g():\n    return 2\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), out.join("vendor")).unwrap();
+
+        let mut seen = Vec::new();
+        walk_py_files(&out, &mut |p| {
+            seen.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![out.join("main.py")],
+            "linked dir must be skipped"
+        );
+
+        let helper = out.join("typhon_profile.py");
+        std::os::unix::fs::symlink(&target, &helper).unwrap();
+        assert!(write_in_build_dir(&out, &helper, b"x").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "PRECIOUS\n");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            "def f():\n    return 1\n"
+        );
+    }
 
     #[test]
     fn remap_collapsed_maps_build_frames_to_ty_lines() {

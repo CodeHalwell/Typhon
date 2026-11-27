@@ -6,6 +6,34 @@ use std::path::{Path, PathBuf};
 use miette::{miette, Result};
 use tyc_db::ModuleShapes;
 use tyc_diagnostics::Diagnostics;
+/// A Python script written for one run of an interpreter, in a directory of
+/// its own.
+///
+/// CPython puts the *directory of the script it is given* first on
+/// `sys.path`. A script dropped straight into the shared temp directory
+/// therefore imports from that directory before the standard library: any
+/// other local user who leaves a `json.py` in `/tmp` gets it executed by
+/// `python /tmp/tyc-xxxx.py`. The script instead lives in a fresh directory
+/// only this user can read or write (`tempfile::tempdir` creates it `0700`
+/// with an unpredictable name); both are removed when this value is dropped.
+pub struct PrivateScript {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl PrivateScript {
+    pub fn create(prefix: &str, file_name: &str, body: &str) -> std::io::Result<Self> {
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir()?;
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, body)?;
+        Ok(Self { _dir: dir, path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[cfg(test)]
 use tyc_diagnostics::TycError;
 use tyc_syntax::preprocess::preprocess;

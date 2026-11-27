@@ -18,6 +18,12 @@
 
 set -eu
 
+# The whole installer runs inside `main`, called on the very last line. When
+# this script is piped into `sh` and the download is cut short, the shell
+# reaches end-of-input before `main` is ever invoked, so a truncated script
+# runs nothing instead of running half of a command.
+main() {
+
 REPO="codehalwell/typhon"
 DEFAULT_DIR="$HOME/.local/bin"
 
@@ -188,7 +194,7 @@ if [ -z "$version" ]; then
     # the most recent tag and emit it at the first `"draft": false`.
     api_url="https://api.github.com/repos/$REPO/releases?per_page=5"
     version="$(
-        curl -fsSL "$api_url" \
+        curl -fsSL --proto '=https' --tlsv1.2 "$api_url" \
         | awk -F'"' '
             /"tag_name":/          { tag = $4 }
             /"draft":[[:space:]]*false/ { if (tag != "") { print tag; exit } }
@@ -319,3 +325,8 @@ case ":$PATH:" in
 esac
 
 say "Done. Run \`tyc --help\` to get started."
+
+}
+
+main "$@"
+# typhon-installer: end

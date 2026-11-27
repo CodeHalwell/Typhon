@@ -30,3 +30,7 @@ stress/round-2026-06-21/proj/
 # twin breaks checkout on case-insensitive filesystems (macOS, Windows).
 .Jules/
 code_review/
+
+# Output of examples/17-file-io-json when run from the repo root
+/typhon-people.json
+/typhon-people-array.json

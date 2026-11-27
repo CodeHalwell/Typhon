@@ -308,12 +308,12 @@ impl ReplSession {
         }
         let py = self.cached_py.clone().unwrap();
 
-        let tmp = tempfile::Builder::new()
-            .prefix("tyc-repl-")
-            .suffix(".py")
-            .tempfile()
-            .map_err(|e| miette!("cannot create temp file: {e}"))?;
-        std::fs::write(tmp.path(), &py).map_err(|e| miette!("cannot write temp file: {e}"))?;
+        // A private directory: the script's directory is `sys.path[0]`, so
+        // loose in the shared temp dir every `import` the session makes
+        // could be answered by a file another user left there.
+        let tmp =
+            crate::commands::util::PrivateScript::create("tyc-repl-", "tyc_repl_session.py", &py)
+                .map_err(|e| miette!("cannot create temp file: {e}"))?;
 
         let output = Command::new(&self.python)
             .arg(tmp.path())

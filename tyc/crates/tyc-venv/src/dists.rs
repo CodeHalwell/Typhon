@@ -209,7 +209,8 @@ pub fn guess_import_roots(dist: &str) -> Vec<String> {
 /// 2. `$UV_PROJECT_ENVIRONMENT` (resolved against the project root when
 ///    relative), which `uv` honours in place of `.venv`;
 /// 3. the nearest `.venv` in an ancestor directory — a `uv` workspace or a
-///    monorepo keeps one environment at its root;
+///    monorepo keeps one environment at its root — provided it belongs to
+///    the project's owner (see [`same_owner_as_project`]);
 /// 4. `$VIRTUAL_ENV`, an activated environment.
 ///
 /// A directory only counts when it holds a `pyvenv.cfg`.
@@ -229,7 +230,7 @@ pub fn find_venv(project_root: &Path) -> Option<PathBuf> {
     }
     for ancestor in root.ancestors().skip(1) {
         let candidate = ancestor.join(".venv");
-        if is_venv(&candidate) {
+        if is_venv(&candidate) && same_owner_as_project(&candidate, &root) {
             return Some(candidate);
         }
     }
@@ -240,6 +241,34 @@ pub fn find_venv(project_root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether an ancestor's `.venv` may be trusted to supply the interpreter
+/// for `project_root`.
+///
+/// The interpreter found here is *executed* (dependency introspection,
+/// `tyc run --compile`), and the walk goes all the way to `/`. A project
+/// kept under a directory other local users can write to — `/tmp/work/proj`,
+/// a shared scratch volume — would otherwise run whatever `bin/python`
+/// someone else left in `/tmp/.venv`. So, as git does for repositories
+/// (`safe.directory`, CVE-2022-24765), an environment *above* the project is
+/// only used when it is owned by the same user as the project directory, or
+/// by root. The project's own `.venv` and the explicit environment
+/// variables are not subject to this: those are the user's stated choice.
+#[cfg(unix)]
+fn same_owner_as_project(venv: &Path, project_root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(venv_meta), Ok(project_meta)) =
+        (std::fs::metadata(venv), std::fs::metadata(project_root))
+    else {
+        return false;
+    };
+    venv_meta.uid() == project_meta.uid() || venv_meta.uid() == 0
+}
+
+#[cfg(not(unix))]
+fn same_owner_as_project(_venv: &Path, _project_root: &Path) -> bool {
+    true
 }
 
 /// The interpreter inside a venv, probing the native layout first.

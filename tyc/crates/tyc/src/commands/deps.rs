@@ -503,7 +503,8 @@ pub fn bootstrap_python_env_with(
         // `--no-sync` used to leave `uv.lock` describing the *old*
         // dependency list, so a later `uv sync --locked` in CI failed on a
         // manifest the build had just rewritten. Relock (resolution only —
-        // nothing is installed) so the two stay in step.
+        // nothing is installed, and `--no-build` means nothing is built
+        // either) so the two stay in step.
         run_uv_lock_warning(project_root, config);
     }
     Ok(())
@@ -590,8 +591,17 @@ fn run_uv_lock_warning(project_root: &Path, config: &TyphonConfig) {
         );
         return;
     }
+    // `--no-sync` is the documented way to build a project without running
+    // any of its dependencies' code (SECURITY.md). Plain `uv lock` breaks
+    // that promise: to read the metadata of a source distribution — a path,
+    // git or sdist dependency — it runs that package's PEP 517 build backend,
+    // which a cloned project can point at a file of its own with
+    // `[tool.uv.sources]`. `--no-build` makes uv resolve from wheels and
+    // static metadata only and fail on anything it would have to build; the
+    // lockfile then stays as it was and the warning below says so.
     let status = Command::new("uv")
         .arg("lock")
+        .arg("--no-build")
         .arg("--python")
         .arg(uv_python_request(config))
         .current_dir(project_root)
@@ -599,8 +609,9 @@ fn run_uv_lock_warning(project_root: &Path, config: &TyphonConfig) {
     match status {
         Ok(s) if s.success() => eprintln!("note: refreshed uv.lock (--no-sync: nothing installed)"),
         Ok(s) => eprintln!(
-            "warning: `uv lock` exited with {s} — uv.lock may be stale; run `uv lock` \
-             before `uv sync --locked`"
+            "warning: `uv lock --no-build` exited with {s} — uv.lock may be stale. \
+             `--no-sync` never builds a dependency from source; if one of yours \
+             needs that, run `uv lock` yourself before `uv sync --locked`"
         ),
         Err(e) => eprintln!("warning: cannot spawn `uv`: {e} — uv.lock may be stale"),
     }
@@ -799,14 +810,16 @@ fn uv_sync_command(project_root: &Path, config: &TyphonConfig) -> Command {
 /// keeping the free-threaded `t` (uv reads `3.13t` directly). A patch-level
 /// target such as `3.13.2` would make uv demand that exact patch, so it is
 /// trimmed to `3.13`, which any 3.13 security release satisfies.
+///
+/// The request is rebuilt from the parsed numbers, never passed through: uv
+/// reads a `--python` value it cannot parse as a version as a *path*, so a
+/// target such as `3.14post1` made it execute `./3.14post1/bin/python` from
+/// the project being built.
 fn uv_python_request(config: &TyphonConfig) -> String {
-    let target = default_str(&config.python.target, "3.13");
-    let (version, threaded) = match target.strip_suffix('t') {
-        Some(v) => (v, "t"),
-        None => (target, ""),
-    };
-    let minor: Vec<&str> = version.splitn(3, '.').take(2).collect();
-    format!("{}{threaded}", minor.join("."))
+    let target = default_str(&config.python.target, "3.13").trim();
+    let (major, minor) = crate::config::parse_python_target(target).unwrap_or((3, 13));
+    let threaded = if target.ends_with('t') { "t" } else { "" };
+    format!("{major}.{minor}{threaded}")
 }
 
 fn has_uv() -> bool {
@@ -1331,6 +1344,9 @@ lint = [\"ruff\"]
             ("3.15", "3.15"),
             ("3.14t", "3.14t"),
             ("3.13.2", "3.13"),
+            ("3.15rc1t", "3.15t"),
+            ("3.14post1", "3.14"),
+            ("3.14/../evil", "3.14"),
             ("", "3.13"),
         ] {
             let mut cfg = TyphonConfig::default();

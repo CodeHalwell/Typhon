@@ -52,10 +52,40 @@ To inspect an untrusted project without executing any of its dependencies:
   editor now shares the CLI's interpreter discovery, so the guarantee holds on
   both surfaces.)
 - **`--no-sync` / `TYC_NO_SYNC=1`** on `tyc build` skips `uv sync`, so no
-  dependency is installed.
+  dependency is installed. If the build changes the dependency list and a
+  `uv.lock` is present, it is refreshed with `uv lock --no-build`: uv resolves
+  from wheels and static metadata only and never runs a package's build
+  backend, so a path, git or sdist dependency named in the project's
+  `pyproject.toml` is not executed (the lockfile is left stale and a warning
+  says so instead). `uv` does contact the package index for that step; remove
+  `uv.lock`, or take `uv` off `PATH`, to stay offline.
 
 Set both when working with code you don't trust, and avoid attaching the
 language server until you do.
+
+Three more things are worth knowing about what gets executed:
+
+- **A `.venv` committed to a repository is still that repository's code.**
+  The allow-list below limits which *modules* are imported, but the
+  interpreter that imports them is the project's own `.venv/bin/python` when
+  one exists — and that file can be any executable. `TYC_NO_INTROSPECT=1` is
+  the switch that stops it being run.
+- **A `.venv` in a parent directory is only used when it belongs to you.**
+  Interpreter discovery walks up from the project to find a workspace-level
+  environment. On Unix an environment found that way is ignored unless it is
+  owned by the same user as the project directory (or by root), so a project
+  kept under a shared directory such as `/tmp` does not run an interpreter
+  another local user left above it.
+- **`[python] target` must be a plain version** (`3.13`, `3.14t`, `3.15rc1`).
+  It is passed to `uv --python`, which treats anything else as a path to an
+  interpreter.
+
+`tyc check` (without `--with-ty`), `tyc explain`, `tyc trace` and
+`tyc build --check` do not write into the project, run `uv`, or execute
+project code beyond the dependency introspection described above. `tyc fmt`
+rewrites the `.ty` files it is pointed at and nothing else.
+`tyc check --with-ty` builds into a throwaway directory and leaves the
+project's `pyproject.toml` and `uv.lock` untouched.
 
 Independently of those switches, introspection is limited to an allow-list:
 the Python standard library plus the packages the project declares in

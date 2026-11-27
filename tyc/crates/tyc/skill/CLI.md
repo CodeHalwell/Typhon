@@ -56,7 +56,7 @@ Full pipeline: parse → check → analyse → desugar → emit → format. Writ
 | `--out DIR` / `-o DIR` | Override `[project] out` |
 | `--no-format` | Skip `ruff format` post-process |
 | `--check` | Dry-run — list every file that *would* be created/overwritten without touching disk. Full pipeline still runs, so type errors surface |
-| `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` (and relock an existing `uv.lock` if the dependencies changed) |
+| `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` (and relock an existing `uv.lock` with `uv lock --no-build` if the dependencies changed) |
 | `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flips the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins |
 | `--with-ty` (v0.12.0) | After emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check); errors fail the build. Equivalent to `[checker] external = "ty"` for one invocation |
 

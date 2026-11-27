@@ -27,6 +27,15 @@ pub fn run(args: InitArgs) -> Result<()> {
             // be parsed by the very next command.
             let name = validate_project_name(&name)?;
             let target = args.dir.join(&name);
+            // `tyc init NAME` makes a *new* directory. A symlink already
+            // sitting at that name (dangling or not) would send the whole
+            // scaffold to wherever it points.
+            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(miette!(
+                    "{} is a symlink; `tyc init` does not scaffold through one",
+                    target.display()
+                ));
+            }
             std::fs::create_dir_all(&target)
                 .map_err(|e| miette!("cannot create {}: {}", target.display(), e))?;
             let canonical = target.canonicalize().unwrap_or(target);
@@ -61,6 +70,17 @@ pub fn run(args: InitArgs) -> Result<()> {
             "src/main.ty already exists in {}; remove it first to re-scaffold",
             dir.display()
         ));
+    }
+
+    // `src` and `tests` are created inside the project, never followed out
+    // of it: a pre-existing `src -> /elsewhere` would put `main.ty` there.
+    for sub in [&src_dir, &tests_dir] {
+        if std::fs::symlink_metadata(sub).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(miette!(
+                "{} is a symlink; `tyc init` does not scaffold through one",
+                sub.display()
+            ));
+        }
     }
 
     std::fs::create_dir_all(&src_dir).map_err(|e| miette!("cannot create src/: {}", e))?;
@@ -241,6 +261,40 @@ allow-secret-comptime = false   # silence `tyc::contains_secret_literal` warning
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_to_scaffold_through_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // `tyc init myapp` where `myapp` is a link elsewhere.
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("myapp")).unwrap();
+        let err = run(InitArgs {
+            name: Some("myapp".into()),
+            dir: tmp.path().to_path_buf(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("symlink"), "{err}");
+
+        // `tyc init` in a directory whose `src` is a link elsewhere.
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        std::os::unix::fs::symlink(outside.path(), proj.join("src")).unwrap();
+        let err = run(InitArgs {
+            name: None,
+            dir: proj.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !proj.join("typhon.toml").exists(),
+            "refused before any write"
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn init_creates_project_structure() {

@@ -295,3 +295,4 @@ finally {
         Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+# typhon-installer: end

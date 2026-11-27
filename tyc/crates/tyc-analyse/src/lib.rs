@@ -68,6 +68,40 @@ const MAX_COMPTIME_DEPTH: usize = 64;
 /// build-time constant and stops a runaway build-string well before that.
 const MAX_COMPTIME_STRING_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bytes charged for each comptime value besides its string content — a
+/// round figure for the enum and its `Vec` slot.
+const COMPTIME_VALUE_OVERHEAD: usize = 32;
+
+/// Approximate heap footprint of a comptime value, for the memory budget.
+fn comptime_value_size(value: &ComptimeValue) -> usize {
+    let inner = match value {
+        ComptimeValue::Str(s) => s.len(),
+        ComptimeValue::List(xs) | ComptimeValue::Tuple(xs) => xs
+            .iter()
+            .map(comptime_value_size)
+            .fold(0usize, usize::saturating_add),
+        ComptimeValue::Dict(items) => items
+            .iter()
+            .map(|(k, v)| comptime_value_size(k).saturating_add(comptime_value_size(v)))
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    };
+    inner.saturating_add(COMPTIME_VALUE_OVERHEAD)
+}
+
+/// The error for `int("…")` / `float("…")` on a string that is not a number.
+/// The string itself is deliberately not quoted: it is very often
+/// `env("…")`, and a diagnostic is printed by `tyc check` into terminals and
+/// CI logs — `int(env("AWS_SECRET_ACCESS_KEY", "0"))` in a project somebody
+/// was only *checking* printed the secret.
+fn unparsable_number(s: &str, ty: &str) -> String {
+    format!(
+        "cannot parse a {}-character string as {ty} (the value is not shown: \
+         it may come from the environment)",
+        s.chars().count()
+    )
+}
+
 /// Evaluation-step budget for one `comptime let` binding (every expression
 /// node and statement evaluated counts one step). The depth cap alone does
 /// not bound the work: `f(n) = f(n - 1) + f(n - 1)` stays within 64 frames
@@ -1584,6 +1618,14 @@ impl<'a> EvalContext<'a> {
     /// Account for a freshly-produced string of `bytes` length; error out once
     /// the cumulative total crosses the budget so a runaway concatenation /
     /// replacement fails the build with a diagnostic instead of OOM-aborting.
+    /// Charge a value placed into a list, tuple or dict literal. Containers
+    /// copy their elements, so `[x, x, x, x, x, x, x, x]` in a recursive
+    /// `comptime def` multiplies memory eightfold per call without ever
+    /// building a string; the same budget covers both.
+    fn charge_value(&mut self, value: &ComptimeValue) -> Result<(), String> {
+        self.charge_string(comptime_value_size(value))
+    }
+
     fn charge_string(&mut self, bytes: usize) -> Result<(), String> {
         self.string_bytes = self.string_bytes.saturating_add(bytes);
         if self.string_bytes > MAX_COMPTIME_STRING_BYTES {
@@ -1801,14 +1843,18 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
         Expr::List(l) => {
             let mut elts = Vec::with_capacity(l.elts.len());
             for e in &l.elts {
-                elts.push(eval_expr(e, ctx)?);
+                let v = eval_expr(e, ctx)?;
+                ctx.charge_value(&v)?;
+                elts.push(v);
             }
             Ok(ComptimeValue::List(elts))
         }
         Expr::Tuple(t) => {
             let mut elts = Vec::with_capacity(t.elts.len());
             for e in &t.elts {
-                elts.push(eval_expr(e, ctx)?);
+                let v = eval_expr(e, ctx)?;
+                ctx.charge_value(&v)?;
+                elts.push(v);
             }
             Ok(ComptimeValue::Tuple(elts))
         }
@@ -1831,6 +1877,8 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
                 };
                 let k = eval_expr(key_expr, ctx)?;
                 let v = eval_expr(&item.value, ctx)?;
+                ctx.charge_value(&k)?;
+                ctx.charge_value(&v)?;
                 if let Some(existing) = items.iter_mut().find(|(ek, _)| values_equal(ek, &k)) {
                     existing.1 = v;
                 } else {
@@ -2191,7 +2239,7 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .trim()
                     .parse::<i64>()
                     .map(ComptimeValue::Int)
-                    .map_err(|_| format!("cannot parse '{}' as int", s)),
+                    .map_err(|_| unparsable_number(&s, "int")),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(n)),
                 // Rust's `as i64` *saturates* at `i64::MIN`/`i64::MAX` and maps
                 // NaN to 0, so `int(1e30)` silently folded the constant
@@ -2232,7 +2280,7 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .trim()
                     .parse::<f64>()
                     .map(ComptimeValue::Float)
-                    .map_err(|_| format!("cannot parse '{}' as float", s)),
+                    .map_err(|_| unparsable_number(&s, "float")),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Float(n as f64)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(f)),
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Float(if b { 1.0 } else { 0.0 })),
@@ -2364,12 +2412,22 @@ fn eval_method_call(
             expect_arity(method, 2, &args)?;
             let needle = expect_str(method, &args[0])?;
             let replacement = expect_str(method, &args[1])?;
-            let out = s.replace(needle, replacement);
-            // `replace` can grow the string (a longer replacement than needle);
-            // charge it so a recursive `grow(s.replace(a, aaaa), n)` hits the
-            // budget rather than OOM-aborting.
-            ctx.charge_string(out.len())?;
-            Ok(ComptimeValue::Str(out))
+            // `replace` can grow the string (a longer replacement than needle).
+            // The size of the result is computed and charged *before* it is
+            // built: `s.replace("a", s)` on a 1 MiB string of `a`s asks for a
+            // terabyte in one call, and charging afterwards meant the
+            // allocation had already aborted the process.
+            let matches = if needle.is_empty() {
+                s.chars().count() + 1
+            } else {
+                s.matches(needle).count()
+            };
+            let out_len = s
+                .len()
+                .saturating_sub(matches.saturating_mul(needle.len()))
+                .saturating_add(matches.saturating_mul(replacement.len()));
+            ctx.charge_string(out_len)?;
+            Ok(ComptimeValue::Str(s.replace(needle, replacement)))
         }
         (ComptimeValue::Str(s), "startswith") => {
             expect_arity(method, 1, &args)?;
@@ -2387,6 +2445,11 @@ fn eval_method_call(
             if sep.is_empty() {
                 return Err("comptime str.split() requires a non-empty separator".into());
             }
+            // One owned copy of every piece, plus a list slot each.
+            ctx.charge_string(
+                s.len()
+                    .saturating_add(s.matches(sep).count().saturating_mul(COMPTIME_VALUE_OVERHEAD)),
+            )?;
             let parts: Vec<ComptimeValue> = s
                 .split(sep)
                 .map(|p| ComptimeValue::Str(p.to_owned()))
@@ -2422,6 +2485,14 @@ fn eval_method_call(
                     )
                 }
             };
+            // Charged before the join allocates: a long separator between
+            // many empty pieces multiplies just as `replace` does.
+            let joined_len = items
+                .iter()
+                .map(|i| i.len())
+                .fold(0usize, usize::saturating_add)
+                .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
+            ctx.charge_string(joined_len)?;
             Ok(ComptimeValue::Str(items.join(sep)))
         }
         (ComptimeValue::Str(_), other) => Err(format!(
@@ -3391,6 +3462,41 @@ comptime let X: str = grow(\"aaaa\", 40)
             diags.has_errors(),
             "a runaway comptime concatenation must be rejected, not OOM"
         );
+    }
+
+    /// `replace`, `join` and container literals multiply memory without a
+    /// `+`. Each must be charged *before* it allocates: these three programs
+    /// used to abort `tyc check` (and the language server) with an
+    /// allocation failure instead of reporting a diagnostic.
+    #[test]
+    fn replace_join_and_container_growth_hit_the_budget_not_oom() {
+        let grow = "\
+comptime def grow(s: str, n: int) -> str:
+    if n == 0:
+        return s
+    return grow(s + s, n - 1)
+";
+        for tail in [
+            "comptime def boom(s: str) -> str:\n    return s.replace(\"a\", s)\n\n\
+             comptime let X: str = boom(grow(\"a\", 20))\n",
+            "comptime def k(s: str) -> str:\n    return s.join(s.split(\"a\"))\n\n\
+             comptime let X: str = k(grow(\"a\", 20))\n",
+            "comptime def n(x: list[int], d: int) -> int:\n    if d == 0:\n        return 0\n\
+             \x20   return n([x, x, x, x, x, x, x, x], d - 1)\n\n\
+             comptime let X: int = n([], 30)\n",
+        ] {
+            let (_values, diags) = eval(&format!("{grow}\n{tail}"));
+            assert!(diags.has_errors(), "must be rejected, not OOM:\n{tail}");
+        }
+    }
+
+    /// A failed `int(...)` / `float(...)` must not quote its argument: it is
+    /// usually `env(...)`, and the diagnostic goes to the terminal and CI log.
+    #[test]
+    fn unparsable_number_does_not_echo_the_value() {
+        let msg = unparsable_number("wJalrXUtnFEMI", "int");
+        assert!(!msg.contains("wJalrXUtnFEMI"), "{msg}");
+        assert!(msg.contains("13-character"), "{msg}");
     }
 
     #[test]

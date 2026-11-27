@@ -751,7 +751,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
         } else {
             let td = tempfile::tempdir()
                 .map_err(|e| miette!("failed to create temp build dir for --with-ty: {e}"))?;
-            crate::commands::build::run(crate::commands::build::BuildArgs {
+            crate::commands::build::run_scratch(crate::commands::build::BuildArgs {
                 path: project_root.clone(),
                 out: Some(td.path().to_path_buf()),
                 no_format: true,
