@@ -70,6 +70,27 @@ impl PyDict {
         self.live
     }
 
+    /// Bytes one entry takes (slot plus index), for sizing a dict before
+    /// it is built.
+    pub const ENTRY_BYTES: usize =
+        std::mem::size_of::<Option<Entry>>() + std::mem::size_of::<usize>();
+
+    /// Make room for one more entry, reporting `false` when memory for it
+    /// cannot be had (CPython's `MemoryError` from `dictresize`) where a
+    /// plain insertion would abort the process.
+    pub fn try_reserve_one(&mut self) -> bool {
+        if self.slots.len() < self.slots.capacity() && self.table.len() < self.table.capacity() {
+            return true;
+        }
+        if self.slots.try_reserve(1).is_err() {
+            return false;
+        }
+        let slots = &self.slots;
+        self.table
+            .try_reserve(1, |&j| slots[j].as_ref().map_or(0, |e| e.hash))
+            .is_ok()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.live == 0
     }

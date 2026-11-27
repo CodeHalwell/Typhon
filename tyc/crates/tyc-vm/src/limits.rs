@@ -66,6 +66,211 @@ pub fn try_repeat_bytes(b: &[u8], n: usize) -> Result<Vec<u8>, Unwind> {
     Ok(out)
 }
 
+/// `v.push(x)`, raising `MemoryError` when the vector cannot grow instead
+/// of aborting. Growth stays amortised: `try_reserve` doubles like `push`.
+#[inline]
+pub fn try_push<T>(v: &mut Vec<T>, x: T) -> Result<(), Unwind> {
+    if v.len() == v.capacity() {
+        v.try_reserve(1).map_err(|_| memory_error())?;
+    }
+    v.push(x);
+    Ok(())
+}
+
+/// Room for `extra` more elements, or `MemoryError`.
+pub fn try_reserve_items<T>(v: &mut Vec<T>, extra: usize) -> Result<(), Unwind> {
+    v.try_reserve_exact(extra).map_err(|_| memory_error())
+}
+
+/// Room for one more member of `s`, or `MemoryError` (see
+/// [`PySet::try_reserve_one`](crate::pyset::PySet::try_reserve_one)).
+#[inline]
+pub(crate) fn set_room(s: &mut crate::pyset::PySet) -> Result<(), Unwind> {
+    if s.try_reserve_one() {
+        Ok(())
+    } else {
+        Err(memory_error())
+    }
+}
+
+/// Room for one more entry of `d`, or `MemoryError`.
+#[inline]
+pub(crate) fn dict_room(d: &mut crate::pydict::PyDict) -> Result<(), Unwind> {
+    if d.try_reserve_one() {
+        Ok(())
+    } else {
+        Err(memory_error())
+    }
+}
+
+/// `a + b` for two strings, `MemoryError` when the result cannot be held.
+pub fn try_concat_str(a: &str, b: &str) -> Result<String, Unwind> {
+    let total = a.len().checked_add(b.len()).ok_or_else(memory_error)?;
+    let mut out = String::new();
+    out.try_reserve_exact(total).map_err(|_| memory_error())?;
+    out.push_str(a);
+    out.push_str(b);
+    Ok(out)
+}
+
+/// `a + b` for two byte strings; see [`try_concat_str`].
+pub fn try_concat_bytes(a: &[u8], b: &[u8]) -> Result<Vec<u8>, Unwind> {
+    let total = a.len().checked_add(b.len()).ok_or_else(memory_error)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(total).map_err(|_| memory_error())?;
+    out.extend_from_slice(a);
+    out.extend_from_slice(b);
+    Ok(out)
+}
+
+/// `a + b` for two element sequences (list / tuple concatenation).
+pub fn try_concat_items<T: Clone>(a: &[T], b: &[T]) -> Result<Vec<T>, Unwind> {
+    let total = a.len().checked_add(b.len()).ok_or_else(memory_error)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(total).map_err(|_| memory_error())?;
+    out.extend_from_slice(a);
+    out.extend_from_slice(b);
+    Ok(out)
+}
+
+/// A fallible `slice.to_vec()`.
+pub fn try_clone_items<T: Clone>(a: &[T]) -> Result<Vec<T>, Unwind> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(a.len()).map_err(|_| memory_error())?;
+    out.extend_from_slice(a);
+    Ok(out)
+}
+
+/// `sep.join(parts)` with the total length checked and reserved up front.
+pub fn try_join_str(
+    sep: &str,
+    parts: &[impl std::ops::Deref<Target = String>],
+) -> Result<String, Unwind> {
+    let mut total = sep
+        .len()
+        .checked_mul(parts.len().saturating_sub(1))
+        .ok_or_else(memory_error)?;
+    for p in parts {
+        total = total.checked_add(p.len()).ok_or_else(memory_error)?;
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(total).map_err(|_| memory_error())?;
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(p);
+    }
+    Ok(out)
+}
+
+/// `sep.join(parts)` for bytes; see [`try_join_str`].
+pub fn try_join_bytes(
+    sep: &[u8],
+    parts: &[impl std::ops::Deref<Target = Vec<u8>>],
+) -> Result<Vec<u8>, Unwind> {
+    let mut total = sep
+        .len()
+        .checked_mul(parts.len().saturating_sub(1))
+        .ok_or_else(memory_error)?;
+    for p in parts {
+        total = total.checked_add(p.len()).ok_or_else(memory_error)?;
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(total).map_err(|_| memory_error())?;
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        out.extend_from_slice(p);
+    }
+    Ok(out)
+}
+
+/// Make sure an integer of `bits` bits can be held (`MemoryError`
+/// otherwise), before `num_bigint` allocates it and aborts on failure.
+/// `scratch` asks for that much again, for an operation that needs working
+/// space the size of its result (multiplication, exponentiation, radix
+/// conversion).
+pub fn ensure_int_bits(bits: u128, scratch: bool) -> Result<(), Unwind> {
+    let bytes = bits / 8 + 8;
+    let bytes = if scratch {
+        bytes.saturating_mul(2)
+    } else {
+        bytes
+    };
+    ensure_alloc(usize::try_from(bytes).map_err(|_| memory_error())?)
+}
+
+/// Bytes one piece of a split costs beyond its text: the `Value`, the
+/// shared string header and the allocator's own bookkeeping.
+const PIECE_OVERHEAD: usize = 96;
+
+/// Before a `str` / `bytes` method builds its result from a large receiver
+/// of `len` bytes: `MemoryError` when the result cannot be allocated. The
+/// methods that copy or re-case the text need about `len` bytes again;
+/// `pieces()` (called only for a large receiver) counts what a split
+/// produces. Small receivers return at once.
+pub fn ensure_text_result(
+    len: usize,
+    name: &str,
+    pieces: impl FnOnce() -> usize,
+) -> Result<(), Unwind> {
+    if len < PROBE_FROM {
+        return Ok(());
+    }
+    match name {
+        "split" | "rsplit" | "splitlines" => {
+            let n = pieces();
+            ensure_alloc(
+                n.checked_mul(PIECE_OVERHEAD)
+                    .and_then(|b| b.checked_add(len))
+                    .ok_or_else(memory_error)?,
+            )
+        }
+        "upper" | "lower" | "casefold" | "title" | "capitalize" | "swapcase" | "strip"
+        | "lstrip" | "rstrip" | "encode" | "decode" | "translate" | "removeprefix"
+        | "removesuffix" | "partition" | "rpartition" | "hex" | "format" | "format_map" => {
+            // `hex` doubles the text; a case mapping can grow it slightly.
+            ensure_alloc(len.checked_mul(2).ok_or_else(memory_error)?)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The size of `hay.replace(from, to)` when `count` occurrences are
+/// replaced, checked against memory before the result is built.
+pub fn ensure_replace_result(
+    hay_len: usize,
+    from_len: usize,
+    to_len: usize,
+    count: usize,
+) -> Result<(), Unwind> {
+    let total = if to_len > from_len {
+        count
+            .checked_mul(to_len - from_len)
+            .and_then(|grow| grow.checked_add(hay_len))
+            .ok_or_else(memory_error)?
+    } else {
+        hay_len
+    };
+    ensure_alloc(total)
+}
+
+/// The number of items `range(start, stop, step)` yields from `current`.
+pub fn range_len(current: i64, stop: i64, step: i64) -> u128 {
+    let (lo, hi, step) = if step > 0 {
+        (current as i128, stop as i128, step as i128)
+    } else {
+        (stop as i128, current as i128, -(step as i128))
+    };
+    if step == 0 || lo >= hi {
+        0
+    } else {
+        ((hi - lo - 1) / step + 1) as u128
+    }
+}
+
 /// CPython's error for a count that does not fit `Py_ssize_t`.
 pub fn index_overflow() -> Unwind {
     Unwind::Exception(VmException::new(

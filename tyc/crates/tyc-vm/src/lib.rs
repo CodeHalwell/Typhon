@@ -32,9 +32,11 @@ pub mod ffi;
 pub mod hashes;
 pub mod interp;
 pub mod limits;
-mod os_random;
+pub mod oom;
+mod osrandom;
 pub(crate) mod pydict;
 pub mod pyhash;
+mod pyre;
 pub mod pyset;
 pub mod slots;
 mod stack;
@@ -2091,6 +2093,9 @@ pub fn call_accepts_keyword(
 
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+mod robustness_tests;
 
 #[cfg(test)]
 mod tests {

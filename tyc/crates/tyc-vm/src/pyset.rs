@@ -90,7 +90,12 @@ pub struct PySet {
     used: usize,
     /// Where `pop()` resumes its scan.
     finger: usize,
+    /// The table size [`PySet::try_reserve_one`] last found allocatable.
+    probed: usize,
 }
+
+/// Tables at least this large (in bytes) are probed before they are built.
+const PROBE_FROM_BYTES: usize = 1 << 24;
 
 impl Default for PySet {
     fn default() -> Self {
@@ -105,7 +110,43 @@ impl PySet {
             fill: 0,
             used: 0,
             finger: 0,
+            probed: 0,
         }
+    }
+
+    /// Bytes one table slot takes, for sizing a set before it is built.
+    pub const SLOT_BYTES: usize = std::mem::size_of::<Slot>();
+
+    /// Whether one more insertion is sure to find memory: when it would
+    /// grow a large table, check the new table can be allocated first.
+    /// `false` is CPython's `MemoryError` from `set_table_resize`; without
+    /// the check the growth aborts the process.
+    pub fn try_reserve_one(&mut self) -> bool {
+        let mask = self.mask();
+        if (self.fill + 1) * 5 < mask * 3 {
+            return true;
+        }
+        let used = self.used + 1;
+        let minused = if used > 50000 { used * 2 } else { used * 4 };
+        let mut newsize = MIN_SIZE;
+        while newsize <= minused {
+            match newsize.checked_mul(2) {
+                Some(n) => newsize = n,
+                None => return false,
+            }
+        }
+        let Some(bytes) = newsize.checked_mul(Self::SLOT_BYTES) else {
+            return false;
+        };
+        if bytes < PROBE_FROM_BYTES || self.probed == newsize {
+            return true;
+        }
+        let mut probe: Vec<Slot> = Vec::new();
+        if probe.try_reserve_exact(newsize).is_err() {
+            return false;
+        }
+        self.probed = newsize;
+        true
     }
 
     /// An empty set; the capacity hint is ignored (CPython starts every set

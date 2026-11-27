@@ -324,6 +324,7 @@ impl Interpreter {
             current_function: None,
             repr_active: {
                 crate::limits::set_int_max_str_digits(crate::limits::DEFAULT_INT_MAX_STR_DIGITS);
+                crate::oom::arm();
                 std::collections::HashSet::new()
             },
             alias_defs: HashMap::new(),
@@ -335,6 +336,73 @@ impl Interpreter {
         crate::builtins::install(&mut interp);
         interp.builtin_globals = interp.root.snapshot().into_iter().collect();
         interp
+    }
+
+    /// The scope `eval(source, globals, locals)` evaluates in. Without
+    /// `globals` that is the module scope. With it, a scope of its own:
+    /// the builtins (or what `globals["__builtins__"]` names instead), then
+    /// the entries of `globals`, then those of `locals` — and none of the
+    /// running program's names, as in CPython.
+    pub(crate) fn eval_scope(
+        &mut self,
+        globals: Option<&Value>,
+        locals: Option<&Value>,
+    ) -> Result<EnvRef, Unwind> {
+        fn bind_all(env: &EnvRef, mapping: &Value) {
+            if let Value::Dict(d) = mapping {
+                for (k, v) in d.borrow().iter() {
+                    if let HashKey::Str(name) = k {
+                        if name.as_str() != "__builtins__" {
+                            env.set(name, v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let scope = match globals {
+            None => self.root.clone(),
+            Some(Value::Dict(d)) => {
+                let builtins = Env::new_root();
+                let given = d
+                    .borrow()
+                    .get(&HashKey::Str(Rc::new("__builtins__".to_owned())))
+                    .cloned();
+                match given {
+                    Some(Value::Module(m)) => {
+                        for (name, v) in m.members.borrow().iter() {
+                            builtins.set(name, v.clone());
+                        }
+                    }
+                    Some(mapping @ Value::Dict(_)) => bind_all(&builtins, &mapping),
+                    Some(_) | None => {
+                        for (name, v) in &self.builtin_globals {
+                            builtins.set(name, v.clone());
+                        }
+                    }
+                }
+                let scope = Env::new_module(&builtins);
+                bind_all(&scope, &Value::Dict(d.clone()));
+                scope
+            }
+            Some(other) => {
+                return Err(type_error(format!(
+                    "globals must be a dict, not {}",
+                    other.type_display_name()
+                )))
+            }
+        };
+        match locals {
+            None => Ok(scope),
+            Some(mapping @ Value::Dict(_)) => {
+                let inner = Env::new_child(&scope);
+                bind_all(&inner, mapping);
+                Ok(inner)
+            }
+            Some(other) => Err(type_error(format!(
+                "locals must be a mapping, not {}",
+                other.type_display_name()
+            ))),
+        }
     }
 
     /// Entry point — run a parsed module's body in the root scope.
@@ -817,6 +885,8 @@ impl Interpreter {
     fn exec_stmt(&mut self, stmt: &Stmt, env: &EnvRef) -> Result<(), Unwind> {
         use ruff_text_size::Ranged;
         self.current_offset = stmt.range().start().to_usize();
+        // A safe point for memory exhaustion: see `crate::oom`.
+        crate::oom::check()?;
         // Lazy generators: a `yield` in statement position suspends the body
         // here, and is where `next()` / `send()` / `throw()` re-enter it.
         if matches!(self.gen_stack.last(), Some(GenFrame::Lazy(_))) {
@@ -920,10 +990,10 @@ impl Interpreter {
                         Operator::Add => {
                             let it = self.make_iter(rhs.clone())?;
                             let mut items = Vec::new();
-                            while let Some(v) = self.iter_next(&it)? {
-                                items.push(v);
-                            }
-                            target.borrow_mut().extend(items);
+                            self.drain_iter(&it, &mut items)?;
+                            let mut target = target.borrow_mut();
+                            crate::limits::try_reserve_items(&mut target, items.len())?;
+                            target.extend(items);
                             true
                         }
                         Operator::Mult => {
@@ -4067,9 +4137,7 @@ impl Interpreter {
         if let Expr::Starred(s) = e {
             let v = self.eval_expr(&s.value, env)?;
             let iter = self.make_iter(v)?;
-            while let Some(x) = self.iter_next(&iter)? {
-                out.push(x);
-            }
+            self.drain_iter(&iter, out)?;
             Ok(())
         } else {
             out.push(self.eval_expr(e, env)?);
@@ -4592,9 +4660,11 @@ impl Interpreter {
             }
             _ => {
                 let it = self.make_iter(other)?;
+                ensure_range_fits(&it, crate::pyset::PySet::SLOT_BYTES)?;
                 while let Some(x) = self.iter_next(&it)? {
                     let k = self.hash_key(&x)?;
                     let k = self.settle_key_in_set(out, k)?;
+                    crate::limits::set_room(out)?;
                     out.insert(k);
                 }
             }
@@ -5326,9 +5396,7 @@ impl Interpreter {
             if let Expr::Starred(s) = arg {
                 let v = self.eval_expr(&s.value, env)?;
                 let iter = self.make_iter(v)?;
-                while let Some(x) = self.iter_next(&iter)? {
-                    args.push(x);
-                }
+                self.drain_iter(&iter, &mut args)?;
             } else {
                 args.push(self.eval_expr(arg, env)?);
             }
@@ -7123,7 +7191,14 @@ impl Interpreter {
             // and `fib(99)` still compute the exact arbitrary-precision result.
             (Int(a), Add, Int(b)) => return Ok(Int(a.add(b))),
             (Int(a), Sub, Int(b)) => return Ok(Int(a.sub(b))),
-            (Int(a), Mult, Int(b)) => return Ok(Int(a.mul(b))),
+            (Int(a), Mult, Int(b)) => {
+                // Only a product of two heap ints can be large enough to
+                // exhaust memory; CPython raises `MemoryError` there.
+                if let (VmInt::Big(_), VmInt::Big(_)) = (a, b) {
+                    crate::limits::ensure_int_bits(a.bits() as u128 + b.bits() as u128, true)?;
+                }
+                return Ok(Int(a.mul(b)));
+            }
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
             (Int(a), Div, Int(b)) => return int_true_div(a, b).map(Value::Float),
             (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
@@ -7143,12 +7218,7 @@ impl Interpreter {
                     let (af, bf) = (l.to_float()?, r.to_float()?);
                     return self.binop(&Value::Float(af), Pow, &Value::Float(bf));
                 }
-                // `pow` takes a `u32` exponent; for ridiculous exponents
-                // (10**million) we'd happily eat all the RAM, so cap at
-                // u32::MAX which is already astronomically more than
-                // Python tolerates before timing out.
-                let exp = b.to_u32().ok_or_else(overflow)?;
-                return Ok(Int(a.pow(exp)));
+                return int_pow(a, b).map(Int);
             }
             // `bool & bool` / `|` / `^` stay `bool` in CPython (`True & False`
             // is `False`, not `0`); every other bool operand promotes to int.
@@ -7162,7 +7232,23 @@ impl Interpreter {
                 if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
-                let shift = b.to_usize().ok_or_else(overflow)?;
+                // `0 << n` is 0 whatever `n` is; any other result has
+                // `shift` more bits than `a`, and CPython raises
+                // `MemoryError` when that cannot be allocated.
+                if a.is_zero() {
+                    return Ok(Int(VmInt::from(0)));
+                }
+                // CPython counts the shift in 30-bit digits: a count whose
+                // digit count overflows `Py_ssize_t` is an `OverflowError`,
+                // anything smaller that cannot be allocated a `MemoryError`.
+                if b.div_floor(&VmInt::from(30)).to_i64().is_none() {
+                    return Err(Unwind::Exception(VmException::new(
+                        "OverflowError",
+                        "too many digits in integer",
+                    )));
+                }
+                let shift = b.to_usize().ok_or_else(crate::limits::memory_error)?;
+                crate::limits::ensure_int_bits(a.bits() as u128 + shift as u128, false)?;
                 return Ok(Int(a.shl(shift)));
             }
             (Int(a), RShift, Int(b)) => {
@@ -7394,7 +7480,7 @@ impl Interpreter {
             if a.is_empty() {
                 return Ok(Str(b.clone()));
             }
-            return Ok(Str(Rc::new(format!("{}{}", a, b))));
+            return Ok(Str(Rc::new(crate::limits::try_concat_str(a, b)?)));
         }
         // The length limit counts characters, as CPython's does; a result
         // that fits the limit but not memory is a `MemoryError`.
@@ -7412,10 +7498,7 @@ impl Interpreter {
 
         // Bytes: concatenation (`b"a" + b"b"`) and repetition (`b"a" * 3`).
         if let (Bytes(a), Add, Bytes(b)) = (l, op, r) {
-            let mut out = Vec::with_capacity(a.len() + b.len());
-            out.extend_from_slice(a);
-            out.extend_from_slice(b);
-            return Ok(Bytes(Rc::new(out)));
+            return Ok(Bytes(Rc::new(crate::limits::try_concat_bytes(a, b)?)));
         }
         if let (Bytes(a), Mult, Int(n)) | (Int(n), Mult, Bytes(a)) = (l, op, r) {
             let n =
@@ -7425,14 +7508,11 @@ impl Interpreter {
 
         // Lists / tuples.
         if let (List(a), Add, List(b)) = (l, op, r) {
-            let mut out = a.borrow().clone();
-            out.extend(b.borrow().iter().cloned());
+            let out = crate::limits::try_concat_items(&a.borrow(), &b.borrow())?;
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Add, Tuple(b)) = (l, op, r) {
-            let mut out = a.as_ref().clone();
-            out.extend(b.iter().cloned());
-            return Ok(Tuple(Rc::new(out)));
+            return Ok(Tuple(Rc::new(crate::limits::try_concat_items(a, b)?)));
         }
         // Repetition works in both operand orders (`[0] * 3` and `3 * [0]`),
         // and a `bool` count is an int (`True * [1] == [1]`), as in CPython.
@@ -9428,9 +9508,7 @@ impl Interpreter {
                 // Iterate.
                 let iter = self.make_iter(other)?;
                 let mut out = Vec::new();
-                while let Some(v) = self.iter_next(&iter)? {
-                    out.push(v);
-                }
+                self.drain_iter(&iter, &mut out)?;
                 out
             }
         };
@@ -9714,7 +9792,9 @@ impl Interpreter {
                     ));
                 }
                 let k = self.dict_probe_key(d, key)?;
-                d.borrow_mut().insert(k, value);
+                let mut d = d.borrow_mut();
+                crate::limits::dict_room(&mut d)?;
+                d.insert(k, value);
                 Ok(())
             }
             other => Err(type_error(format!(
@@ -9753,9 +9833,7 @@ impl Interpreter {
             .make_iter(value)
             .map_err(|_| type_error("must assign iterable to extended slice"))?;
         let mut repl: Vec<Value> = Vec::new();
-        while let Some(v) = self.iter_next(&it)? {
-            repl.push(v);
-        }
+        self.drain_iter(&it, &mut repl)?;
         let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
         if step_i == 1 {
             let s = start.max(0) as usize;
@@ -9817,6 +9895,8 @@ impl Interpreter {
             Value::List(l) => IterState::List { items: l, index: 0 },
             Value::Tuple(t) => IterState::Tuple { items: t, index: 0 },
             Value::Str(s) => {
+                // The iterator holds the text as `char`s (four bytes each).
+                crate::limits::ensure_alloc_items(s.len(), std::mem::size_of::<char>())?;
                 let chars = s.chars().collect();
                 IterState::Str { chars, index: 0 }
             }
@@ -9998,6 +10078,9 @@ impl Interpreter {
         let Value::Iter(state) = it else {
             return Err(type_error("not an iterator"));
         };
+        // A safe point for memory exhaustion: a builtin draining an
+        // iterator (`list(map(str, xs))`) runs no statements.
+        crate::oom::check()?;
         // Iterator adapters that wrap an inner iterator (Enumerate, Zip, Map,
         // Filter) must recurse into `iter_next` on that inner iterator. The
         // recursion needs `&mut self`, and bumping our own state afterwards
@@ -10200,6 +10283,18 @@ impl Interpreter {
             }
         };
 
+        // Every state below runs more interpreter code — another
+        // `iter_next` for an adapter, a generator body, a `__next__` call —
+        // so a chain of a million `(x for x in g)` / `map` / `filter` /
+        // `enumerate` / `zip` layers recurses a million native frames deep.
+        // Stop at the native-stack floor with a `RecursionError`, as a
+        // function call does, instead of overflowing the stack (SIGABRT).
+        if self.stack_floor != 0 && crate::stack::stack_pointer() < self.stack_floor {
+            return Err(Unwind::Exception(VmException::new(
+                "RecursionError",
+                "maximum recursion depth exceeded",
+            )));
+        }
         match recurse {
             Recurse::Enumerate(inner) => match self.iter_next(&Value::Iter(inner))? {
                 Some(v) => {
@@ -10315,6 +10410,23 @@ impl Interpreter {
         }
     }
 
+    /// Append every remaining item of `it` to `out`. An iterator that knows
+    /// how much is left (CPython's `__length_hint__`: a range, list, tuple
+    /// or string iterator) has the room reserved up front, and the buffer
+    /// otherwise grows fallibly, so `list(range(10**12))` and an unbounded
+    /// `list(itertools.count())` raise `MemoryError` as CPython does where a
+    /// plain `Vec::push` aborts the process.
+    pub fn drain_iter(&mut self, it: &Value, out: &mut Vec<Value>) -> Result<(), Unwind> {
+        if let Some(n) = iter_len_hint(it) {
+            let n = usize::try_from(n).map_err(|_| crate::limits::memory_error())?;
+            crate::limits::try_reserve_items(out, n)?;
+        }
+        while let Some(x) = self.iter_next(it)? {
+            crate::limits::try_push(out, x)?;
+        }
+        Ok(())
+    }
+
     /// `next(it)` semantics: the next element, or a `StopIteration` carrying
     /// a finished generator's `return` value.
     pub fn iter_next_or_stop(&mut self, it: &Value) -> Result<Value, Unwind> {
@@ -10401,13 +10513,12 @@ impl Interpreter {
                 let spread = this.eval_expr(&star.value, scope)?;
                 let it = this.make_iter(spread)?;
                 while let Some(v) = this.iter_next(&it)? {
-                    out_clone.borrow_mut().push(v);
+                    crate::limits::try_push(&mut out_clone.borrow_mut(), v)?;
                 }
                 return Ok(());
             }
             let v = this.eval_expr(&elt, scope)?;
-            out_clone.borrow_mut().push(v);
-            Ok(())
+            crate::limits::try_push(&mut out_clone.borrow_mut(), v)
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
         Ok(Value::List(Rc::new(RefCell::new(result))))
@@ -10424,9 +10535,7 @@ impl Interpreter {
                 let spread = this.eval_expr(&star.value, scope)?;
                 let it = this.make_iter(spread)?;
                 let mut items = Vec::new();
-                while let Some(v) = this.iter_next(&it)? {
-                    items.push(v);
-                }
+                this.drain_iter(&it, &mut items)?;
                 items
             } else {
                 vec![this.eval_expr(&elt, scope)?]
@@ -10434,7 +10543,9 @@ impl Interpreter {
             for v in items {
                 let k = this.hash_key(&v)?;
                 let k = this.settle_key_set(&out_clone, k)?;
-                out_clone.borrow_mut().insert(k);
+                let mut out = out_clone.borrow_mut();
+                crate::limits::set_room(&mut out)?;
+                out.insert(k);
             }
             Ok(())
         })?;
@@ -10474,7 +10585,9 @@ impl Interpreter {
             let k = this.hash_key(&key_value)?;
             let k = this.settle_key_dict(&out_clone, k)?;
             let v = this.eval_expr(&value_expr, scope)?;
-            out_clone.borrow_mut().insert(k, v);
+            let mut out = out_clone.borrow_mut();
+            crate::limits::dict_room(&mut out)?;
+            out.insert(k, v);
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
@@ -13369,6 +13482,84 @@ fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
 /// backing allocation goes through `try_reserve_exact` so a count that fits an
 /// index but not the machine (`[1, 1] * (2 ** 40)`) also surfaces as a
 /// catchable `MemoryError` instead of aborting the process.
+/// `a ** b` for a non-negative `b`. The result has between
+/// `(bits(a) - 1) * b` and `bits(a) * b` bits: one that cannot be allocated
+/// is a `MemoryError` (CPython's, once its own multiplication runs out)
+/// rather than an abort, and the bases whose powers never grow (0, 1, -1)
+/// take any exponent.
+fn int_pow(a: &VmInt, b: &VmInt) -> Result<VmInt, Unwind> {
+    if b.is_zero() {
+        return Ok(VmInt::from(1));
+    }
+    if let Some(small) = a.to_i64() {
+        match small {
+            0 | 1 => return Ok(VmInt::from(small)),
+            -1 => {
+                let odd = !b.mod_floor(&VmInt::from(2)).is_zero();
+                return Ok(VmInt::from(if odd { -1 } else { 1 }));
+            }
+            _ => {}
+        }
+    }
+    let exp = b.to_u32().ok_or_else(crate::limits::memory_error)?;
+    let least_bits = (a.bits() as u128 - 1) * exp as u128;
+    crate::limits::ensure_int_bits(least_bits, true)?;
+    Ok(a.pow(exp))
+}
+
+/// How many items `it` has left, for the iterators that know exactly
+/// (CPython's `__length_hint__`). A list can still change under its
+/// iterator, so this sizes a buffer and nothing else.
+pub(crate) fn iter_len_hint(it: &Value) -> Option<u128> {
+    let Value::Iter(state) = it else {
+        return None;
+    };
+    let state = state.try_borrow().ok()?;
+    Some(match &*state {
+        IterState::Range {
+            current,
+            stop,
+            step,
+        } => crate::limits::range_len(*current, *stop, *step),
+        IterState::List { items, index } => {
+            items.try_borrow().ok()?.len().saturating_sub(*index) as u128
+        }
+        IterState::Tuple { items, index } | IterState::Reversed { items, index } => {
+            items.len().saturating_sub(*index) as u128
+        }
+        IterState::Str { chars, index } => chars.len().saturating_sub(*index) as u128,
+        _ => return None,
+    })
+}
+
+/// How many items a range iterator has left; `None` for anything else. A
+/// range's items are distinct, so a set or dict built from one needs at
+/// least that many slots.
+pub(crate) fn range_iter_len(it: &Value) -> Option<u128> {
+    let Value::Iter(state) = it else {
+        return None;
+    };
+    match &*state.try_borrow().ok()? {
+        IterState::Range {
+            current,
+            stop,
+            step,
+        } => Some(crate::limits::range_len(*current, *stop, *step)),
+        _ => None,
+    }
+}
+
+/// `MemoryError` up front when `it` is a range too long for a table of
+/// `slot_bytes`-byte slots to hold — `set(range(10**12))` fails at once
+/// rather than after filling memory.
+pub(crate) fn ensure_range_fits(it: &Value, slot_bytes: usize) -> Result<(), Unwind> {
+    if let Some(n) = range_iter_len(it) {
+        let n = usize::try_from(n).map_err(|_| crate::limits::memory_error())?;
+        crate::limits::ensure_alloc_items(n, slot_bytes)?;
+    }
+    Ok(())
+}
+
 fn repeat_elements(elems: &[Value], n: &VmInt) -> Result<Vec<Value>, Unwind> {
     let count = repeat_count_checked(elems.len(), n, repeated_out_of_memory())?;
     let total = elems.len().saturating_mul(count);
@@ -13818,9 +14009,7 @@ fn iter_reduce(interp: &mut Interpreter, target: &Value) -> Result<Value, Unwind
             };
             let twin = Value::Iter(Rc::new(RefCell::new(twin)));
             let mut rest = Vec::new();
-            while let Some(v) = interp.iter_next(&twin)? {
-                rest.push(v);
-            }
+            interp.drain_iter(&twin, &mut rest)?;
             vec![
                 builtin(interp, "iter")?,
                 Value::Tuple(Rc::new(vec![Value::List(Rc::new(RefCell::new(rest)))])),

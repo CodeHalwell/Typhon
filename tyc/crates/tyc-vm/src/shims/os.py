@@ -416,6 +416,10 @@ def access(path, mode, *, dir_fd=None, effective_ids=False, follow_symlinks=True
 
 
 def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+    # Linux cannot change a symlink's own mode, and CPython says so rather
+    # than changing the mode of the file the link points at.
+    if not follow_symlinks and (lstat(path).st_mode & 0o170000) == 0o120000:
+        raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
     _fs_chmod(path, mode)
 
 

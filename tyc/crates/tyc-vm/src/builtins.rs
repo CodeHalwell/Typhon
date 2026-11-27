@@ -768,9 +768,7 @@ pub fn install(interp: &mut Interpreter) {
         let mut out = Vec::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                out.push(x);
-            }
+            i.drain_iter(&it, &mut out)?;
         }
         Ok(Value::List(Rc::new(RefCell::new(out))))
     });
@@ -779,9 +777,7 @@ pub fn install(interp: &mut Interpreter) {
         let mut out = Vec::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                out.push(x);
-            }
+            i.drain_iter(&it, &mut out)?;
         }
         Ok(Value::Tuple(Rc::new(out)))
     });
@@ -842,6 +838,11 @@ pub fn install(interp: &mut Interpreter) {
             Some(v) => {
                 let it = i.make_iter(v)?;
                 let mut out: Vec<u8> = Vec::new();
+                // CPython sizes the buffer from the length hint first.
+                if let Some(n) = crate::interp::iter_len_hint(&it) {
+                    let n = usize::try_from(n).map_err(|_| crate::limits::memory_error())?;
+                    crate::limits::try_reserve_items(&mut out, n)?;
+                }
                 while let Some(x) = i.iter_next(&it)? {
                     let n = x.to_int()?;
                     if !(0..=255).contains(&n) {
@@ -862,13 +863,23 @@ pub fn install(interp: &mut Interpreter) {
     // local. `exec` is deliberately absent — it would need statement
     // execution against a caller frame the VM cannot see.
     native!("eval", |i, args| {
-        let (pos, _kw) = split_kwargs(&args);
-        let Some(Value::Str(src)) = pos.first() else {
-            return Err(type_error(
-                "eval() arg 1 must be a string, bytes or code object",
-            ));
+        let (pos, kw) = split_kwargs(&args);
+        let source = match pos.first() {
+            Some(Value::Str(src)) => src.trim().to_owned(),
+            Some(Value::Bytes(src)) => String::from_utf8_lossy(src).trim().to_owned(),
+            _ => {
+                return Err(type_error(
+                    "eval() arg 1 must be a string, bytes or code object",
+                ))
+            }
         };
-        let source = src.trim().to_owned();
+        let named = |name: &str, at: usize| {
+            pos.get(at)
+                .cloned()
+                .or_else(|| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+                .filter(|v| !matches!(v, Value::None))
+        };
+        let (globals, locals) = (named("globals", 1), named("locals", 2));
         let module = tyc_syntax::parse_module(&source).map_err(|e| {
             crate::error::Unwind::Exception(crate::error::VmException::new(
                 "SyntaxError",
@@ -882,7 +893,10 @@ pub fn install(interp: &mut Interpreter) {
             ));
         };
         let expr = expr.value.clone();
-        let env = i.root.clone();
+        // With `globals` (and `locals`) the expression sees those names and
+        // nothing else: a caller that passes `{"__builtins__": {}}` or a
+        // dict of allowed names is restricting what the text can reach.
+        let env = i.eval_scope(globals.as_ref(), locals.as_ref())?;
         // An `eval` is its own compilation unit (`File "<string>"`), so its
         // literals are not the caller's constants.
         let outer = i
@@ -964,6 +978,7 @@ pub fn install(interp: &mut Interpreter) {
                     Value::Tuple(t) if t.len() == 2 => {
                         let key = i.hash_key(&t[0])?;
                         let key = i.settle_key_in_map(&map, key)?;
+                        crate::limits::dict_room(&mut map)?;
                         map.insert(key, t[1].clone());
                     }
                     _ => return Err(type_error("dict update expected a sequence of pairs")),
@@ -1209,9 +1224,7 @@ pub fn install(interp: &mut Interpreter) {
                 .ok_or_else(|| type_error("sorted() requires an iterable"))?,
         )?;
         let mut out: Vec<Value> = Vec::new();
-        while let Some(v) = i.iter_next(&it)? {
-            out.push(v);
-        }
+        i.drain_iter(&it, &mut out)?;
         // Honour a user `__lt__` on instances via `value_cmp` (the dunder-blind
         // `py_cmp` treats every instance pair as equal, leaving the list
         // unsorted). `sort_by` can't return `Result`, so capture the first
@@ -1285,9 +1298,7 @@ pub fn install(interp: &mut Interpreter) {
                 }
                 let it = i.make_iter(seq)?;
                 let mut out: Vec<Value> = Vec::new();
-                while let Some(v) = i.iter_next(&it)? {
-                    out.push(v);
-                }
+                i.drain_iter(&it, &mut out)?;
                 out.reverse();
                 IterState::Reversed {
                     items: Rc::new(out),
@@ -2228,6 +2239,12 @@ fn based_int_repr(
         }
     };
     let sign = if vi.is_negative() { "-" } else { "" };
+    // One digit per `log2(radix)` bits: a text CPython cannot allocate is
+    // its `MemoryError`.
+    crate::limits::ensure_int_bits(
+        vi.bits() as u128 * 8 / u128::from(radix.trailing_zeros().max(1)),
+        true,
+    )?;
     Ok(Value::Str(Rc::new(format!(
         "{sign}{prefix}{}",
         vi.abs().to_str_radix(radix)
@@ -2751,9 +2768,7 @@ fn reduce_minmax(
     let candidates: Vec<Value> = if args.len() == 1 {
         let it = interp.make_iter(args.remove(0))?;
         let mut out = Vec::new();
-        while let Some(v) = interp.iter_next(&it)? {
-            out.push(v);
-        }
+        interp.drain_iter(&it, &mut out)?;
         out
     } else {
         args
@@ -3007,9 +3022,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         if let Some((_, d)) = kw.iter().find(|(k, _)| k == "defaults") {
             if !matches!(d, Value::None) {
                 let it = i.make_iter(d.clone())?;
-                while let Some(v) = i.iter_next(&it)? {
-                    defaults.push(v);
-                }
+                i.drain_iter(&it, &mut defaults)?;
             }
         }
         if defaults.len() > fields.len() {
@@ -6187,6 +6200,103 @@ fn lexical_abspath(path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+// ── Files `tempfile` created ──────────────────────────────────────────
+//
+// CPython's `tempfile` creates a file with `O_CREAT | O_EXCL` and from then
+// on works through the descriptor, so nothing done to the *name* afterwards
+// (a file or symlink swapped in by another user of a shared directory) can
+// redirect its writes. The VM's file objects hold no descriptor: they keep
+// the whole file in memory and write it back by name. To keep the same
+// guarantee, a name created by `tempfile` is recorded with the identity
+// (device and inode) of the file created, and every later write to that
+// name opens it with `O_NOFOLLOW` and checks the identity before touching
+// it.
+
+#[cfg(unix)]
+thread_local! {
+    static PRIVATE_FILES: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(unix)]
+pub(crate) fn private_file_id(path: &str) -> Option<(u64, u64)> {
+    PRIVATE_FILES.with(|m| m.borrow().get(path).copied())
+}
+
+fn forget_private_file(path: &str) {
+    #[cfg(unix)]
+    PRIVATE_FILES.with(|m| {
+        m.borrow_mut().remove(path);
+    });
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Create `path` exclusively with permission bits `mode` and record its
+/// identity. An existing name — a file, a directory or a symlink, dangling
+/// or not — is `EEXIST`.
+pub(crate) fn create_private(path: &str, mode: u32) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        PRIVATE_FILES.with(|m| {
+            m.borrow_mut()
+                .insert(path.to_owned(), (meta.dev(), meta.ino()));
+        });
+    }
+    Ok(file)
+}
+
+/// Write `data` to the private file recorded for `path` as `id`. When the
+/// name no longer leads to that file the data is dropped: CPython's write
+/// through its descriptor would land in the original (now unlinked) file,
+/// never in what replaced it. When the name is simply gone, the file is
+/// created again, exclusively and owner-only.
+#[cfg(unix)]
+pub(crate) fn private_write(
+    path: &str,
+    data: &[u8],
+    append: bool,
+    id: (u64, u64),
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).custom_flags(libc::O_NOFOLLOW);
+    if append {
+        opts.append(true);
+    }
+    match opts.open(path) {
+        Ok(mut file) => {
+            let meta = file.metadata()?;
+            if (meta.dev(), meta.ino()) != id {
+                return Ok(());
+            }
+            if !append {
+                file.set_len(0)?;
+            }
+            file.write_all(data)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            forget_private_file(path);
+            create_private(path, 0o600)?.write_all(data)
+        }
+        // A symlink now sits at the name (`O_NOFOLLOW`).
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The `_fs_*` natives every filesystem shim is seeded with.
 fn fs_natives() -> Vec<(&'static str, Value)> {
     vec![
@@ -6223,6 +6333,16 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     .map(|v| v.py_str())
                     .unwrap_or_else(|| "w".into());
                 use std::io::Write;
+                // A file `tempfile` created is written through its identity,
+                // never through whatever the name leads to now.
+                #[cfg(unix)]
+                if mode != "x" {
+                    if let Some(id) = private_file_id(&path) {
+                        private_write(&path, &data, mode == "a", id)
+                            .map_err(|e| fs_unwind(&display, e))?;
+                        return Ok(Value::None);
+                    }
+                }
                 let result = match mode.as_str() {
                     "a" => std::fs::OpenOptions::new()
                         .create(true)
@@ -6245,6 +6365,22 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     _ => std::fs::write(&path, &data),
                 };
                 result.map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            // `_fs_create_private(path, mode)`: create a new file exclusively
+            // (`O_CREAT | O_EXCL`, which never follows a symlink) with `mode`
+            // and bind the name to the file created, for `tempfile`.
+            "_fs_create_private",
+            nf("_fs_create_private", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "open")?;
+                let mode = args
+                    .get(1)
+                    .map(|v| v.to_int())
+                    .transpose()?
+                    .unwrap_or(0o600);
+                create_private(&path, mode as u32).map_err(|e| fs_unwind(&display, e))?;
                 Ok(Value::None)
             }),
         ),
@@ -6334,6 +6470,7 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             nf("_fs_unlink", |i, args| {
                 let (path, display) = path_arg(i, &args, 0, "unlink")?;
                 std::fs::remove_file(&path).map_err(|e| fs_unwind(&display, e))?;
+                forget_private_file(&path);
                 Ok(Value::None)
             }),
         ),
@@ -6343,6 +6480,10 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                 let (src, dsrc) = path_arg(i, &args, 0, "rename")?;
                 let (dst, ddst) = path_arg(i, &args, 1, "rename")?;
                 std::fs::rename(&src, &dst).map_err(|e| fs_unwind2(&dsrc, &ddst, e))?;
+                // The program moved the file itself: neither name is bound
+                // to the old identity any more.
+                forget_private_file(&src);
+                forget_private_file(&dst);
                 Ok(Value::None)
             }),
         ),
@@ -6587,9 +6728,16 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     .arg(&cmd)
                     .status()
                     .map_err(|e| fs_unwind("'sh'", e))?;
-                // POSIX wait status: the exit code in the high byte.
-                let code = status.code().unwrap_or(1) as i64;
-                Ok(Value::Int(VmInt::from(code << 8)))
+                // The raw POSIX wait status, as `system(3)` returns it: the
+                // exit code in the high byte, a terminating signal in the low.
+                #[cfg(unix)]
+                let raw = {
+                    use std::os::unix::process::ExitStatusExt;
+                    i64::from(status.into_raw())
+                };
+                #[cfg(not(unix))]
+                let raw = i64::from(status.code().unwrap_or(1));
+                Ok(Value::Int(VmInt::from(raw)))
             }),
         ),
         (
@@ -6601,12 +6749,14 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                 }
                 let n = n as usize;
                 crate::limits::ensure_alloc(n)?;
-                // The kernel CSPRNG, as in CPython. Programs make keys and
-                // tokens from `os.urandom`; it used to be filled from
-                // `RandomState` hashes, which are not cryptographic.
+                // The OS CSPRNG, as CPython's `os.urandom`: programs draw
+                // keys and tokens from this.
                 let mut out = vec![0u8; n];
-                crate::os_random::fill(&mut out).map_err(|e| {
-                    os_error_unwind(5, &format!("cannot read OS randomness: {e}"), None, None)
+                crate::osrandom::fill(&mut out).map_err(|e| {
+                    Unwind::Exception(crate::error::VmException::new(
+                        "NotImplementedError",
+                        format!("os.urandom is unavailable: {e}"),
+                    ))
                 })?;
                 Ok(Value::Bytes(Rc::new(out)))
             }),
@@ -6752,11 +6902,11 @@ fn make_tempfile_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_shim_module(interp, "tempfile", |interp| {
         let os = make_os_module(interp)?;
         let shutil = make_shutil_module(interp)?;
-        let random = interp.import_module("random")?;
+        let io = make_io_module(interp)?;
         let mut seed = fs_natives();
         seed.push(("os", os));
         seed.push(("shutil", shutil));
-        seed.push(("random", random));
+        seed.push(("io", io));
         let (members, env) = compile_shim(interp, shims::TEMPFILE, seed)?;
         Ok(module_from_members(
             "tempfile",
@@ -7519,12 +7669,19 @@ fn make_random_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         if k.is_negative() {
             return Err(value_error("number of bits must be non-negative"));
         }
-        k.to_u64().ok_or_else(|| {
-            Unwind::Exception(crate::error::VmException::new(
-                "OverflowError",
-                "Python int too large to convert to C int",
-            ))
-        })
+        // CPython reads `k` as a `Py_ssize_t`-sized count and raises
+        // `MemoryError` for a result it cannot allocate.
+        let k = k
+            .to_u64()
+            .filter(|k| *k <= i64::MAX as u64)
+            .ok_or_else(|| {
+                Unwind::Exception(crate::error::VmException::new(
+                    "OverflowError",
+                    "int too big to convert",
+                ))
+            })?;
+        crate::limits::ensure_int_bits(u128::from(k), true)?;
+        Ok(k)
     }
 
     let natives: Vec<(&str, Value)> = vec![
@@ -8148,17 +8305,16 @@ fn make_re_module_with_flags(interp: &mut Interpreter) -> Result<Value, Unwind> 
 }
 
 fn make_re_module() -> Value {
-    // Compile a Python-shaped pattern into a Rust regex by rewriting
-    // `(?P<name>` to `(?<name>`. The `(?P=name)` back-reference form is
-    // left as-is so the Rust engine rejects it with a legible error —
-    // there's no equivalent in `regex` (a finite-automaton engine).
-    fn to_rust_pattern(p: &str) -> String {
-        p.replace("(?P<", "(?<")
-    }
+    use crate::pyre::PyRe;
+    // Patterns are compiled by `crate::pyre`, which translates Python's
+    // syntax and matching rules (`$`, `\Z`, `(?P<name>`, `fullmatch`) for
+    // the Rust engine. The `(?P=name)` back-reference form is left as-is so
+    // the engine rejects it with a legible error — there's no equivalent in
+    // `regex` (a finite-automaton engine).
     // `flags` are the `re.I` / `re.M` / `re.S` / `re.X` bits, spelled as the
     // inline group the Rust engine understands. `ASCII` / `UNICODE` /
     // `LOCALE` / `DEBUG` are accepted and have no effect here.
-    fn compile_one(p: &str, flags: i64) -> Result<regex::Regex, Unwind> {
+    fn compile_one(p: &str, flags: i64) -> Result<PyRe, Unwind> {
         if flags & (4 | 128) != 0 || flags & !(2 | 8 | 16 | 32 | 64 | 256) != 0 {
             return Err(re_error(p, "this flag requires tyc run --compile"));
         }
@@ -8174,12 +8330,13 @@ fn make_re_module() -> Value {
         if flags & 256 != 0 {
             inline.push_str("-u");
         }
-        let source = if inline.is_empty() {
-            to_rust_pattern(p)
+        let prefix = if inline.is_empty() {
+            String::new()
         } else {
-            format!("(?{inline}){}", to_rust_pattern(p))
+            format!("(?{inline})")
         };
-        regex::Regex::new(&source).map_err(|e| re_error(p, &e.to_string()))
+        PyRe::new(p, &prefix, flags & 8 != 0, flags & 64 != 0)
+            .map_err(|e| re_error(p, &e.to_string()))
     }
     // name -> group index for a compiled pattern's named groups.
     fn name_indices(re: &regex::Regex) -> HashMap<String, usize> {
@@ -8326,7 +8483,7 @@ fn make_re_module() -> Value {
     // Python-syntax template string. `count == 0` means replace all.
     fn re_sub_apply(
         interp: &mut crate::interp::Interpreter,
-        re: &regex::Regex,
+        re: &PyRe,
         repl: &Value,
         s: &str,
         string: &Option<Value>,
@@ -8346,7 +8503,7 @@ fn make_re_module() -> Value {
         let mut out = String::new();
         let mut last = 0usize;
         let mut n = 0usize;
-        for caps in re.captures_iter(s) {
+        for caps in re.captures_all(s, 0) {
             if count != 0 && n >= count {
                 break;
             }
@@ -8370,11 +8527,11 @@ fn make_re_module() -> Value {
     }
     // `re.split` — includes captured groups between splits (CPython semantics).
     // `maxsplit == 0` means unlimited.
-    fn re_split_apply(re: &regex::Regex, s: &str, maxsplit: usize) -> Vec<Value> {
+    fn re_split_apply(re: &PyRe, s: &str, maxsplit: usize) -> Vec<Value> {
         let ngroups = re.captures_len().saturating_sub(1);
         let mut out: Vec<Value> = Vec::new();
         let mut last = 0usize;
-        for (n, caps) in re.captures_iter(s).enumerate() {
+        for (n, caps) in re.captures_all(s, 0).into_iter().enumerate() {
             if maxsplit != 0 && n >= maxsplit {
                 break;
             }
@@ -8394,7 +8551,7 @@ fn make_re_module() -> Value {
     // A Pattern object holding a compiled regex plus a thin method table
     // so `pattern.match(s)` etc. work. Every method takes its keyword
     // arguments (`pos=`, `endpos=`, `count=`, `maxsplit=`) by name.
-    fn pattern_value(p: regex::Regex, source: String, flags: i64) -> Value {
+    fn pattern_value(p: PyRe, source: String, flags: i64) -> Value {
         let p_rc = Rc::new(p);
         let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
         // `Pattern.prefixmatch` (3.15) is a second method with the same
@@ -8412,9 +8569,7 @@ fn make_re_module() -> Value {
                     let a = re_args(args, &["string", "pos", "endpos"], name)?;
                     let s = re_str_arg(&a[0], name)?;
                     let (hay, pos) = re_window(&s, &a[1], &a[2])?;
-                    let caps = p1
-                        .captures_at(&hay, pos)
-                        .filter(|c| c.get(0).unwrap().start() == pos);
+                    let caps = p1.match_at(&hay, pos);
                     Ok(captures_to_value(
                         caps,
                         &name_indices(&p1),
@@ -8444,9 +8599,7 @@ fn make_re_module() -> Value {
                 let a = re_args(args, &["string", "pos", "endpos"], "fullmatch")?;
                 let s = re_str_arg(&a[0], "fullmatch")?;
                 let (hay, pos) = re_window(&s, &a[1], &a[2])?;
-                let caps = p2m.captures_at(&hay, pos).filter(|c| {
-                    c.get(0).unwrap().start() == pos && c.get(0).unwrap().end() == hay.len()
-                });
+                let caps = p2m.fullmatch_at(&hay, pos);
                 Ok(captures_to_value(
                     caps,
                     &name_indices(&p2m),
@@ -8467,26 +8620,11 @@ fn make_re_module() -> Value {
                 // original string (`span()` on a `finditer(s, 1)` hit was
                 // slice-relative) and `^` keeps meaning the real start.
                 let ctx = MatchCtx::new(&hay, &a[0], pos);
-                let mut out: Vec<Value> = Vec::new();
-                let mut at = pos;
-                while at <= hay.len() {
-                    let Some(caps) = p2f.captures_at(&hay, at) else {
-                        break;
-                    };
-                    let whole = caps.get(0).expect("group 0 always present");
-                    let (start, end) = (whole.start(), whole.end());
-                    out.push(captures_to_value(Some(caps), &names, &ctx));
-                    at = if end > start {
-                        end
-                    } else {
-                        // An empty match: step one character so the scan
-                        // makes progress, as `captures_iter` does.
-                        match hay[end..].chars().next() {
-                            Some(ch) => end + ch.len_utf8(),
-                            None => break,
-                        }
-                    };
-                }
+                let out: Vec<Value> = p2f
+                    .captures_all(&hay, pos)
+                    .into_iter()
+                    .map(|caps| captures_to_value(Some(caps), &names, &ctx))
+                    .collect();
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }))),
         );
@@ -8497,7 +8635,7 @@ fn make_re_module() -> Value {
                 let a = re_args(args, &["string", "pos", "endpos"], "findall")?;
                 let s = re_str_arg(&a[0], "findall")?;
                 let (hay, pos) = re_window(&s, &a[1], &a[2])?;
-                let hits = re_findall_hits(&p3, &hay[pos..]);
+                let hits = re_findall_hits(&p3, &hay, pos);
                 Ok(Value::List(Rc::new(RefCell::new(hits))))
             }))),
         );
@@ -8583,15 +8721,18 @@ fn make_re_module() -> Value {
     /// CPython's `findall` result shape: the whole match when the pattern has no
     /// capture groups, the single group when it has one, and a tuple of groups
     /// when it has more. An unmatched optional group is the empty string.
-    fn re_findall_hits(re: &regex::Regex, text: &str) -> Vec<Value> {
+    fn re_findall_hits(re: &PyRe, text: &str, pos: usize) -> Vec<Value> {
         let groups = re.captures_len() - 1;
         if groups == 0 {
             return re
-                .find_iter(text)
+                .captures_all(text, pos)
+                .iter()
+                .filter_map(|c| c.get(0))
                 .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
                 .collect();
         }
-        re.captures_iter(text)
+        re.captures_all(text, pos)
+            .into_iter()
             .map(|c| {
                 let mut parts: Vec<Value> = (1..=groups)
                     .map(|i| {
@@ -8855,7 +8996,7 @@ fn make_re_module() -> Value {
             // string (unlike `re.search`). The Rust `regex` crate
             // returns the leftmost match anywhere, so anchor by
             // requiring `start() == 0`.
-            let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+            let caps = r.match_at(&s, 0);
             let names = name_indices(&r);
             Ok(captures_to_value(
                 caps,
@@ -8906,11 +9047,10 @@ fn make_re_module() -> Value {
                     let a = re_args(args, &["pattern", "string", "flags"], "fullmatch")?;
                     let p = re_str_arg(&a[0], "fullmatch")?;
                     let s = re_str_arg(&a[1], "fullmatch")?;
-                    let anchored = format!("^(?:{p})$");
-                    let r = compile_one(&anchored, re_flags_arg(&a[2])?)?;
+                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     let names = name_indices(&r);
                     Ok(captures_to_value(
-                        r.captures(&s),
+                        r.fullmatch_at(&s, 0),
                         &names,
                         &MatchCtx::new(&s, &a[1], 0),
                     ))
@@ -8967,7 +9107,8 @@ fn make_re_module() -> Value {
                     let names = name_indices(&r);
                     let ctx = MatchCtx::new(&s, &a[1], 0);
                     let out: Vec<Value> = r
-                        .captures_iter(&s)
+                        .captures_all(&s, 0)
+                        .into_iter()
                         .map(|c| captures_to_value(Some(c), &names, &ctx))
                         .collect();
                     Ok(Value::List(Rc::new(RefCell::new(out))))
@@ -8980,7 +9121,7 @@ fn make_re_module() -> Value {
                     let p = re_str_arg(&a[0], "findall")?;
                     let s = re_str_arg(&a[1], "findall")?;
                     let r = compile_one(&p, re_flags_arg(&a[2])?)?;
-                    let hits = re_findall_hits(&r, &s);
+                    let hits = re_findall_hits(&r, &s, 0);
                     Ok(Value::List(Rc::new(RefCell::new(hits))))
                 }),
             ),
@@ -11744,10 +11885,12 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
     let fill = it.next().unwrap_or(Value::None);
     let mut map: DictMap = DictMap::new();
     let iter = interp.make_iter(iterable)?;
+    crate::interp::ensure_range_fits(&iter, crate::pydict::PyDict::ENTRY_BYTES)?;
     while let Some(k) = interp.iter_next(&iter)? {
         // Last write wins on a duplicate key, matching CPython.
         let key = interp.hash_key(&k)?;
         let key = interp.settle_key_in_map(&map, key)?;
+        crate::limits::dict_room(&mut map)?;
         map.insert(key, fill.clone());
     }
     Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
@@ -11924,6 +12067,11 @@ fn str_method(
     args: &[Value],
     _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
+    crate::limits::ensure_text_result(s.len(), name, || match args.first() {
+        Some(Value::Str(sep)) if !sep.is_empty() => s.matches(sep.as_str()).count() + 1,
+        _ if name == "splitlines" => s.lines().count() + 1,
+        _ => s.split_whitespace().count() + 1,
+    })?;
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
         "lower" => Value::Str(Rc::new(s.to_lowercase())),
@@ -12056,7 +12204,7 @@ fn str_method(
                     _ => v,
                 };
                 match v {
-                    Value::Str(s) => parts.push(s),
+                    Value::Str(s) => crate::limits::try_push(&mut parts, s)?,
                     other => {
                         return Err(type_error(format!(
                             "sequence item: expected str instance, {} found",
@@ -12069,14 +12217,7 @@ fn str_method(
             if parts.len() == 1 && exact {
                 return Ok(Value::Str(parts.pop().unwrap()));
             }
-            let mut out = String::new();
-            for (i, p) in parts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(s);
-                }
-                out.push_str(p);
-            }
-            Value::Str(Rc::new(out))
+            Value::Str(Rc::new(crate::limits::try_join_str(s, &parts)?))
         }
         "replace" => {
             let from = args
@@ -12087,6 +12228,25 @@ fn str_method(
                 .get(1)
                 .ok_or_else(|| type_error("str.replace requires args"))?
                 .py_str();
+            // The result's size is known before it is built: CPython raises
+            // `MemoryError` (or `OverflowError`) for one it cannot hold.
+            if to.len() > from.len() && !s.is_empty() {
+                let occurrences = if from.is_empty() {
+                    s.chars().count() + 1
+                } else {
+                    s.matches(from.as_str()).count()
+                };
+                let limit = match args.get(2) {
+                    Some(c) => usize::try_from(c.to_int()?).unwrap_or(usize::MAX),
+                    None => usize::MAX,
+                };
+                crate::limits::ensure_replace_result(
+                    s.len(),
+                    from.len(),
+                    to.len(),
+                    occurrences.min(limit),
+                )?;
+            }
             // Optional third `count` arg: replace at most `count` occurrences
             // (a negative count means "replace all", matching CPython).
             let replaced = match args.get(2) {
@@ -12776,6 +12936,11 @@ fn bytes_method(
     args: &[Value],
     _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
+    crate::limits::ensure_text_result(b.len(), name, || match args.first() {
+        Some(Value::Bytes(sep)) if sep.len() == 1 => b.iter().filter(|c| **c == sep[0]).count() + 1,
+        // An upper bound: no split yields more pieces than bytes.
+        _ => b.len() / 2 + 1,
+    })?;
     Ok(match name {
         // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
         // other encodings fall back to a lossy UTF-8 decode.
@@ -13254,21 +13419,49 @@ fn bytes_method(
                 }
                 None => usize::MAX,
             };
+            if to.len() > from.len() && !from.is_empty() {
+                let mut occurrences = 0usize;
+                let mut rest: &[u8] = b;
+                while let Some(i) = find_subslice(rest, &from) {
+                    occurrences += 1;
+                    rest = &rest[i + from.len()..];
+                }
+                crate::limits::ensure_replace_result(
+                    b.len(),
+                    from.len(),
+                    to.len(),
+                    occurrences.min(max),
+                )?;
+            }
             Value::Bytes(Rc::new(replace_bytes(b, &from, &to, max)))
         }
         "join" => {
             // b",".join([b"a", b"b"]) -> b"a,b"
             let it = single(args, "join")?;
-            let mut out: Vec<u8> = Vec::new();
-            if let Value::List(l) = it {
-                for (i, part) in l.borrow().iter().enumerate() {
-                    if i > 0 {
-                        out.extend_from_slice(b);
+            // The parts are shared, not copied, and the total length is
+            // reserved before anything is written.
+            let mut parts: Vec<Rc<Vec<u8>>> = Vec::new();
+            let mut add = |part: &Value| -> Result<(), Unwind> {
+                parts.push(match part {
+                    Value::Bytes(p) => p.clone(),
+                    other => Rc::new(bytes_arg(other)?),
+                });
+                Ok(())
+            };
+            match it {
+                Value::List(l) => {
+                    for part in l.borrow().iter() {
+                        add(part)?;
                     }
-                    out.extend_from_slice(&bytes_arg(part)?);
                 }
+                Value::Tuple(t) => {
+                    for part in t.iter() {
+                        add(part)?;
+                    }
+                }
+                _ => {}
             }
-            Value::Bytes(Rc::new(out))
+            Value::Bytes(Rc::new(crate::limits::try_join_bytes(b, &parts)?))
         }
         _ => return Err(attribute_error(format!("bytes has no method '{}'", name))),
     })
@@ -13415,13 +13608,28 @@ fn list_method(
     let (args, kw) = split_kwargs(args);
     match name {
         "append" => {
-            l.borrow_mut().push(single(args, "append")?.clone());
+            crate::limits::try_push(&mut l.borrow_mut(), single(args, "append")?.clone())?;
             Ok(Value::None)
         }
         "extend" => {
-            let it = interp.make_iter(single(args, "extend")?.clone())?;
+            let arg = single(args, "extend")?;
+            // A list argument is copied as it stands, as CPython does
+            // (`PySequence_Fast`): `xs.extend(xs)` doubles the list, where
+            // stepping an iterator over the list being grown never ends.
+            if let Value::List(src) = arg {
+                let items = crate::limits::try_clone_items(&src.borrow())?;
+                let mut l = l.borrow_mut();
+                crate::limits::try_reserve_items(&mut l, items.len())?;
+                l.extend(items);
+                return Ok(Value::None);
+            }
+            let it = interp.make_iter(arg.clone())?;
+            if let Some(n) = crate::interp::iter_len_hint(&it) {
+                let n = usize::try_from(n).map_err(|_| crate::limits::memory_error())?;
+                crate::limits::try_reserve_items(&mut l.borrow_mut(), n)?;
+            }
             while let Some(v) = interp.iter_next(&it)? {
-                l.borrow_mut().push(v);
+                crate::limits::try_push(&mut l.borrow_mut(), v)?;
             }
             Ok(Value::None)
         }
@@ -13618,9 +13826,7 @@ fn list_method(
         "extendleft" => {
             let it = interp.make_iter(single(args, "extendleft")?.clone())?;
             let mut to_prepend: Vec<Value> = Vec::new();
-            while let Some(v) = interp.iter_next(&it)? {
-                to_prepend.push(v);
-            }
+            interp.drain_iter(&it, &mut to_prepend)?;
             // extendleft reverses element order to match CPython
             // (each pushed-left element ends up *before* the previous).
             let mut l = l.borrow_mut();
@@ -13897,7 +14103,9 @@ pub(crate) fn set_method(
         "add" => {
             let x = single(args, "add")?;
             let k = interp.set_probe_key(s, x)?;
-            s.borrow_mut().insert(k);
+            let mut s = s.borrow_mut();
+            crate::limits::set_room(&mut s)?;
+            s.insert(k);
             Ok(Value::None)
         }
         "remove" | "discard" => {
@@ -14848,10 +15056,14 @@ fn json_apply_hooks(
 }
 
 fn json_loads(s: &str) -> Result<Value, Unwind> {
+    // The decoder holds the document as `char`s (four bytes each).
+    crate::limits::ensure_alloc_items(s.len(), std::mem::size_of::<char>())?;
     let mut p = JsonParser {
         doc: s,
         chars: s.chars().collect(),
         pos: 0,
+        depth: 0,
+        stack_floor: None,
     };
     p.skip_ws();
     let v = p.parse_value()?;
@@ -14868,8 +15080,11 @@ struct JsonParser<'a> {
     doc: &'a str,
     chars: Vec<char>,
     pos: usize,
+    /// How many arrays and objects enclose the value being decoded.
+    depth: usize,
+    /// The native-stack floor, looked up once the nesting gets deep.
+    stack_floor: Option<usize>,
 }
-
 impl JsonParser<'_> {
     fn err(&self, msg: &str, pos: usize) -> Unwind {
         json_decode_error(msg, self.doc, pos)
@@ -14893,8 +15108,39 @@ impl JsonParser<'_> {
             return Err(self.err("Expecting value", self.pos));
         };
         match c {
-            '{' => self.parse_object(),
-            '[' => self.parse_array(),
+            '{' | '[' => {
+                // A document nested too deep is CPython's `RecursionError`;
+                // the decoder recurses natively, so without the bound an
+                // attacker-sized `[[[[…` overflows the stack (SIGABRT).
+                if self.depth >= 64 && self.stack_floor.is_none() {
+                    self.stack_floor = Some(
+                        crate::stack::current_thread_stack()
+                            .map(|(low, size)| low + crate::stack::safety_margin(size))
+                            .unwrap_or(0),
+                    );
+                }
+                let below_floor = self
+                    .stack_floor
+                    .is_some_and(|floor| floor != 0 && crate::stack::stack_pointer() < floor);
+                if self.depth >= JSON_MAX_DEPTH || below_floor {
+                    let what = if c == '{' { "object" } else { "array" };
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "RecursionError",
+                        format!(
+                            "maximum recursion depth exceeded while decoding a JSON {what} \
+                             from a unicode string"
+                        ),
+                    )));
+                }
+                self.depth += 1;
+                let value = if c == '{' {
+                    self.parse_object()
+                } else {
+                    self.parse_array()
+                };
+                self.depth -= 1;
+                value
+            }
             '"' => self.parse_string().map(|s| Value::Str(Rc::new(s))),
             'n' if self.starts_with("null") => {
                 self.pos += 4;
@@ -15243,9 +15489,7 @@ pub fn call_with_kwargs(
                 .map(|a| -> Result<Vec<Value>, Unwind> {
                     let it = interp.make_iter(a)?;
                     let mut out = Vec::new();
-                    while let Some(v) = interp.iter_next(&it)? {
-                        out.push(v);
-                    }
+                    interp.drain_iter(&it, &mut out)?;
                     Ok(out)
                 })
                 .collect::<Result<_, _>>()?;
@@ -15290,9 +15534,7 @@ pub fn call_with_kwargs(
             let candidates: Vec<Value> = if args.len() == 1 {
                 let it = interp.make_iter(args.into_iter().next().unwrap())?;
                 let mut out = Vec::new();
-                while let Some(v) = interp.iter_next(&it)? {
-                    out.push(v);
-                }
+                interp.drain_iter(&it, &mut out)?;
                 out
             } else {
                 args
@@ -15344,9 +15586,7 @@ pub fn call_with_kwargs(
                     .next()
                     .ok_or_else(|| type_error("sorted() requires an iterable"))?,
             )?;
-            while let Some(v) = interp.iter_next(&it)? {
-                out.push(v);
-            }
+            interp.drain_iter(&it, &mut out)?;
             let mut reverse = false;
             let mut key_fn: Option<Value> = None;
             for (k, v) in kwargs {
