@@ -4138,6 +4138,32 @@ pub fn class_is_pydantic_model(class: &Class) -> bool {
         .contains_key("__typhon_pydantic_model__")
 }
 
+/// What a pydantic `model` does with keyword arguments that name no field:
+/// the `extra` entry (`"forbid"`, `"ignore"` or `"allow"`) of the nearest
+/// `model_config` along the MRO, or `None` when that config does not set it.
+/// `model_config` is a `ConfigDict(...)` call or a dict literal — a dict
+/// either way.
+///
+/// Only the nearest config is consulted: every `model` gets a `model_config`
+/// (the lowering injects one where the source has none), and the build
+/// merges the project's `[emit] model-extra` into a config that omits
+/// `extra`, so an omitted `extra` means that setting, not the parent's.
+pub fn pydantic_model_extra(class: &Rc<Class>) -> Option<String> {
+    let config = std::iter::once(class)
+        .chain(class.mro.iter())
+        .find_map(|c| match c.class_attrs.borrow().get("model_config") {
+            Some(Value::Dict(config)) => Some(Rc::clone(config)),
+            _ => None,
+        })?;
+    let config = config.borrow();
+    config.iter().find_map(|(k, v)| match (k, v) {
+        (HashKey::Str(key), Value::Str(policy)) if key.as_str() == "extra" => {
+            Some((**policy).clone())
+        }
+        _ => None,
+    })
+}
+
 /// Whether `@dataclass` decorated `class` itself (not just an ancestor), so
 /// its generated methods live at this MRO level.
 pub fn generates_dataclass(class: &Class) -> bool {

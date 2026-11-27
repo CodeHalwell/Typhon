@@ -6394,6 +6394,29 @@ impl Interpreter {
                 class.fields.len()
             )));
         }
+        // A pydantic `model` decides what to do with keywords that name no
+        // field from `model_config`'s `extra`: `"ignore"` drops them,
+        // `"allow"` keeps them as attributes, `"forbid"` rejects them. With
+        // no `extra` the project's `[emit] model-extra` applies; the VM does
+        // not see that setting, so it takes its default, `"forbid"`.
+        if !consumed_kwargs.is_empty()
+            && std::iter::once(class)
+                .chain(class.mro.iter())
+                .any(|c| crate::value::class_is_pydantic_model(c))
+        {
+            match crate::value::pydantic_model_extra(class).as_deref() {
+                Some("ignore") => consumed_kwargs.clear(),
+                Some("allow") => {
+                    // In the order they were passed, like pydantic.
+                    for (k, _) in kwargs {
+                        if let Some(v) = consumed_kwargs.remove(k) {
+                            instance.fields.borrow_mut().insert(k.clone(), v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if !consumed_kwargs.is_empty() {
             let extras: Vec<String> = consumed_kwargs.keys().cloned().collect();
             return Err(type_error(format!(

@@ -10802,7 +10802,8 @@ fn make_pydantic_module() -> Value {
         is_protocol: false,
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
-        // Accept any kwargs and ignore — purely a config-record stub.
+        // The keywords are added by the kwargs-aware call path
+        // (`call_native_with_kwargs`'s `"ConfigDict"` arm).
         Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
             DictMap::new(),
         ))))
@@ -15720,10 +15721,23 @@ pub fn call_with_kwargs(
             }
             Ok(base)
         }
+        // `ConfigDict(frozen=True, extra="ignore")` is a dict of its
+        // keywords, as in pydantic (a `TypedDict`). The generated `__init__`
+        // of a `model` reads `extra` out of it.
+        "ConfigDict" => {
+            let base = (n.func)(interp, args)?;
+            if let Value::Dict(d) = &base {
+                let mut m = d.borrow_mut();
+                for (k, v) in kwargs {
+                    m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+            }
+            Ok(base)
+        }
         // Native ctors / shims that intentionally accept any kwargs and
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
-        "ConfigDict" | "dataclass" => (n.func)(interp, args),
+        "dataclass" => (n.func)(interp, args),
         // `itertools.groupby(iterable, key=…)` — fold the `key` keyword into
         // the second positional slot the native already understands.
         "groupby" => {
