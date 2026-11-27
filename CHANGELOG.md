@@ -94,6 +94,33 @@ release pipeline and the installers. No language change.
   `TYC_NO_SYNC` accepts any value but empty or `0`; `tyc check` refuses a
   `src` symlinked out of the project.
 
+- **Hostile input can no longer crash or stall the front end.** The parser
+  stops at 10,000 levels of nesting (1,000 for nested f-strings) with a
+  `tyc::parse` error instead of overflowing the stack — 300,000 nested
+  parentheses used to abort `tyc check`, `tyc fmt` and the language server on
+  open. A type larger than 100,000 nodes degrades to `Unknown` (a 24-line
+  file of doubling tuples took 10 s and 3 GB); method and attribute chains
+  are inferred once per link (an `extend str` chain of 24 calls took 6 s, of
+  48 never finished); and long runs of `?`, `as!` and `rescue` on one line
+  are linear or capped. A diagnostic more than 50,000 columns into a line
+  renders without its source excerpt instead of panicking the renderer.
+- **The VM raises where it used to abort.** Results too large to allocate
+  (`1 << 10**12`, `list(range(10**12))`, `",".join(big)`, big-int products)
+  raise `MemoryError` as CPython does; deep iterator chains and deeply nested
+  `json.loads` input raise `RecursionError`.
+- **VM `tempfile` matches CPython's guarantees.** Names come from
+  `os.urandom` rather than the program-seedable `random`; files are created
+  exclusively with mode `0600` and written through the file that was
+  created, not through its name.
+- **VM `eval(text, globals, locals)` honours its scope arguments** (they
+  were ignored, so `eval(text, {})` could read module globals);
+  `os.chmod(..., follow_symlinks=False)` and `Path.lchmod` no longer change
+  the link's target; `shutil.rmtree` refuses a symlink with CPython's error;
+  `os.system` returns the raw wait status; the pydantic shim honours
+  `model_config`'s `extra`; under `--no-fallback`, `re`'s `$` and
+  `fullmatch` follow CPython.
+- `deny.toml` treats a yanked crate as an error.
+
 ### Release pipeline and packaging
 
 - The release workflow's build jobs run with a read-only token, without
