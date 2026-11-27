@@ -5082,6 +5082,10 @@ fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option
     Some(slice.trim_end_matches(['\r', '\n']))
 }
 
+/// The furthest into a line a label may sit and still be rendered with its
+/// source excerpt (see `SanitisedDiagnostic::labels`).
+const MAX_RENDERED_COLUMN: usize = 50_000;
+
 /// FINDINGS #32: an owning wrapper around a [`TycError`] that overrides
 /// `Diagnostic::source_code` to return a sanitised view (synthetic
 /// `__typhon_*` lines blanked out / restored). Every other trait
@@ -5807,12 +5811,34 @@ impl miette::Diagnostic for SanitisedDiagnostic {
     }
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
         let labels = self.inner.labels()?;
+        // The graphical renderer formats a label's column as a padding
+        // width and panics ("Formatting argument out of range") once it
+        // passes `u16::MAX`. A machine-generated megabyte line is exactly
+        // where the limits that reject hostile input report from, so a
+        // label that far out is dropped: the message, code and help still
+        // render, without the source excerpt nobody could read anyway.
+        let labels: Vec<miette::LabeledSpan> = labels.collect();
+        if let Some(text) = self.sanitised.as_ref().map(named_source_text) {
+            let too_far = labels.iter().any(|label| {
+                let offset = label.inner().offset().min(text.len());
+                let end = (offset + label.inner().len()).min(text.len());
+                let line_start = text.as_bytes()[..offset]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(0, |newline| newline + 1);
+                end - line_start > MAX_RENDERED_COLUMN
+            });
+            if too_far {
+                return None;
+            }
+        }
+        let labels = labels.into_iter();
         // B15: redirect any label that landed in a synthetic duplicated
         // `impl Variant:` block (past the real source's EOF) back onto the
         // first, real-source-aligned block. No-op when the file carries
         // no distributed impl group.
         let Some(remap) = self.block_remap.clone() else {
-            return Some(labels);
+            return Some(Box::new(labels));
         };
         let remapped = labels.map(move |label| {
             let span = label.inner();

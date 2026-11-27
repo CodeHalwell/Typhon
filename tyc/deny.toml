@@ -3,6 +3,9 @@
 
 [advisories]
 version = 2
+# A yanked crate is one its own maintainers withdrew, usually for a serious
+# bug or a security problem: fail rather than warn.
+yanked = "deny"
 ignore = []
 
 [licenses]
