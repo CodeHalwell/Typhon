@@ -28,7 +28,10 @@ use crate::{
     UnsupportedSyntaxErrorKind,
 };
 
-use super::{InterpolatedStringElementsKind, Parenthesized, RecoveryContextKind};
+use super::{
+    InterpolatedStringElementsKind, MAX_INTERPOLATED_STRING_DEPTH, Parenthesized,
+    RecoveryContextKind,
+};
 
 /// A token set consisting of a newline or end of file.
 const NEWLINE_EOF_SET: TokenSet = TokenSet::new([TokenKind::Newline, TokenKind::EndOfFile]);
@@ -247,19 +250,40 @@ impl<'src> Parser<'src> {
         left_precedence: OperatorPrecedence,
         context: ExpressionContext,
     ) -> ParsedExpr {
+        // Typhon: every expression nesting cycle except `lambda` bodies and
+        // `if` expressions passes through here, so this is where the nesting
+        // limit is enforced.
+        if !self.enter_nesting() {
+            return Expr::Name(self.parse_missing_name()).into();
+        }
         let start = self.node_start();
+        let mark = self.height_mark();
         let lhs = self.parse_lhs_expression(left_precedence, context);
-        self.parse_binary_expression_or_higher_recursive(lhs, left_precedence, context, start)
+        let lhs_height = self.height_since(mark);
+        let parsed = self.parse_binary_expression_or_higher_recursive(
+            lhs,
+            lhs_height,
+            left_precedence,
+            context,
+            start,
+        );
+        self.leave_nesting();
+        parsed
     }
 
+    /// `left_height` is the height of `left` as measured by
+    /// [`Parser::height_since`] (Typhon: the loop below builds a left-deep
+    /// chain without recursing, so it has to count the levels itself).
     pub(super) fn parse_binary_expression_or_higher_recursive(
         &mut self,
         mut left: ParsedExpr,
+        left_height: u32,
         left_precedence: OperatorPrecedence,
         context: ExpressionContext,
         start: TextSize,
     ) -> ParsedExpr {
         let mut progress = ParserProgress::default();
+        let mut height = left_height;
 
         loop {
             progress.assert_progressing(self);
@@ -290,6 +314,7 @@ impl<'src> Parser<'src> {
                 break;
             }
 
+            let mark = self.height_mark();
             left.expr = match operator {
                 BinaryLikeOperator::Boolean(bool_op) => {
                     Expr::BoolOp(self.parse_boolean_expression(left.expr, start, bool_op, context))
@@ -311,6 +336,10 @@ impl<'src> Parser<'src> {
                     })
                 }
             };
+            // The old `left` moved one level down; the right operand was
+            // parsed one level down already.
+            height = height.saturating_add(1).max(self.height_since(mark));
+            self.note_chain_height(height);
         }
 
         left
@@ -413,10 +442,12 @@ impl<'src> Parser<'src> {
             _ => {}
         }
 
+        let mark = self.height_mark();
         let lhs = self.parse_atom();
+        let atom_height = self.height_since(mark);
 
         ParsedExpr {
-            expr: self.parse_postfix_expression(lhs.expr, start),
+            expr: self.parse_postfix_expression(lhs.expr, start, atom_height),
             is_parenthesized: lhs.is_parenthesized,
         }
     }
@@ -662,14 +693,32 @@ impl<'src> Parser<'src> {
     /// expression, `[` for a subscript expression, or `.` for an attribute expression.
     ///
     /// This method does nothing if the current token is not a candidate for a postfix expression.
-    pub(super) fn parse_postfix_expression(&mut self, mut lhs: Expr, start: TextSize) -> Expr {
+    ///
+    /// `lhs_height` is the height of `lhs` as measured by
+    /// [`Parser::height_since`] (Typhon: the loop builds a left-deep chain
+    /// without recursing, so it has to count the levels itself).
+    pub(super) fn parse_postfix_expression(
+        &mut self,
+        mut lhs: Expr,
+        start: TextSize,
+        lhs_height: u32,
+    ) -> Expr {
+        let mut height = lhs_height;
         loop {
+            let mark = self.height_mark();
             lhs = match self.current_token_kind() {
                 TokenKind::Lpar => Expr::Call(self.parse_call_expression(lhs, start)),
                 TokenKind::Lsqb => Expr::Subscript(self.parse_subscript_expression(lhs, start)),
                 TokenKind::Dot => Expr::Attribute(self.parse_attribute_expression(lhs, start)),
-                _ => break lhs,
+                _ => {
+                    self.height_since(mark);
+                    break lhs;
+                }
             };
+            // The old `lhs` moved one level down; arguments and slices were
+            // parsed one level down already.
+            height = height.saturating_add(1).max(self.height_since(mark));
+            self.note_chain_height(height);
         }
     }
 
@@ -1549,11 +1598,18 @@ impl<'src> Parser<'src> {
         let mut flags = self.tokens.current_flags().as_any_string_flags();
 
         self.bump(kind.start_token());
+        // Typhon: f-strings nested inside f-strings get their own, much lower
+        // limit (see `MAX_INTERPOLATED_STRING_DEPTH`).
+        self.interpolated_string_depth += 1;
+        if self.interpolated_string_depth > MAX_INTERPOLATED_STRING_DEPTH {
+            self.report_interpolated_strings_too_deep();
+        }
         let elements = self.parse_interpolated_string_elements(
             flags,
             InterpolatedStringElementsKind::Regular(kind),
             kind,
         );
+        self.interpolated_string_depth -= 1;
 
         if !self.expect(kind.end_token()) {
             flags = flags.with_unclosed(true);
@@ -2878,7 +2934,15 @@ impl<'src> Parser<'src> {
         // test_err lambda_body_with_yield_expr
         // lambda x: yield y
         // lambda x: yield from y
-        let body = self.parse_conditional_expression_or_higher();
+        // Typhon: `lambda: lambda: …` recurses without passing through
+        // `parse_binary_expression_or_higher`, so it opens a level itself.
+        let body = if self.enter_nesting() {
+            let body = self.parse_conditional_expression_or_higher();
+            self.leave_nesting();
+            body
+        } else {
+            Expr::Name(self.parse_missing_name()).into()
+        };
 
         ast::ExprLambda {
             body: Box::new(body.expr),
@@ -2902,7 +2966,15 @@ impl<'src> Parser<'src> {
 
         self.expect(TokenKind::Else);
 
-        let orelse = self.parse_conditional_expression_or_higher();
+        // Typhon: `a if b else c if d else …` recurses here after the
+        // operand's own nesting level has been closed, so it opens one.
+        let orelse = if self.enter_nesting() {
+            let orelse = self.parse_conditional_expression_or_higher();
+            self.leave_nesting();
+            orelse
+        } else {
+            Expr::Name(self.parse_missing_name()).into()
+        };
 
         ast::ExprIf {
             body: Box::new(body),

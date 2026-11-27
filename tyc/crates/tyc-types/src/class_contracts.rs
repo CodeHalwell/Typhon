@@ -105,90 +105,87 @@ pub(super) fn method_accepts_contract(expected: &MethodSig, actual: &MethodSig) 
     true
 }
 
+/// Every `class` statement in the module, nested ones included, in source
+/// (pre-order) order. Built once per check: [`property`] runs for each
+/// attribute read, and walking the whole module for each one made a long
+/// attribute chain cubic in its length.
+fn class_defs<'c, 'a>(c: &'c Checker<'a>) -> &'c [&'a ruff_python_ast::StmtClassDef] {
+    struct Collect<'a>(Vec<&'a ruff_python_ast::StmtClassDef>);
+    impl<'a> Visitor<'a> for Collect<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::ClassDef(cd) = stmt {
+                self.0.push(cd);
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+        // No statement lives inside an expression.
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let Some(module) = c.module else {
+        return &[];
+    };
+    c.class_defs.get_or_init(|| {
+        let mut collect = Collect(Vec::new());
+        for stmt in &module.body {
+            collect.visit_stmt(stmt);
+        }
+        collect.0
+    })
+}
+
 pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, Option<Type>)> {
     fn own(c: &Checker, class: &str, field: &str) -> (Option<Type>, Option<Type>) {
-        struct Scan<'a, 'c> {
-            c: &'a Checker<'c>,
-            class: &'a str,
-            field: &'a str,
-            getter: Option<Type>,
-            setter: Option<Type>,
-        }
-        impl<'s> Visitor<'s> for Scan<'_, '_> {
-            fn visit_stmt(&mut self, stmt: &'s Stmt) {
-                if let Stmt::ClassDef(cd) = stmt {
-                    let real = cd
-                        .name
-                        .as_str()
-                        .strip_prefix("__typhon_impl_")
-                        .unwrap_or(cd.name.as_str());
-                    if real == self.class {
-                        let tps = self
-                            .c
-                            .class_type_params
-                            .get(self.class)
-                            .cloned()
-                            .unwrap_or_default();
-                        for stmt in &cd.body {
-                            if let Stmt::FunctionDef(f) = stmt {
-                                if f.name.as_str() != self.field {
-                                    continue;
-                                }
-                                if is_property_getter(f) {
-                                    self.getter = Some(
-                                        f.returns
-                                            .as_deref()
-                                            .map(|r| {
-                                                type_from_annotation_with_params(
-                                                    r,
-                                                    &self.c.classes,
-                                                    &tps,
-                                                )
-                                            })
-                                            .unwrap_or(Type::Unknown),
-                                    );
-                                    let readonly=f.decorator_list.iter().any(|d|matches!(&d.expression,Expr::Name(n) if n.id.as_str()=="property") || matches!(&d.expression,Expr::Attribute(a) if a.attr.as_str()=="property"));
-                                    if !readonly {
-                                        self.setter = self.getter.clone();
-                                    }
-                                } else if is_property_setter(f) {
-                                    self.setter = Some(
-                                        f.parameters
-                                            .posonlyargs
-                                            .iter()
-                                            .chain(&f.parameters.args)
-                                            .nth(1)
-                                            .and_then(|p| p.parameter.annotation.as_deref())
-                                            .map(|r| {
-                                                type_from_annotation_with_params(
-                                                    r,
-                                                    &self.c.classes,
-                                                    &tps,
-                                                )
-                                            })
-                                            .unwrap_or(Type::Unknown),
-                                    );
-                                }
-                            }
-                        }
-                    }
+        let mut getter: Option<Type> = None;
+        let mut setter: Option<Type> = None;
+        let mut tps: Option<Vec<String>> = None;
+        for cd in class_defs(c) {
+            let real = cd
+                .name
+                .as_str()
+                .strip_prefix("__typhon_impl_")
+                .unwrap_or(cd.name.as_str());
+            if real != class {
+                continue;
+            }
+            for stmt in &cd.body {
+                let Stmt::FunctionDef(f) = stmt else {
+                    continue;
+                };
+                if f.name.as_str() != field {
+                    continue;
                 }
-                visitor::walk_stmt(self, stmt);
+                let tps = tps.get_or_insert_with(|| {
+                    c.class_type_params.get(class).cloned().unwrap_or_default()
+                });
+                if is_property_getter(f) {
+                    getter = Some(
+                        f.returns
+                            .as_deref()
+                            .map(|r| type_from_annotation_with_params(r, &c.classes, tps))
+                            .unwrap_or(Type::Unknown),
+                    );
+                    let readonly = f.decorator_list.iter().any(|d| {
+                        matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property")
+                            || matches!(&d.expression, Expr::Attribute(a) if a.attr.as_str() == "property")
+                    });
+                    if !readonly {
+                        setter = getter.clone();
+                    }
+                } else if is_property_setter(f) {
+                    setter = Some(
+                        f.parameters
+                            .posonlyargs
+                            .iter()
+                            .chain(&f.parameters.args)
+                            .nth(1)
+                            .and_then(|p| p.parameter.annotation.as_deref())
+                            .map(|r| type_from_annotation_with_params(r, &c.classes, tps))
+                            .unwrap_or(Type::Unknown),
+                    );
+                }
             }
         }
-        let mut scan = Scan {
-            c,
-            class,
-            field,
-            getter: None,
-            setter: None,
-        };
-        if let Some(module) = c.module {
-            for stmt in &module.body {
-                scan.visit_stmt(stmt);
-            }
-        }
-        (scan.getter, scan.setter)
+        (getter, setter)
     }
     fn resolve(
         c: &Checker,

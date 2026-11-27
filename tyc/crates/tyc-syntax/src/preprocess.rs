@@ -1129,6 +1129,7 @@ struct Splice {
     repl: String,
 }
 
+#[cfg(test)]
 impl Splice {
     fn apply(&self, source: &str) -> String {
         let mut out = String::with_capacity(source.len() + self.repl.len());
@@ -1161,6 +1162,167 @@ impl Splice {
             })
             .collect()
     }
+}
+
+/// One step of a [`splice_to_fixpoint`] rewrite.
+struct SpliceStep {
+    splice: Splice,
+    /// How far into `splice.repl` the next search may start: the length of
+    /// the leading part of the replacement that holds only fixed text and
+    /// source text the search has already been over.
+    searched: usize,
+    /// The [`compute_code_skip_mask`] of `splice.repl`, assembled from the
+    /// mask of the source it was cut from — see [`SpliceMask`]. `None` when
+    /// that cannot be done exactly; the whole buffer is then lexed again.
+    repl_skip: Option<Vec<bool>>,
+}
+
+/// Builds the skip mask of a replacement that is fixed code interleaved with
+/// pieces moved verbatim out of the source.
+///
+/// A moved piece keeps the mask it had, provided it lexes the same on its
+/// own: it must start and end in plain code. The callers cut pieces at
+/// structural-code boundaries, so the one way that fails is a piece ending
+/// inside a `#` comment whose newline was trimmed off — any piece holding a
+/// `#` is therefore refused, and the caller falls back to a full re-lex.
+struct SpliceMask<'a> {
+    source: &'a str,
+    skip: &'a [bool],
+    mask: Option<Vec<bool>>,
+}
+
+impl<'a> SpliceMask<'a> {
+    fn new(source: &'a str, skip: &'a [bool], capacity: usize) -> Self {
+        Self {
+            source,
+            skip,
+            mask: Some(Vec::with_capacity(capacity)),
+        }
+    }
+
+    /// `len` bytes of generated code.
+    fn code(&mut self, len: usize) {
+        if let Some(mask) = &mut self.mask {
+            mask.resize(mask.len() + len, false);
+        }
+    }
+
+    /// `piece`, a sub-slice of the source this mask was created for.
+    fn moved(&mut self, piece: &str) {
+        let start = piece.as_ptr() as usize - self.source.as_ptr() as usize;
+        match &mut self.mask {
+            Some(mask) if !piece.as_bytes().contains(&b'#') => {
+                mask.extend_from_slice(&self.skip[start..start + piece.len()]);
+            }
+            _ => self.mask = None,
+        }
+    }
+}
+
+/// Upper bound on the bytes [`splice_to_fixpoint`] moves in total before it
+/// stops rewriting.
+///
+/// Each splice shifts the text after it, so the work is the number of
+/// rewrites times the length of what follows them: linear for any real file,
+/// quadratic for one line carrying a hundred thousand chained operators —
+/// whose lowering nests one call per operator and could never be parsed
+/// anyway. A megabyte source with several thousand operators spread through
+/// it stays well inside the bound. Operators left over when it is hit reach
+/// the parser as they are and are reported as a syntax error.
+const SPLICE_FIXPOINT_BUDGET: u64 = 1 << 32;
+
+/// Upper bound on the total size of the replacements [`splice_to_fixpoint`]
+/// writes before it stops rewriting.
+///
+/// A replacement holds its operator's operands, so this is the sum of the
+/// operand sizes: a few dozen bytes per operator in real code. An operator
+/// *chain* (`y as! int as! int …`) makes each operand the whole chain so
+/// far, and finding where that operand starts costs a scan back over it —
+/// quadratic in the chain's length. A chain long enough to reach the bound
+/// nests thousands of calls; the parser stops at 200.
+const SPLICE_OPERAND_BUDGET: u64 = 1 << 24;
+
+/// Apply left-most-first splices until `find` reports none is left.
+///
+/// `find(text, skip, from)` returns the left-most rewrite at or after byte
+/// `from`, given the text and its [`compute_code_skip_mask`]. Returns the
+/// rewritten text, its output-line → input-line table, and whether anything
+/// changed.
+///
+/// The `as!` and postfix-`rescue` passes used to re-lex the whole buffer and
+/// rescan it from byte 0 for every operator, which made them quadratic in the
+/// size of the *file*: 5,000 casts took 6 s. Here the mask is patched in
+/// place (the replacement's mask comes with the step; the text around it
+/// lexes as before, because a splice starts and ends in plain code), the scan
+/// resumes
+/// where the previous one stopped (an operator that could not be rewritten
+/// stays that way: it depends only on its own operands), and the line table
+/// is recomposed only for a splice that actually spans or adds lines.
+fn splice_to_fixpoint(
+    source: &str,
+    mut find: impl FnMut(&str, &[bool], usize) -> Option<SpliceStep>,
+) -> (String, Vec<usize>, bool) {
+    let mut current = source.to_owned();
+    let mut map = identity_line_map(text_line_count(source));
+    let mut skip = compute_code_skip_mask(&current);
+    let mut from = 0usize;
+    let mut changed = false;
+    let mut work = 0u64;
+    let mut operands = 0u64;
+    while let Some(step) = find(&current, &skip, from) {
+        let SpliceStep {
+            splice,
+            searched,
+            repl_skip,
+        } = step;
+        let Splice { start, end, repl } = &splice;
+        let (start, end) = (*start, *end);
+        work = work.saturating_add((current.len() - start + repl.len()) as u64);
+        operands = operands.saturating_add(repl.len() as u64);
+        if work > SPLICE_FIXPOINT_BUDGET || operands > SPLICE_OPERAND_BUDGET {
+            break;
+        }
+        // Same table `Splice::line_map` builds, skipped when it would be the
+        // identity (a splice inside one line that adds none).
+        let removed_lines = current[start..end].matches('\n').count();
+        let added_lines = repl.matches('\n').count();
+        let first_line = if removed_lines > 0 || added_lines > 0 {
+            Some(current[..start].matches('\n').count())
+        } else {
+            None
+        };
+        current.replace_range(start..end, repl);
+        match repl_skip {
+            Some(mask) if mask.len() == repl.len() => {
+                skip.splice(start..end, mask);
+            }
+            _ => skip = compute_code_skip_mask(&current),
+        }
+        // In the crate's own tests, check the patched mask against a re-lex
+        // (small inputs only: this is the quadratic step being avoided).
+        #[cfg(test)]
+        if current.len() <= 4096 {
+            assert_eq!(skip, compute_code_skip_mask(&current), "{current:?}");
+        }
+        if let Some(first) = first_line {
+            let last = first + removed_lines;
+            let step: Vec<usize> = (0..text_line_count(&current))
+                .map(|k| {
+                    if k < first {
+                        k
+                    } else if k <= first + added_lines {
+                        first
+                    } else {
+                        last + (k - first - added_lines)
+                    }
+                })
+                .collect();
+            map = compose_line_maps(&step, &map);
+        }
+        from = start + searched.min(repl.len());
+        changed = true;
+    }
+    (current, map, changed)
 }
 
 /// Output buffer that records which input line each chunk of output came
@@ -4390,16 +4552,14 @@ pub fn expand_checked_casts(source: &str) -> String {
 
 /// [`expand_checked_casts`] plus an output-line → input-line table.
 pub fn expand_checked_casts_mapped(source: &str) -> (String, Vec<usize>) {
-    let mut current = source.to_owned();
-    let mut map = identity_line_map(text_line_count(source));
-    let mut changed = false;
-    while let Some(splice) = rewrite_one_checked_cast(&current) {
-        let next = splice.apply(&current);
-        let step = splice.line_map(&current, &next);
-        map = compose_line_maps(&step, &map);
-        current = next;
-        changed = true;
+    // No operator, nothing to lex.
+    if !source.contains("as!") {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
     }
+    let (current, map, changed) = splice_to_fixpoint(source, rewrite_one_checked_cast);
     if changed {
         prepend_typhon_runtime_alias_import_mapped(
             current,
@@ -4429,15 +4589,17 @@ fn compute_code_skip_mask(source: &str) -> Vec<bool> {
         .collect()
 }
 
-/// Find the left-most rewritable `as!` operator in `source` and return the
-/// source with that one cast lowered to `__typhon_checked_cast__(EXPR, TYPE)`,
-/// or `None` when no rewritable `as!` remains. An `as!` whose operands can't
-/// be resolved (e.g. the right side isn't a type expression) is skipped, not
-/// rewritten, so it falls through to the parser as a clean error.
-fn rewrite_one_checked_cast(source: &str) -> Option<Splice> {
+/// Find the left-most rewritable `as!` operator at or after byte `from` and
+/// return the splice lowering that one cast to
+/// `__typhon_checked_cast__(EXPR, TYPE)`, or `None` when no rewritable `as!`
+/// remains. An `as!` whose operands can't be resolved (e.g. the right side
+/// isn't a type expression) is skipped, not rewritten, so it falls through to
+/// the parser as a clean error. `skip` is `source`'s
+/// [`compute_code_skip_mask`].
+fn rewrite_one_checked_cast(source: &str, skip: &[bool], from: usize) -> Option<SpliceStep> {
+    const CALL: &str = "__typhon_checked_cast__(";
     let bytes = source.as_bytes();
-    let skip = compute_code_skip_mask(source);
-    let mut i = 0;
+    let mut i = from;
     while i + 3 < bytes.len() {
         let is_op = !skip[i]
             && &bytes[i..i + 3] == b"as!"
@@ -4445,12 +4607,12 @@ fn rewrite_one_checked_cast(source: &str) -> Option<Splice> {
             && bytes[i - 1].is_ascii_whitespace()
             && bytes[i + 3].is_ascii_whitespace();
         if is_op {
-            let expr_start = find_cast_expr_start(bytes, &skip, i);
+            let expr_start = find_cast_expr_start(bytes, skip, i);
             let mut type_start = i + 3;
             while type_start < bytes.len() && matches!(bytes[type_start], b' ' | b'\t') {
                 type_start += 1;
             }
-            if let Some(mut type_end) = find_cast_type_end(bytes, &skip, type_start) {
+            if let Some(mut type_end) = find_cast_type_end(bytes, skip, type_start) {
                 // `EXPR as! T?` casts to the nullable type. The cast returns a
                 // value, never a `Result`, so a `?` here can only be the
                 // nullable marker — fold it into the target as `T | None`
@@ -4470,18 +4632,31 @@ fn rewrite_one_checked_cast(source: &str) -> Option<Splice> {
                         .trim_end();
                     if !expr_text.is_empty() && !type_text.is_empty() {
                         let mut repl = String::with_capacity(expr_text.len() + 40);
-                        repl.push_str("__typhon_checked_cast__(");
+                        let mut mask = SpliceMask::new(source, skip, repl.capacity());
+                        repl.push_str(CALL);
+                        mask.code(CALL.len());
                         repl.push_str(expr_text);
+                        mask.moved(expr_text);
                         repl.push_str(", ");
+                        mask.code(2);
                         repl.push_str(type_text);
+                        mask.moved(type_text);
                         if nullable {
                             repl.push_str(" | None");
+                            mask.code(7);
                         }
                         repl.push(')');
-                        return Some(Splice {
-                            start: expr_start,
-                            end: type_end,
-                            repl,
+                        mask.code(1);
+                        return Some(SpliceStep {
+                            repl_skip: mask.mask,
+                            splice: Splice {
+                                start: expr_start,
+                                end: type_end,
+                                repl,
+                            },
+                            // Every `as!` left of this one, the operand's
+                            // included, has been looked at.
+                            searched: CALL.len() + expr_text.len(),
                         });
                     }
                 }
@@ -4705,34 +4880,50 @@ pub fn expand_rescue(source: &str) -> String {
 
 /// [`expand_rescue`] plus an output-line → input-line table.
 pub fn expand_rescue_mapped(source: &str) -> (String, Vec<usize>) {
-    let mut current = source.to_owned();
-    let mut map = identity_line_map(text_line_count(source));
-    while let Some(splice) = rewrite_one_rescue(&current) {
-        let next = splice.apply(&current);
-        let step = splice.line_map(&current, &next);
-        map = compose_line_maps(&step, &map);
-        current = next;
+    // No keyword, nothing to lex.
+    if !source.contains("rescue") {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
     }
+    let (current, map, _) = splice_to_fixpoint(source, rewrite_one_rescue);
     (current, map)
 }
 
-/// Find the left-most rewritable postfix `rescue` and lower that one
-/// occurrence, or return `None` when none remains.
-fn rewrite_one_rescue(source: &str) -> Option<Splice> {
+/// How many `rescue` keywords that cannot be lowered are examined on one
+/// physical line before the rest of that line is left to the parser.
+///
+/// Only a statement-tail `rescue` is lowered, so a line holds at most one
+/// that can be; every other one on it (inside the lowered error expression,
+/// or in an inline position) costs a scan back over the line to find that
+/// out. Ten thousand of them on one line took seconds, a hundred thousand
+/// did not finish. A line with this many is a syntax error either way.
+const MAX_REJECTED_RESCUES_PER_LINE: usize = 64;
+
+/// Find the left-most rewritable postfix `rescue` at or after byte `from` and
+/// return the splice lowering that one occurrence, or `None` when none
+/// remains. `skip` is `source`'s [`compute_code_skip_mask`].
+fn rewrite_one_rescue(source: &str, skip: &[bool], from: usize) -> Option<SpliceStep> {
     const KW: &[u8] = b"rescue";
     let bytes = source.as_bytes();
-    let skip = compute_code_skip_mask(source);
-    let mut i = 0;
+    let mut i = from;
+    let mut rejected_on_line = 0usize;
     while i + KW.len() < bytes.len() {
-        let is_op = !skip[i]
+        if bytes[i] == b'\n' {
+            rejected_on_line = 0;
+        }
+        let is_op = rejected_on_line < MAX_REJECTED_RESCUES_PER_LINE
+            && !skip[i]
             && bytes[i..].starts_with(KW)
             && i > 0
             && bytes[i - 1].is_ascii_whitespace()
             && bytes[i + KW.len()].is_ascii_whitespace();
         if is_op {
-            if let Some(out) = try_rewrite_rescue_at(source, bytes, &skip, i) {
+            if let Some(out) = try_rewrite_rescue_at(source, bytes, skip, i) {
                 return Some(out);
             }
+            rejected_on_line += 1;
         }
         i += 1;
     }
@@ -4748,7 +4939,7 @@ fn try_rewrite_rescue_at(
     bytes: &[u8],
     skip: &[bool],
     kw_pos: usize,
-) -> Option<Splice> {
+) -> Option<SpliceStep> {
     // Left operand: reuse the `as!` value-slot scanner (handles brackets,
     // strings, separators, and a leading `return`/`if`/`while`/… keyword).
     let expr_start = find_cast_expr_start(bytes, skip, kw_pos);
@@ -4807,18 +4998,33 @@ fn try_rewrite_rescue_at(
         return None;
     }
 
+    const CALL: &str = "try_result(lambda: ";
     let mut repl = String::with_capacity(expr_text.len() + err_text.len() + 40);
-    repl.push_str("try_result(lambda: ");
+    let mut mask = SpliceMask::new(source, skip, repl.capacity());
+    repl.push_str(CALL);
+    mask.code(CALL.len());
     repl.push_str(expr_text);
+    mask.moved(expr_text);
     repl.push_str(", lambda ");
+    mask.code(9);
     repl.push_str(name);
+    mask.code(name.len());
     repl.push_str(": ");
+    mask.code(2);
     repl.push_str(err_text);
+    mask.moved(err_text);
     repl.push_str(")?");
-    Some(Splice {
-        start: expr_start,
-        end: err_end,
-        repl,
+    mask.code(2);
+    Some(SpliceStep {
+        repl_skip: mask.mask,
+        splice: Splice {
+            start: expr_start,
+            end: err_end,
+            repl,
+        },
+        // Every `rescue` left of this one, the operand's included, has been
+        // looked at; the error expression has not.
+        searched: CALL.len() + expr_text.len(),
     })
 }
 
@@ -7078,6 +7284,10 @@ fn flush_lifted_statement(
     }
 }
 
+/// How many inline `?` propagation operators are lifted out of one line; see
+/// [`rewrite_inline_question_ops_one_line`]. Real code has a handful.
+const MAX_INLINE_QUESTION_OPS_PER_LINE: usize = 256;
+
 /// Lift every inline `)?` on a single line. Returns `None` when the line
 /// contains no inline propagation operator (so the caller can emit it
 /// verbatim and avoid the overhead of building a new buffer). When `Some`,
@@ -7094,8 +7304,21 @@ fn rewrite_inline_question_ops_one_line(
 
     let mut lifted: Vec<String> = Vec::new();
     let mut current = content.to_owned();
+    let mut lifts = 0usize;
 
     while let Some(q_pos) = find_first_inline_propagation_q(&current, ctx) {
+        // Each lift rescans the line, so a line of thousands of `?` was
+        // quadratic here and again in every pass over the statements it
+        // lowers to. Stop, and have the parser reject the line.
+        if lifts == MAX_INLINE_QUESTION_OPS_PER_LINE {
+            // `$` is a token neither Python nor any later pass knows: the
+            // statement is reported as a syntax error at this operator
+            // instead of having the passes below chew through the tail.
+            current.truncate(q_pos);
+            current.push_str(" $");
+            break;
+        }
+        lifts += 1;
         // The operand is a call, a subscript or a dotted name; a
         // parenthesised expression (`(a + b)?`) is skipped so the diagnostic
         // stays crisp instead of emitting an `(a + b).value` that runs but
@@ -10570,6 +10793,159 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The fixpoint the `as!` / `rescue` passes ran before
+    /// `splice_to_fixpoint`: re-lex and rescan the whole buffer per operator.
+    /// Kept as the oracle the incremental driver is compared against.
+    fn reference_fixpoint(
+        source: &str,
+        find: impl Fn(&str, &[bool], usize) -> Option<SpliceStep>,
+    ) -> (String, Vec<usize>) {
+        let mut current = source.to_owned();
+        let mut map = identity_line_map(text_line_count(source));
+        loop {
+            let skip = compute_code_skip_mask(&current);
+            let Some(step) = find(&current, &skip, 0) else {
+                break;
+            };
+            let next = step.splice.apply(&current);
+            let line_step = step.splice.line_map(&current, &next);
+            map = compose_line_maps(&line_step, &map);
+            current = next;
+        }
+        (current, map)
+    }
+
+    /// The incremental driver must produce exactly the text and line table
+    /// the whole-buffer fixpoint did. (`splice_to_fixpoint` additionally
+    /// checks its patched mask against a re-lex under `cfg(test)`.)
+    #[test]
+    fn splice_fixpoint_matches_the_whole_buffer_fixpoint() {
+        let sources = [
+            "x = y as! int\n",
+            "x = y as! int as! str as! bytes\n",
+            "x = f(a as! int, b as! str) as! list[int]\n",
+            "def f(y: object) -> int:\n    return y as! int\n",
+            "let d = client.request(\n    method, url,\n) as! dict[str, int]\n",
+            "x = (a\n    as! int)\ny = b as! str\n",
+            "x = [v as! int for v in vs]\nif raw as! bool:\n    pass\n",
+            "x = \"a as! b\" as! str  # c as! d\ny = z as! int?\n",
+            "x = a as! 5\ny = b as! int\nz = c as!\nw = d as! str\n",
+            "x = (a  # note\n     as! int)\ny = b as! int\n",
+            "s = \"\"\"\nq as! int\n\"\"\"\nx = y as! int | None\n",
+            "x = a as! Foo[b as! int]\n",
+            "for x in data as! list[int]:\n    y = x as! int + 1\n",
+            "x = f\"{a as! int}\" as! str\n",
+            "x = '#' as! str\ny = t as! dict[str, '#']\n",
+            "x = y as! int\r\nz = w as! str\r\n",
+            "x = é as! int; y = ü as! str\n",
+        ];
+        for source in sources {
+            let (text, map, _) = splice_to_fixpoint(source, rewrite_one_checked_cast);
+            let (ref_text, ref_map) = reference_fixpoint(source, rewrite_one_checked_cast);
+            assert_eq!(text, ref_text, "cast text for {source:?}");
+            assert_eq!(map, ref_map, "cast line map for {source:?}");
+        }
+        let sources = [
+            "def f() -> Result[int, str]:\n    x = int(s) rescue e: str(e)\n    return Ok(x)\n",
+            "x = g() rescue e: 'x'\ny = h() rescue err: E(err)  # note\n",
+            "x = g() rescue e: 'a' rescue e: 'b' rescue e: 'c'\n",
+            "x = f(a rescue e: 1, b)\ny = g() rescue e: 2\n",
+            "x = g(\n    1,\n) rescue e: [\n    e,\n]\ny = 2\n",
+            "rescue e: Bad(e):\n    x = g()\ny = h() rescue e: '#'\n",
+            "x = \"rescue e: 1\" rescue e: \"q\"\n",
+            "x = g() rescue e\ny = g() rescue e: 'ok'\n",
+            "return g() rescue e: Err(str(e))\n",
+        ];
+        for source in sources {
+            let (text, map, _) = splice_to_fixpoint(source, rewrite_one_rescue);
+            let (ref_text, ref_map) = reference_fixpoint(source, rewrite_one_rescue);
+            assert_eq!(text, ref_text, "rescue text for {source:?}");
+            assert_eq!(map, ref_map, "rescue line map for {source:?}");
+        }
+    }
+
+    /// 5,000 casts used to re-lex the buffer 5,000 times (6 s in a release
+    /// build). Spread over lines they are now all lowered in one pass over
+    /// the file; chained on one line the pass gives up on the chain, whose
+    /// lowering would nest a call per operator.
+    #[test]
+    fn checked_casts_scale_with_the_file() {
+        let mut lines = String::new();
+        for i in 0..5000 {
+            lines.push_str(&format!("x{i} = y{i} as! int\n"));
+        }
+        let (out, map) = expand_checked_casts_mapped(&lines);
+        assert!(!out.contains("as!"));
+        assert_eq!(out.matches("__typhon_checked_cast__(").count(), 5000);
+        assert!(out.contains("x4999 = __typhon_checked_cast__(y4999, int)\n"));
+        // One injected import line, then the identity.
+        assert_eq!(map.len(), 5001);
+        assert_eq!(map[5000], 4999);
+
+        let short_chain = format!("x = y{}\n", " as! int".repeat(50));
+        let (out, _) = expand_checked_casts_mapped(&short_chain);
+        assert!(!out.contains("as!"));
+        assert_eq!(out.matches("__typhon_checked_cast__(").count(), 50);
+
+        let chain = format!("x = y{}\n", " as! int".repeat(40_000));
+        let (out, _) = expand_checked_casts_mapped(&chain);
+        // Cut off: what is left is rejected by the parser.
+        assert!(out.contains("as!"));
+        // (The lowered part nests a couple of thousand calls: parse it on a
+        // stack the size of the CLI's.)
+        let parsed = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || crate::parse_module(&out).is_ok())
+            .expect("spawn the test worker")
+            .join()
+            .expect("the test worker panicked");
+        assert!(!parsed);
+    }
+
+    /// A statement-tail `rescue` is lowered once per line; the others on the
+    /// line each cost a scan back over it. 100,000 on one line did not
+    /// finish.
+    #[test]
+    fn postfix_rescues_scale_with_the_file() {
+        let mut lines = String::new();
+        for i in 0..3000 {
+            lines.push_str(&format!("x{i} = g{i}() rescue e: 'x'\n"));
+        }
+        let (out, map) = expand_rescue_mapped(&lines);
+        assert_eq!(out.matches("try_result(lambda: ").count(), 3000);
+        assert!(out.contains("x2999 = try_result(lambda: g2999(), lambda e: 'x')?\n"));
+        assert_eq!(map, identity_line_map(3000));
+
+        let one_line = format!("e = g(){}\n", " rescue e: 'x'".repeat(100_000));
+        let (out, _) = expand_rescue_mapped(&one_line);
+        assert_eq!(out.matches("try_result(lambda: ").count(), 1);
+        assert!(out.ends_with(")?\n"));
+    }
+
+    /// Up to `MAX_INLINE_QUESTION_OPS_PER_LINE` inline `?` are lifted as
+    /// before; a line with more becomes a syntax error instead of costing
+    /// quadratic time here and in every pass over what it lowers to (5,000
+    /// took 7 s).
+    #[test]
+    fn inline_question_ops_are_capped_per_line() {
+        let line = |n: usize| format!("def f():\n    x = 1 + g(){}\n", "?".repeat(n));
+        let (few, _) = expand_inline_question_ops_mapped(&line(3));
+        assert_eq!(few.matches("__typhon_Err__):").count(), 3);
+        assert!(!few.contains('$'));
+        let (at_cap, _) =
+            expand_inline_question_ops_mapped(&line(MAX_INLINE_QUESTION_OPS_PER_LINE));
+        assert!(!at_cap.contains('$'));
+        let (many, _) = expand_inline_question_ops_mapped(&line(50_000));
+        assert_eq!(
+            many.matches("__typhon_Err__):").count(),
+            MAX_INLINE_QUESTION_OPS_PER_LINE
+        );
+        assert!(many.contains(" $"));
+        assert!(!many.contains("??"), "the tail is dropped, not passed on");
+        let lowered = expand_question_ops(&many);
+        assert!(crate::parse_module(&preprocess(&lowered).python_source).is_err());
+    }
 
     #[test]
     fn optional_rewrite_leaves_question_marks_inside_nested_fstrings() {

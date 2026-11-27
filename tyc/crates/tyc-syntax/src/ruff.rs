@@ -48,7 +48,8 @@ const CPYTHON_MAX_BRACKET_DEPTH: usize = 200;
 /// otherwise `tyc check` and `tyc run` accepted a program `tyc build` turned
 /// into a `.py` that does not compile.
 pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
-    let parsed = ruff_python_parser::parse_module(source)?;
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|error| clamp_error_column(source, error))?;
     if source_nests_past_cpython_limit(source) {
         if let Some(at) = emitted_bracket_past_cpython_limit(parsed.syntax()) {
             return Err(ParseError {
@@ -279,6 +280,36 @@ impl<'a> Visitor<'a> for NestingProbe {
     }
 }
 
+/// The furthest into a line a syntax error is reported.
+const MAX_REPORTED_COLUMN: usize = 50_000;
+
+/// Move a syntax error that sits more than [`MAX_REPORTED_COLUMN`] bytes into
+/// its line back to that column.
+///
+/// The parser stops at its nesting limit (`MAX_NESTING_DEPTH`) partway
+/// through a machine-generated megabyte line, and other errors on such lines
+/// land just as far out. The diagnostic renderer formats the column as a
+/// padding width and panics once it passes `u16::MAX`, so the clean error the
+/// limit exists to produce became a crash. Nobody reads a column that far
+/// out; the line and the message are what matter.
+fn clamp_error_column(source: &str, mut error: ParseError) -> ParseError {
+    let offset = error.location.start().to_usize().min(source.len());
+    let line_start = source.as_bytes()[..offset]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |newline| newline + 1);
+    if offset - line_start > MAX_REPORTED_COLUMN {
+        let mut at = line_start + MAX_REPORTED_COLUMN;
+        while !source.is_char_boundary(at) {
+            at -= 1;
+        }
+        if let Ok(at) = TextSize::try_from(at) {
+            error.location = TextRange::empty(at);
+        }
+    }
+    error
+}
+
 /// Parse a single expression — used by the type checker to resolve quoted
 /// forward-reference annotations (`"Node"`, `"Tree[T]"`, `"list[Node]"`)
 /// whose content escaped the surface-sugar preprocessor.
@@ -342,6 +373,162 @@ mod tests {
             "[".repeat(300)
         );
         assert!(parse_module(&flat).is_ok());
+    }
+
+    /// The recursive-descent parser has a deep debug-build frame; give the
+    /// nesting tests the room the CLI's 256 MiB release stack gives it.
+    fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(4 << 30)
+                .spawn_scoped(scope, f)
+                .expect("spawn the test worker")
+                .join()
+                .expect("the test worker panicked")
+        })
+    }
+
+    fn nesting_error(source: &str) -> String {
+        match parse_module(source) {
+            Ok(_) => panic!("expected a nesting error for {:.60?}…", source),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Every shape that nests through the parser's recursion: 300,000 of
+    /// them overflowed the 256 MiB stack and aborted `tyc check`, `tyc fmt`
+    /// and the language server.
+    #[test]
+    fn recursive_nesting_past_the_limit_is_a_syntax_error() {
+        let n = 300_000;
+        let shapes = [
+            format!("x: int = {}1{}\n", "(".repeat(n), ")".repeat(n)),
+            format!("x: int = {}1\n", "-".repeat(n)),
+            format!("x: bool = {}True\n", "not ".repeat(n)),
+            format!("x = {}{}\n", "[".repeat(n), "]".repeat(n)),
+            format!("x = {}{}\n", "{".repeat(n), "}".repeat(n)),
+            format!("x = {}1\n", "lambda: ".repeat(n)),
+            format!("x = {}2\n", "1 if a else ".repeat(n)),
+            format!("x = 1{}\n", " ** 1".repeat(n)),
+            format!("x = {}y{}\n", "f(".repeat(n), ")".repeat(n)),
+            format!("x = {}[]{}\n", "[0 for _ in ".repeat(n), "]".repeat(n)),
+            format!("async def f():\n    return {}f()\n", "(await ".repeat(n)),
+            format!(
+                "match v:\n    case {}{}:\n        pass\n",
+                "[".repeat(n),
+                "]".repeat(n)
+            ),
+        ];
+        on_big_stack(|| {
+            for source in &shapes {
+                let message = nesting_error(source);
+                assert!(message.contains("too deeply nested"), "{message}");
+            }
+        });
+    }
+
+    /// Chains the parser builds in a loop — so without recursing — into a
+    /// tree as deep as the chain is long. A million terms parsed fine and
+    /// then overflowed the stack in the first recursive walk over the result
+    /// (the resolver, the checker, the printer, or just `Drop`).
+    #[test]
+    fn iterative_chains_past_the_limit_are_a_syntax_error() {
+        let n = 400_000;
+        let shapes = [
+            format!("x: int = a{}\n", " + 1".repeat(n)),
+            format!("x = a{}\n", ".b".repeat(n)),
+            format!("x = f{}\n", "()".repeat(n)),
+            format!("x = a{}\n", "[0]".repeat(n)),
+            format!("x = a{}\n", " | None".repeat(n)),
+            format!("match v:\n    case a{}:\n        pass\n", ".b".repeat(n)),
+        ];
+        // Deliberately on the default test stack: nothing here may recurse
+        // more than the limit allows, the drop of the rejected tree included.
+        for source in &shapes {
+            let message = nesting_error(source);
+            assert!(message.contains("too deeply nested"), "{message}");
+        }
+    }
+
+    /// The limit counts levels, not operators: a chain made of chains only
+    /// as deep as the limit allows is rejected too (the height of a finished
+    /// operand carries over to the chain it becomes part of), while wide but
+    /// shallow code of the same size is not.
+    #[test]
+    fn nesting_limit_measures_depth_not_size() {
+        let limit = ruff_python_parser::MAX_NESTING_DEPTH as usize;
+        // Three chains of 0.4 × limit each, nested in one another's left
+        // operand: no single loop reaches the limit, the tree does.
+        let third = " + 1".repeat(limit * 4 / 10);
+        let stacked = format!("x = ((a{third}){third}){third}\n");
+        assert!(nesting_error(&stacked).contains("too deeply nested"));
+        // The same three chains side by side are three shallow trees.
+        let wide = format!("x = [a{third}, a{third}, a{third}]\n");
+        assert!(parse_module(&wide).is_ok());
+        let flat = format!("x = [{}]\n", "(a + 1).b(c)[0], ".repeat(limit * 3));
+        assert!(parse_module(&flat).is_ok());
+        let statements = "x = a + 1\n".repeat(limit * 3);
+        assert!(parse_module(&statements).is_ok());
+    }
+
+    /// What the corpus and CPython both accept stays accepted: 3,000 grouping
+    /// parentheses (`stress/…/c1_parens.ty`), a 5,000-link attribute chain
+    /// (`c27_attr_chain.ty`), and operator chains just short of the limit —
+    /// CPython 3.13 compiles 8,000 terms and gives up at 10,000.
+    #[test]
+    fn nesting_below_the_limit_still_parses() {
+        let limit = ruff_python_parser::MAX_NESTING_DEPTH as usize;
+        let shapes = [
+            format!("x: int = {}1{}\n", "(".repeat(3000), ")".repeat(3000)),
+            format!("x = a{}\n", ".x".repeat(5000)),
+            format!("x = a{}\n", " + 1".repeat(limit - 10)),
+            format!("x = {}1\n", "-".repeat(limit - 10)),
+            format!("x = f{}\n", "()".repeat(limit - 10)),
+            format!("x = {}1\n", "lambda: ".repeat(limit - 10)),
+            format!("t = {}\n", vec!["\"v\""; 3000].join(" | ")),
+        ];
+        on_big_stack(|| {
+            for source in &shapes {
+                if let Err(err) = parse_module(source) {
+                    panic!("{:.40?}… should parse: {err}", source);
+                }
+            }
+        });
+    }
+
+    /// Nested f-strings have their own limit: parse time is quadratic in the
+    /// depth (70,000 took 52 s), and CPython stops at 150.
+    #[test]
+    fn nested_f_strings_have_their_own_limit() {
+        let nest = |d: usize| format!("x = {}1{}\n", "f\"{".repeat(d), "}\"".repeat(d));
+        let limit = ruff_python_parser::MAX_INTERPOLATED_STRING_DEPTH as usize;
+        on_big_stack(|| {
+            assert!(parse_module(&nest(20)).is_ok());
+            assert!(parse_module(&nest(limit)).is_ok());
+            let message = nesting_error(&nest(limit + 1));
+            assert!(message.contains("too many nested f-strings"), "{message}");
+            let message = nesting_error(&nest(100_000));
+            assert!(message.contains("too many nested f-strings"), "{message}");
+        });
+    }
+
+    /// The renderer panics on a column past `u16::MAX`; an error that far
+    /// into a line is reported at a column it can print.
+    #[test]
+    fn far_column_errors_are_clamped() {
+        let far = format!("x = [{})\n", "1, ".repeat(40_000));
+        let err = parse_module(&far).expect_err("mismatched bracket");
+        assert_eq!(err.location.start().to_usize(), MAX_REPORTED_COLUMN);
+        // Counted from the start of the error's own line, and only when far.
+        let second_line = format!("y = 1\nx = [{})\n", "1, ".repeat(40_000));
+        let err = parse_module(&second_line).expect_err("mismatched bracket");
+        assert_eq!(err.location.start().to_usize(), 6 + MAX_REPORTED_COLUMN);
+        let near = "x = [1, 2)\n";
+        let err = parse_module(near).expect_err("mismatched bracket");
+        assert_eq!(err.location.start().to_usize(), 9);
+        let deep = format!("x = {}1\n", "lambda: ".repeat(300_000));
+        let err = on_big_stack(|| parse_module(&deep).expect_err("too deep"));
+        assert!(err.location.start().to_usize() <= MAX_REPORTED_COLUMN);
     }
 
     #[test]

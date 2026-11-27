@@ -3789,6 +3789,75 @@ fn read_view_head_accepts(abc: &str, container: &str) -> bool {
 /// crash the process.
 const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 
+/// Size bound on the type of one expression: more nodes than this, or nesting
+/// deeper than [`MAX_EXPR_TYPE_DEPTH`], and the expression is typed `Unknown`.
+///
+/// `Type` is a by-value tree, so `x1 = (x0, x0)`, `x2 = (x1, x1)`, … doubles
+/// the type of each binding: twenty lines built a million-node type, every
+/// later use deep-copied it, and `tyc check` ran out of memory a few lines
+/// further on. `Unknown` is the permissive answer (see
+/// [`INFER_EXPR_MAX_DEPTH`]): it cannot reject a correct program, it only
+/// stops the checker reasoning about a type nobody could have written down.
+/// The largest type in the example and stress corpora is a 2,700-member
+/// literal union; hand-written types are a few dozen nodes.
+const MAX_EXPR_TYPE_NODES: usize = 100_000;
+
+/// See [`MAX_EXPR_TYPE_NODES`]. A type this deep can only come from a chain
+/// of bindings each wrapping the previous one (`x1 = (x0,)`, `x2 = (x1,)`,
+/// …); left alone it grows by a level per line until the recursive walks
+/// over it — `clone`, `==`, `drop` included — overflow the stack.
+const MAX_EXPR_TYPE_DEPTH: usize = 1_000;
+
+/// Whether `ty` is past [`MAX_EXPR_TYPE_NODES`] / [`MAX_EXPR_TYPE_DEPTH`].
+/// Stops counting as soon as either bound is crossed, so the cost is bounded
+/// however large the type is.
+fn expr_type_too_large(ty: &Type) -> bool {
+    fn over(ty: &Type, nodes: &mut usize, depth: usize) -> bool {
+        if *nodes == 0 || depth > MAX_EXPR_TYPE_DEPTH {
+            return true;
+        }
+        *nodes -= 1;
+        match ty {
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|p| over(p, nodes, depth + 1)) || over(ret, nodes, depth + 1)
+            }
+            Type::Generic(_, args) | Type::Union(args) => {
+                args.iter().any(|a| over(a, nodes, depth + 1))
+            }
+            _ => false,
+        }
+    }
+    // Leaves and the everyday one-level containers need no walk at all.
+    match ty {
+        Type::Function { .. } | Type::Generic(..) | Type::Union(_) => {
+            over(ty, &mut { MAX_EXPR_TYPE_NODES }, 0)
+        }
+        _ => false,
+    }
+}
+
+/// How many lambdas deep (`lambda: lambda: lambda: …`) lambda *bodies* are
+/// still checked. Past it a lambda keeps its structural type and its body is
+/// left alone.
+///
+/// Each lambda body is checked in its own scope under a snapshot of the
+/// environment, and both grow with the nesting, so memory was quadratic in
+/// it: 1.7 GB for 100,000 nested lambdas. CPython's own parser gives up
+/// below 3,000.
+const MAX_CHECKED_LAMBDA_NESTING: u32 = 256;
+
+/// Attribute chains (`a.b.c.d…`) with more links than this are folded with a
+/// running `infer_expr_readonly` type for the receiver.
+///
+/// Several per-attribute checks (the deprecated-property lookup, the
+/// nullable-receiver check) ask `infer_expr_readonly` for the receiver's
+/// type, and that function walks the whole chain below it: quadratic in the
+/// chain's length, 10 s for 20,000 links. While a chain longer than this is
+/// folded, the type of each link's receiver is computed once from the
+/// previous link's and handed to those lookups. Shorter chains — every chain
+/// a person writes — take the unchanged path.
+const READONLY_HINT_MIN_CHAIN: usize = 64;
+
 /// Recursion bound for [`Checker::is_assignable`].
 ///
 /// Sized so that no real program reaches it: the deepest nesting in the
@@ -3809,6 +3878,16 @@ struct Checker<'a> {
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
     module: Option<&'a ModModule>,
+    /// Lazily built index of the module's `class` statements; see
+    /// `class_contracts::class_defs`.
+    class_defs: std::cell::OnceCell<Vec<&'a ruff_python_ast::StmtClassDef>>,
+    /// `(address of an expression, its `infer_expr_readonly` type)`, set while
+    /// a long attribute chain is folded; see [`READONLY_HINT_MIN_CHAIN`]. The
+    /// address is only ever compared, never dereferenced.
+    readonly_hint: Option<(usize, Type)>,
+    /// How many lambda bodies are being checked right now; see
+    /// [`MAX_CHECKED_LAMBDA_NESTING`].
+    lambda_depth: u32,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -4428,6 +4507,9 @@ impl<'a> Checker<'a> {
     fn new(path: String, source: &'a str, resolved: &'a ResolvedModule) -> Self {
         Self {
             module: None,
+            class_defs: std::cell::OnceCell::new(),
+            readonly_hint: None,
+            lambda_depth: 0,
             path,
             source,
             resolved,
@@ -12935,6 +13017,11 @@ fn expression_attr_narrowing(c: &Checker, expr: &Expr) -> Option<Type> {
 }
 
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
+    if let Some((address, ty)) = &c.readonly_hint {
+        if *address == std::ptr::from_ref(e) as usize {
+            return ty.clone();
+        }
+    }
     match e {
         Expr::Name(n) => c
             .env
@@ -17255,7 +17342,7 @@ fn run_definite_assignment_pass(
         state.assign(p);
     }
     for name in tracked.keys().chain(locals.iter()) {
-        state.unassigned.insert(name.clone());
+        state.mark_unassigned(name);
     }
     let ctx = DaCtx { tracked, locals };
     da_walk_stmts(c, body, &ctx, &mut state);
@@ -17273,17 +17360,23 @@ struct DaCtx {
 }
 
 #[derive(Clone, Debug)]
+///
+/// The three tables are shared copy-on-write: every `if` / `match` arm
+/// starts from a clone of the state before it, and most arms (a `return`,
+/// the lowered form of `?`) never write to it. Deep-copying every name for
+/// every arm made a function with *n* branches and *n* locals quadratic —
+/// `x = g()?????…` with 5,000 `?` took 7 s.
 struct DaState {
     /// Names that have been assigned on every path reaching the
     /// current point.
-    assigned: std::collections::HashSet<String>,
+    assigned: Rc<std::collections::HashSet<String>>,
     /// Names that have been assigned on *no* path reaching the current
     /// point — never bound yet, or unbound again by `del` / the end of an
     /// `except ... as` handler on every path.
-    unassigned: std::collections::HashSet<String>,
+    unassigned: Rc<std::collections::HashSet<String>>,
     /// Why a name in `unassigned` is unbound, when it is more specific
     /// than "not assigned yet".
-    unbound_reason: HashMap<String, &'static str>,
+    unbound_reason: Rc<HashMap<String, &'static str>>,
     /// True when control flow definitely cannot fall through (a
     /// `return` / `raise` / unconditional terminator has been seen).
     /// A diverging branch is ignored by the intersection step.
@@ -17293,24 +17386,41 @@ struct DaState {
 impl DaState {
     fn new() -> Self {
         Self {
-            assigned: std::collections::HashSet::new(),
-            unassigned: std::collections::HashSet::new(),
-            unbound_reason: HashMap::new(),
+            assigned: Rc::default(),
+            unassigned: Rc::default(),
+            unbound_reason: Rc::default(),
             diverges: false,
         }
     }
+    // Each write is guarded by a read, so a no-op never un-shares a table.
     fn assign(&mut self, name: &str) {
-        self.assigned.insert(name.to_owned());
-        self.unassigned.remove(name);
-        self.unbound_reason.remove(name);
+        if !self.assigned.contains(name) {
+            Rc::make_mut(&mut self.assigned).insert(name.to_owned());
+        }
+        if self.unassigned.contains(name) {
+            Rc::make_mut(&mut self.unassigned).remove(name);
+        }
+        if self.unbound_reason.contains_key(name) {
+            Rc::make_mut(&mut self.unbound_reason).remove(name);
+        }
+    }
+    /// Record `name` as definitely unassigned, with no particular reason.
+    fn mark_unassigned(&mut self, name: &str) {
+        if !self.unassigned.contains(name) {
+            Rc::make_mut(&mut self.unassigned).insert(name.to_owned());
+        }
     }
     /// `del NAME` unbinds the name: a later read on a path where it was
     /// deleted is a `NameError` / `UnboundLocalError`, so it is no longer
     /// definitely-assigned — and is definitely *un*assigned on this path.
     fn unassign(&mut self, name: &str, reason: &'static str) {
-        self.assigned.remove(name);
-        self.unassigned.insert(name.to_owned());
-        self.unbound_reason.insert(name.to_owned(), reason);
+        if self.assigned.contains(name) {
+            Rc::make_mut(&mut self.assigned).remove(name);
+        }
+        self.mark_unassigned(name);
+        if self.unbound_reason.get(name) != Some(&reason) {
+            Rc::make_mut(&mut self.unbound_reason).insert(name.to_owned(), reason);
+        }
     }
 }
 
@@ -17626,7 +17736,7 @@ fn da_while_true_prefix_assignments(body: &[Stmt]) -> Vec<String> {
                 for t in &a.targets {
                     let mut probe = DaState::new();
                     da_collect_assign_targets(t, &mut probe);
-                    out.extend(probe.assigned);
+                    out.extend(probe.assigned.iter().cloned());
                 }
             }
             Stmt::AnnAssign(a) if a.value.is_some() => {
@@ -17650,12 +17760,24 @@ fn da_while_true_prefix_assignments(body: &[Stmt]) -> Vec<String> {
 /// knowledge — a name the body may have bound is no longer certainly
 /// unbound.
 fn da_join_loop_exit(state: &mut DaState, body_state: &DaState) {
-    state
+    if state
         .unassigned
-        .retain(|name| body_state.unassigned.contains(name));
-    state
-        .unbound_reason
-        .retain(|name, _| state.unassigned.contains(name));
+        .iter()
+        .any(|name| !body_state.unassigned.contains(name))
+    {
+        Rc::make_mut(&mut state.unassigned).retain(|name| body_state.unassigned.contains(name));
+    }
+    da_drop_stale_reasons(&mut state.unbound_reason, &state.unassigned);
+}
+
+/// Keep only the reasons for names that are still definitely unassigned.
+fn da_drop_stale_reasons(
+    reasons: &mut Rc<HashMap<String, &'static str>>,
+    unassigned: &std::collections::HashSet<String>,
+) {
+    if reasons.keys().any(|name| !unassigned.contains(name)) {
+        Rc::make_mut(reasons).retain(|name, _| unassigned.contains(name));
+    }
 }
 
 fn da_walk_stmt(c: &mut Checker, stmt: &Stmt, ctx: &DaCtx, state: &mut DaState) {
@@ -18415,25 +18537,43 @@ fn intersect_branches(pre: &DaState, branches: &[DaState]) -> DaState {
     let non_diverging: Vec<&DaState> = branches.iter().filter(|b| !b.diverges).collect();
     if non_diverging.is_empty() {
         return DaState {
-            assigned: pre.assigned.clone(),
-            unassigned: pre.unassigned.clone(),
-            unbound_reason: pre.unbound_reason.clone(),
+            assigned: Rc::clone(&pre.assigned),
+            unassigned: Rc::clone(&pre.unassigned),
+            unbound_reason: Rc::clone(&pre.unbound_reason),
             diverges: true,
         };
     }
     // Definitely assigned / definitely unassigned only when so on every
     // non-diverging arm; a name in neither set is "possibly" bound.
-    let mut assigned: std::collections::HashSet<String> = non_diverging[0].assigned.clone();
-    let mut unassigned: std::collections::HashSet<String> = non_diverging[0].unassigned.clone();
-    let mut reasons: HashMap<String, &'static str> = non_diverging[0].unbound_reason.clone();
+    //
+    // Arms that never wrote still share their tables with `pre` (and so with
+    // each other): pointer-equal tables are equal, and every step below
+    // leaves a table alone unless it would actually change it.
+    let mut assigned = Rc::clone(&non_diverging[0].assigned);
+    let mut unassigned = Rc::clone(&non_diverging[0].unassigned);
+    let mut reasons = Rc::clone(&non_diverging[0].unbound_reason);
     for branch in &non_diverging[1..] {
-        assigned.retain(|name| branch.assigned.contains(name));
-        unassigned.retain(|name| branch.unassigned.contains(name));
-        for (name, reason) in &branch.unbound_reason {
-            reasons.entry(name.clone()).or_insert(reason);
+        if !Rc::ptr_eq(&assigned, &branch.assigned)
+            && assigned.iter().any(|name| !branch.assigned.contains(name))
+        {
+            Rc::make_mut(&mut assigned).retain(|name| branch.assigned.contains(name));
+        }
+        if !Rc::ptr_eq(&unassigned, &branch.unassigned)
+            && unassigned
+                .iter()
+                .any(|name| !branch.unassigned.contains(name))
+        {
+            Rc::make_mut(&mut unassigned).retain(|name| branch.unassigned.contains(name));
+        }
+        if !Rc::ptr_eq(&reasons, &branch.unbound_reason) {
+            for (name, reason) in branch.unbound_reason.iter() {
+                if !reasons.contains_key(name) {
+                    Rc::make_mut(&mut reasons).insert(name.clone(), reason);
+                }
+            }
         }
     }
-    reasons.retain(|name, _| unassigned.contains(name));
+    da_drop_stale_reasons(&mut reasons, &unassigned);
     DaState {
         assigned,
         unassigned,
@@ -21486,13 +21626,18 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         // A lambda body runs later, when captured names may have been
         // reassigned; check it without their narrowings, and let nothing it
         // does leak into the enclosing flow.
+        Expr::Lambda(lam) if c.lambda_depth >= MAX_CHECKED_LAMBDA_NESTING => {
+            lambda_structural_type(lam)
+        }
         Expr::Lambda(lam) => {
             let snap = c.env.snapshot();
             widen_captured_names(c, lam.range.start().to_usize());
             // A `yield` in a lambda body makes the *lambda* a generator; it
             // does not yield from the enclosing function.
             let saved_in_generator = std::mem::replace(&mut c.in_generator, false);
+            c.lambda_depth += 1;
             let r = infer_expr_ctx_inner(c, expr, expected);
+            c.lambda_depth -= 1;
             c.in_generator = saved_in_generator;
             c.env.restore(snap);
             r
@@ -21508,7 +21653,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 leaf = &attr.value;
             }
             let mut receiver = infer_expr_ctx(c, leaf, None);
+            let long_chain = chain.len() > READONLY_HINT_MIN_CHAIN;
+            let outer_hint = c.readonly_hint.take();
+            let mut link_receiver = leaf;
             for node in chain.into_iter().rev() {
+                if long_chain {
+                    // Uses the hint left by the previous link, so this is one
+                    // step, not a walk down the chain.
+                    let readonly = infer_expr_readonly(c, link_receiver);
+                    c.readonly_hint = Some((std::ptr::from_ref(link_receiver) as usize, readonly));
+                }
+                link_receiver = node;
                 c.attribute_receiver_type = Some(receiver);
                 receiver = infer_expr_ctx_inner(
                     c,
@@ -21528,9 +21683,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     receiver.clone(),
                 );
             }
+            c.readonly_hint = outer_hint;
             receiver
         }
         _ => infer_expr_ctx_inner(c, expr, expected),
+    };
+    let result = if expr_type_too_large(&result) {
+        Type::Unknown
+    } else {
+        result
     };
     after_expr_effects(c, expr);
     c.infer_depth.set(depth);
@@ -22758,7 +22919,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
             if let Expr::Attribute(attr) = call.func.as_ref() {
-                let recv = infer_expr(c, &attr.value);
+                // Inferring the callee just above inferred its receiver and
+                // recorded the type. Inferring it again here doubled the work
+                // at every link of a method chain (`a.f().f().f()…` took
+                // 2^n).
+                let recorded = c
+                    .expression_types
+                    .get(&(
+                        attr.value.range().start().to_usize(),
+                        attr.value.range().end().to_usize(),
+                    ))
+                    .cloned();
+                let recv = match recorded {
+                    Some(recv) => recv,
+                    None => infer_expr(c, &attr.value),
+                };
                 if recv.is_nullable() {
                     check_nullable_receiver(c, &attr.value, &recv);
                 }
@@ -44174,5 +44349,7 @@ def main() -> None:
     }
 }
 
+#[cfg(test)]
+mod dos_tests;
 #[cfg(test)]
 mod flow_tests;

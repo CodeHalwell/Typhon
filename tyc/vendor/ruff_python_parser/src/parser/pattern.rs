@@ -141,6 +141,22 @@ impl Parser<'_> {
     ///
     /// See: <https://docs.python.org/3/reference/compound_stmts.html#grammar-token-python-grammar-closed_pattern>
     fn parse_match_pattern_lhs(&mut self, allow_star_pattern: AllowStarPattern) -> Pattern {
+        // Typhon: every pattern nesting cycle passes through here; see
+        // `MAX_NESTING_DEPTH`.
+        if !self.enter_nesting() {
+            let range = self.missing_node_range();
+            return Pattern::MatchValue(ast::PatternMatchValue {
+                value: Box::new(Expr::Name(self.parse_missing_name())),
+                range,
+                node_index: AtomicNodeIndex::NONE,
+            });
+        }
+        let pattern = self.parse_match_pattern_lhs_impl(allow_star_pattern);
+        self.leave_nesting();
+        pattern
+    }
+
+    fn parse_match_pattern_lhs_impl(&mut self, allow_star_pattern: AllowStarPattern) -> Pattern {
         let start = self.node_start();
 
         let mut lhs = match self.current_token_kind() {
@@ -616,8 +632,13 @@ impl Parser<'_> {
 
     /// Parses an attribute expression until the current token is not a `.`.
     fn parse_attr_expr_for_match_pattern(&mut self, mut lhs: Expr, start: TextSize) -> Expr {
+        // Typhon: an iteratively built left-deep chain; count its levels
+        // against `MAX_NESTING_DEPTH`.
+        let mut height = 0u32;
         while self.current_token_kind() == TokenKind::Dot {
             lhs = Expr::Attribute(self.parse_attribute_expression(lhs, start));
+            height = height.saturating_add(1);
+            self.note_chain_height(height);
         }
 
         lhs
