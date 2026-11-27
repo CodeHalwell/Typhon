@@ -2,7 +2,7 @@
   "name": "typhon",
   "displayName": "Typhon",
   "description": "Language support for Typhon — a statically-typed superset of Python.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "typhon-lang",
   "license": "MIT",
   "repository": {
@@ -25,6 +25,12 @@
   "activationEvents": [
     "onLanguage:typhon"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Typhon launches the `tyc` language server, which reads the workspace's `typhon.toml` and runs project tooling (for example the project virtual environment's Python interpreter) on its behalf. Trust the workspace to enable it."
+    }
+  },
   "contributes": {
     "languages": [
       {
@@ -66,7 +72,7 @@
           "type": "string",
           "default": "tyc",
           "scope": "machine",
-          "description": "Path to the `tyc` binary. Use an absolute path if `tyc` is not on PATH. Machine-scoped: only user or remote settings can set it. A workspace or folder `.vscode/settings.json` cannot, so opening a cloned repository never redirects the extension at an executable that repository ships."
+          "description": "Path to the `tyc` binary: a bare command name looked up on PATH, or an absolute path. A relative path is rejected. Machine-scoped: only user or remote settings can set it. A workspace or folder `.vscode/settings.json` cannot, so opening a cloned repository never redirects the extension at an executable that repository ships."
         },
         "typhon.server.arguments": {
           "type": "array",

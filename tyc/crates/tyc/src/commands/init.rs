@@ -250,7 +250,7 @@ suggest-gather = true           # advice when independent awaits could run concu
 # (off at 0, on at 1 or under `tyc build -O`); setting one here overrides both.
 require-with = "warn"           # "error" / "off" — open()/socket()/connect() outside `with` is a leak
 blocking-in-async = "warn"      # "error" / "off" — time.sleep / requests.get inside async def
-allow-secret-comptime = false   # silence `tyc::contains_secret_literal` warnings
+allow-secret-comptime = false   # true: silence `tyc::contains_secret_literal` and let comptime env() read credential-named variables
 
 # Run `tyc migrate path/to/foo.py` to convert typed Python to Typhon.
 "#,

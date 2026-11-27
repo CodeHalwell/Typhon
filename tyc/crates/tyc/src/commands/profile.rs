@@ -551,9 +551,17 @@ fn instrument_module(source: &str) -> String {
     // Walk the remaining lines and prepend a decorator before every
     // top-level `def` / `async def`.  Top-level is detected by zero
     // indentation; this matches CPython's notion of module-level functions.
+    //
+    // A line that begins inside a triple-quoted string is text, not code:
+    // without the lexical state below, a `def ` at column 0 of a string
+    // constant had the decorator spliced into the program's data.
+    let mut in_string = None;
     for line in lines {
+        let starts_in_string = in_string.is_some();
+        tyc_syntax::lexmask::scan_line_kinds(line.trim_end_matches(['\n', '\r']), &mut in_string);
         let trimmed_start = line.trim_start();
-        if line.len() - trimmed_start.len() == 0
+        if !starts_in_string
+            && line.len() - trimmed_start.len() == 0
             && (trimmed_start.starts_with("def ") || trimmed_start.starts_with("async def "))
         {
             out.push_str("@__typhon_profile_record\n");
@@ -627,6 +635,18 @@ mod tests {
     /// Instrumentation rewrites files in place, so it must not follow a
     /// symlink out of the build directory — neither a linked directory of
     /// `.py` files nor a link sitting where the helper module is written.
+    #[test]
+    fn instrument_leaves_string_constants_alone() {
+        let src = "TEMPLATE = \"\"\"\ndef handler(event):\n    pass\n\"\"\"\n\ndef real():\n    return 1\n";
+        let out = instrument_module(src);
+        assert_eq!(out.matches("@__typhon_profile_record").count(), 1, "{out}");
+        assert!(out.contains("\"\"\"\ndef handler(event):"), "{out}");
+        assert!(
+            out.contains("@__typhon_profile_record\ndef real():"),
+            "{out}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn instrument_does_not_write_through_symlinks() {

@@ -69,6 +69,10 @@ deliberate exceptions. These are the ones made since v1.0.0-alpha.2:
 | beta.1 | `unsafe:` containment follows values derived from an unsafe binding (`data["name"]`, `data.count + 1`), not only the bare name. | `value as! T` at the boundary |
 | beta.1 | Exhaustiveness covers `Result` payloads, `T?`, `bool`, literal unions and nested sealed unions; a match that omits a value that never occurs at runtime is now reported. | `case _:`, `[strictness] exhaustive-match` |
 | beta.1 | `del NAME` and `except … as NAME` cannot end a `let`. | declare the binding `mut`, or rename the handler variable |
+| security review (2026-11) | `comptime env("NAME")` refuses a variable whose name marks it as a credential. A project that inlined one at build time must now say so. | list the name under `[env] allow` (or `required`), or `[strictness] allow-secret-comptime = true` |
+| security review (2026-11) | A hand-written `model_config` that does not mention `extra` gets the project's `[emit] model-extra` (default `"forbid"`) merged in, like a model with no config. It used to fall back to pydantic's `"ignore"`. | write `extra="ignore"` in the config |
+| security review (2026-11) | A user name starting with `__typhon_` is `tyc::reserved_name`. | rename it |
+| security review (2026-11) | `[python] target` must be a plain version (`3.13`, `3.14t`, `3.15rc1`); `src` may not be a symlink out of the project. | — |
 
 The VM has changed behaviour too, always towards CPython: arbitrary-precision
 integers (v0.8.0), CPython value semantics for dataclasses, sets and floats

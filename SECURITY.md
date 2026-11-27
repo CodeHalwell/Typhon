@@ -34,9 +34,13 @@ i.e. as code you are about to run:
   privileges, exactly like running `python` yourself.
 - **`comptime` evaluates expressions at build time** and can read environment
   variables via `env(...)`, inlining the resolved values into the build
-  artifact. Do not place secrets in `comptime let`; read them at runtime via
-  `os.environ[...]`. The `tyc::contains_secret_literal` lint is a best-effort
-  name heuristic, not a guarantee.
+  artifact. A variable whose name marks it as a credential (`GITHUB_TOKEN`,
+  `AWS_SECRET_ACCESS_KEY`, …) is refused unless the project's `typhon.toml`
+  lists it under `[env] allow` / `[env] required`, so a cloned project cannot
+  inline your credentials without saying so in a file you can read. That
+  check is a name heuristic, not a guarantee: any other variable (`HOME`,
+  `USER`, an oddly named secret) is still readable. Do not place secrets in
+  `comptime let`; read them at runtime via `os.environ[...]`.
 
 None of this is unusual for a language toolchain (it mirrors `pip install` and
 running the code), but it is worth stating plainly: **opening or building an

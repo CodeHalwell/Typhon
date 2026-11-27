@@ -440,6 +440,16 @@ fn run_vm(args: RunArgs) -> Result<()> {
     if let Some((major, minor)) = vm_python_target(&entry) {
         tyc_vm::set_python_target(major, minor);
     }
+    // The VM inlines `comptime` values itself; give it the project's
+    // `[env] allow` list (the default refuses credential-named variables).
+    if let Some((_, cfg)) = entry
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .and_then(|dir| TyphonConfig::load(&dir).ok().flatten())
+    {
+        crate::commands::util::apply_comptime_env_policy(&cfg);
+    }
     if !args.no_fallback {
         let mut missing = unmodelled_references(&args.path, &entry);
         // PEP 810's global mode changes *when* every import runs; the VM

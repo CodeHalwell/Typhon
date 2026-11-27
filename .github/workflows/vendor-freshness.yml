@@ -1,0 +1,109 @@
+name: Vendor freshness
+
+# The parser is a vendored fork of Ruff (`tyc/vendor/`, pinned by the commit
+# in `tyc/vendor/UPSTREAM`). Dependabot cannot see vendored source, and
+# `cargo-deny` only audits crates.io packages, so nothing else in CI notices
+# when upstream fixes a parser bug or a security issue after the pin.
+#
+# Once a week this job looks up the date of the pinned upstream commit and
+# FAILS when it is more than MAX_AGE_DAYS old, printing where to review what
+# upstream changed in the vendored crates since. Resolve a failure by syncing
+# the fork (see `tyc/vendor/README.md`) and bumping `UPSTREAM`.
+
+on:
+  schedule:
+    # Mondays 06:23 UTC (off the hour, where scheduled runs queue up).
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-freshness
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Vendored Ruff pin age
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check the age of the vendored Ruff pin
+        shell: bash
+        env:
+          # Read-only token; only used for public upstream metadata.
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_DAYS: "120"
+          UPSTREAM_FILE: tyc/vendor/UPSTREAM
+          VENDOR_DIR: tyc/vendor
+        run: |
+          set -euo pipefail
+
+          # UPSTREAM is a single line: `<owner>/<repo> @ <40-hex commit>`.
+          line="$(grep -m1 -E '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ @ [0-9a-f]{40}[[:space:]]*$' "$UPSTREAM_FILE" || true)"
+          if [ -z "$line" ]; then
+            echo "::error file=${UPSTREAM_FILE}::expected a line of the form '<owner>/<repo> @ <40-hex sha>'"
+            exit 1
+          fi
+          repo="${line%% @ *}"
+          sha="$(printf '%s' "${line##* @ }" | tr -d '[:space:]')"
+
+          # UPSTREAM records no date, so ask upstream when the pinned commit
+          # was made.
+          pinned_date="$(gh api "repos/${repo}/commits/${sha}" --jq '.commit.committer.date')"
+          if [ -z "$pinned_date" ]; then
+            echo "::error::could not read the commit date of ${repo}@${sha}"
+            exit 1
+          fi
+          pinned_epoch="$(date -u -d "$pinned_date" +%s)"
+          now_epoch="$(date -u +%s)"
+          age_days=$(( (now_epoch - pinned_epoch) / 86400 ))
+          since_day="${pinned_date%%T*}"
+
+          echo "Vendored pin : ${repo} @ ${sha}"
+          echo "Pinned commit: ${pinned_date} (${age_days} days old; limit ${MAX_AGE_DAYS})"
+          echo
+          echo "Everything upstream since the pin:"
+          echo "  https://github.com/${repo}/compare/${sha}...main"
+          echo
+          echo "Restricted to the vendored crates (commits on main since ${since_day}):"
+          total=0
+          for dir in "$VENDOR_DIR"/*/; do
+            crate="$(basename "$dir")"
+            # Upstream commits that touched this crate after the pin. Capped
+            # at one page: "100" means "100 or more".
+            n="$(gh api -X GET "repos/${repo}/commits" \
+                  -f sha=main -f path="crates/${crate}" -f since="$pinned_date" -f per_page=100 \
+                  --jq 'length' 2>/dev/null || echo '?')"
+            case "$n" in
+              ''|*[!0-9]*) n='?' ;;
+              *)
+                # `since` is inclusive, so the pinned commit itself can be
+                # counted for a crate it touched.
+                total=$(( total + n ))
+                ;;
+            esac
+            printf '  %-22s %4s commit(s)  https://github.com/%s/commits/main/crates/%s?since=%s\n' \
+              "$crate" "$n" "$repo" "$crate" "$since_day"
+          done
+
+          {
+            echo "### Vendored Ruff pin"
+            echo
+            echo "- Pin: \`${repo}@${sha}\`"
+            echo "- Pinned commit date: ${pinned_date} — **${age_days} days old** (limit ${MAX_AGE_DAYS})"
+            echo "- Upstream commits touching the vendored crates since: ${total}"
+            echo "- Compare: https://github.com/${repo}/compare/${sha}...main"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
+            echo "::error file=${UPSTREAM_FILE}::the vendored ${repo} pin is ${age_days} days old (limit ${MAX_AGE_DAYS}). Review the upstream changes listed above, sync tyc/vendor/ (see tyc/vendor/README.md) and bump UPSTREAM."
+            exit 1
+          fi
+          echo
+          echo "OK: the pin is within ${MAX_AGE_DAYS} days."

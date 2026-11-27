@@ -36,9 +36,13 @@ export default defineConfig({
         replacesTitle: false,
       },
       favicon: '/favicon.svg',
-      social: {
-        github: 'https://github.com/CodeHalwell/Typhon',
-      },
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/CodeHalwell/Typhon',
+        },
+      ],
       editLink: {
         baseUrl: 'https://github.com/CodeHalwell/Typhon/edit/main/docs-site/',
       },

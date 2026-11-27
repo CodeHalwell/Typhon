@@ -64,6 +64,14 @@ comptime let TOKEN_LIMIT: int = int(env("TOKEN_LIMIT"))        # fine: not a str
 This diagnostic is **warn-level**: it never fails the build. Silence it
 project-wide with `[strictness] allow-secret-comptime = true`.
 
+The warning is only reached once the project has *allowed* the read. By
+default `comptime env(...)` refuses a credential-named variable outright
+(`tyc::comptime`: "comptime env() may not read 'AWS_SECRET_ACCESS_KEY'") —
+it has to be listed under `[env] allow` or `[env] required` in `typhon.toml`.
+The refusal is decided on the variable's resolved name at evaluation time, so
+a computed key, a helper `comptime def` or a value wrapped in a list is
+covered the same way. See [`docs/configuration.md`](../configuration.md).
+
 ## Example
 
 ```ty

@@ -89,6 +89,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "gather_opportunity",
         "generator_return_type",
         "generic",
+        "hidden_source_character",
         "immutable_assign",
         "impl_forward_reference",
         "impl_unknown_class",
@@ -144,6 +145,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "raise_non_exception",
         "requires_newer_python",
         "reserved_module_name",
+        "reserved_name",
         "resource_not_managed",
         "result_error_mismatch",
         "return_in_except_star",
@@ -347,6 +349,10 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "reserved_module_name" => {
             include_str!("../../../../../docs/diagnostics/reserved_module_name.md")
+        }
+        "reserved_name" => include_str!("../../../../../docs/diagnostics/reserved_name.md"),
+        "hidden_source_character" => {
+            include_str!("../../../../../docs/diagnostics/hidden_source_character.md")
         }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")

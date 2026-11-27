@@ -2709,6 +2709,17 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 };
                 new_class.decorator_list.insert(0, decorator);
             }
+            // A hand-written `model_config` that says nothing about `extra`
+            // gets the project's setting merged in. It used to be left
+            // alone, so adding `ConfigDict(frozen=True)` silently swapped
+            // the documented `extra="forbid"` for pydantic's `"ignore"`.
+            if is_pydantic
+                && !is_impl_stub
+                && !needs_model_config
+                && merge_model_extra(&mut new_class.body, markers.model_extra)
+            {
+                body_transformed = true;
+            }
             if needs_model_config {
                 // Insert after a leading class docstring so that `__doc__` is
                 // preserved.  Python requires the docstring to be the first
@@ -3867,6 +3878,74 @@ fn has_model_config_stmt(body: &[Stmt]) -> bool {
         }
         _ => false,
     })
+}
+
+/// Add `extra=<setting>` to a class body's own `model_config` when that
+/// config is a plain `ConfigDict(...)` call or dict literal that does not
+/// mention `extra`. Returns whether anything changed.
+///
+/// A config that already sets `extra`, spreads another mapping in
+/// (`**base`), or is not a literal at all (`model_config = make_config()`)
+/// is the author's explicit choice and is left exactly as written.
+fn merge_model_extra(body: &mut [Stmt], extra: &str) -> bool {
+    let value: Option<&mut Expr> = body.iter_mut().find_map(|stmt| match stmt {
+        Stmt::Assign(a)
+            if a.targets
+                .iter()
+                .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "model_config")) =>
+        {
+            Some(a.value.as_mut())
+        }
+        Stmt::AnnAssign(a)
+            if matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == "model_config") =>
+        {
+            a.value.as_deref_mut()
+        }
+        _ => None,
+    });
+    match value {
+        Some(Expr::Call(call)) => {
+            let is_config_dict = match call.func.as_ref() {
+                Expr::Name(n) => n.id.as_str() == "ConfigDict",
+                Expr::Attribute(a) => a.attr.as_str() == "ConfigDict",
+                _ => false,
+            };
+            let explicit = !call.arguments.args.is_empty()
+                || call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .any(|k| k.arg.as_ref().is_none_or(|a| a.as_str() == "extra"));
+            if !is_config_dict || explicit {
+                return false;
+            }
+            let mut keywords = std::mem::take(&mut call.arguments.keywords).into_vec();
+            keywords.push(Keyword {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                arg: Some(make_identifier("extra")),
+                value: make_string_literal_expr(extra),
+            });
+            call.arguments.keywords = keywords.into_boxed_slice();
+            true
+        }
+        Some(Expr::Dict(dict)) => {
+            let explicit = dict.items.iter().any(|item| match &item.key {
+                None => true,
+                Some(Expr::StringLiteral(k)) => k.value.to_str() == "extra",
+                Some(_) => true,
+            });
+            if explicit {
+                return false;
+            }
+            dict.items.push(ruff_python_ast::DictItem {
+                key: Some(make_string_literal_expr("extra")),
+                value: make_string_literal_expr(extra),
+            });
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Build `model_config = ConfigDict(extra="…")`.
@@ -7368,6 +7447,39 @@ class __typhon_impl_Event(object):
             out.contains("extra=\"allow\""),
             "user-defined model_config value must be preserved\noutput:\n{out}"
         );
+    }
+
+    #[test]
+    fn model_extra_is_merged_into_a_config_that_omits_it() {
+        let src =
+            "class ApiUser(BaseModel):\n    model_config = ConfigDict(frozen=True)\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "forbid");
+        assert_eq!(out.matches("model_config").count(), 1, "{out}");
+        assert!(out.contains("frozen=True"), "{out}");
+        assert!(out.contains("extra=\"forbid\""), "{out}");
+
+        let src = "class ApiUser(BaseModel):\n    model_config = {\"frozen\": True}\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "forbid");
+        assert!(out.contains("\"extra\": \"forbid\""), "{out}");
+    }
+
+    #[test]
+    fn model_extra_is_not_merged_into_an_explicit_or_dynamic_config() {
+        for config in [
+            "ConfigDict(extra=\"allow\", frozen=True)",
+            "ConfigDict(**BASE)",
+            "{\"extra\": \"ignore\"}",
+            "{**BASE}",
+            "make_config()",
+        ] {
+            let src =
+                format!("class ApiUser(BaseModel):\n    model_config = {config}\n    id: int\n");
+            let out = parse_and_desugar_with_model_extra(&src, "forbid");
+            assert!(
+                !out.contains("forbid"),
+                "{config} must be left alone:\n{out}"
+            );
+        }
     }
 
     #[test]

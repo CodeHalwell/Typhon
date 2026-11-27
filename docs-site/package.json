@@ -11,10 +11,10 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/check": "^0.9.4",
-    "@astrojs/starlight": "^0.30.6",
-    "astro": "^5.18.2",
-    "sharp": "^0.33.5"
+    "@astrojs/check": "^0.9.12",
+    "@astrojs/starlight": "^0.43.2",
+    "astro": "^7.4.13",
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
     "eslint": "^10.6.0",

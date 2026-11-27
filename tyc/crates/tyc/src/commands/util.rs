@@ -6,6 +6,19 @@ use std::path::{Path, PathBuf};
 use miette::{miette, Result};
 use tyc_db::ModuleShapes;
 use tyc_diagnostics::Diagnostics;
+/// Tell the comptime evaluator which credential-named environment variables
+/// this project's `typhon.toml` lets `env(...)` read (see
+/// [`tyc_analyse::ComptimeEnvPolicy`]). Called by every command that
+/// evaluates `comptime`, as soon as the config is loaded.
+pub fn apply_comptime_env_policy(config: &crate::config::TyphonConfig) {
+    let mut allowed = config.env.allow.clone();
+    allowed.extend(config.env.required.iter().cloned());
+    tyc_analyse::set_comptime_env_policy(tyc_analyse::ComptimeEnvPolicy {
+        allow_credentials: config.strictness.allow_secret_comptime,
+        allowed,
+    });
+}
+
 /// A Python script written for one run of an interpreter, in a directory of
 /// its own.
 ///

@@ -2590,6 +2590,15 @@ fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
         if candidate.exists() {
             return match tyc_venv::config::TyphonConfig::load_file(&candidate) {
                 Ok(config) => {
+                    // The editor evaluates `comptime` too: apply this
+                    // project's `[env] allow` list (see
+                    // `tyc_analyse::ComptimeEnvPolicy`).
+                    let mut allowed = config.env.allow.clone();
+                    allowed.extend(config.env.required.iter().cloned());
+                    tyc_analyse::set_comptime_env_policy(tyc_analyse::ComptimeEnvPolicy {
+                        allow_credentials: config.strictness.allow_secret_comptime,
+                        allowed,
+                    });
                     let src_dir = dir.join(&config.project.src);
                     WorkspaceLookup::Project(dir, src_dir)
                 }

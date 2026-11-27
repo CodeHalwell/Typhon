@@ -1380,7 +1380,13 @@ pub fn evaluate_comptime_with_functions(
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
-    evaluate_comptime_inner(module, None, bindings, comptime_function_names)
+    evaluate_comptime_inner(
+        module,
+        None,
+        bindings,
+        comptime_function_names,
+        &comptime_env_policy(),
+    )
 }
 
 /// [`evaluate_comptime_with_functions`] with the (preprocessed) source text
@@ -1407,7 +1413,108 @@ pub fn evaluate_comptime_in_source(
         Some((path, source)),
         bindings,
         comptime_function_names,
+        &comptime_env_policy(),
     )
+}
+
+/// [`evaluate_comptime_in_source`] under an explicit [`ComptimeEnvPolicy`]
+/// instead of the process-wide one.
+pub fn evaluate_comptime_in_source_with_policy(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+    bindings: &[ComptimeBinding],
+    comptime_function_names: &[String],
+    policy: &ComptimeEnvPolicy,
+) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    evaluate_comptime_inner(
+        module,
+        Some((path, source)),
+        bindings,
+        comptime_function_names,
+        policy,
+    )
+}
+
+/// Which environment variables `comptime env(...)` may read.
+///
+/// A comptime value is written into the build output as a literal, and
+/// `comptime` runs for `tyc check` and in the editor, not only for a build.
+/// A project somebody has merely cloned could therefore name
+/// `env("AWS_SECRET_ACCESS_KEY", "")` and have the builder's own credential
+/// inlined into an artifact (or a CI log) without being asked. So a variable
+/// whose *name* marks it as a credential is refused unless the project's
+/// `typhon.toml` — a file the person building it can read — says otherwise:
+/// it is listed under `[env] allow` or `[env] required`, or
+/// `[strictness] allow-secret-comptime = true`. Every other variable
+/// (`PORT`, `BUILD_TAG`, `FEATURE_X`) is read as before.
+#[derive(Debug, Clone, Default)]
+pub struct ComptimeEnvPolicy {
+    /// `[strictness] allow-secret-comptime = true`: no variable is refused.
+    pub allow_credentials: bool,
+    /// `[env] allow` plus `[env] required`: names readable whatever they
+    /// look like.
+    pub allowed: Vec<String>,
+}
+
+impl ComptimeEnvPolicy {
+    /// Why reading `name` (currently holding `value`, if set) is refused,
+    /// or `None` when it is allowed. The value never appears in the message.
+    fn refusal(&self, name: &str, value: Option<&str>) -> Option<String> {
+        if self.allow_credentials || self.allowed.iter().any(|a| a == name) {
+            return None;
+        }
+        let credential = match secrets::secret_name_strength(name)? {
+            secrets::SecretNameStrength::Clear => true,
+            secrets::SecretNameStrength::Ambiguous => {
+                value.is_some_and(secrets::secret_value_is_credential_shaped)
+            }
+        };
+        credential.then(|| {
+            format!(
+                "comptime env() may not read '{name}': the name marks it as a credential, \
+                 and a comptime value is written into the build output. Read it at runtime \
+                 with os.environ[...]; or, if it must be baked in, list it under \
+                 `[env] allow` in typhon.toml"
+            )
+        })
+    }
+}
+
+static COMPTIME_ENV_POLICY: std::sync::RwLock<Option<ComptimeEnvPolicy>> =
+    std::sync::RwLock::new(None);
+
+thread_local! {
+    /// The policy of the project *this thread* is working on. A command
+    /// handles one project on one thread, so this is exact; the process-wide
+    /// slot above only serves helper threads that never loaded a config.
+    static THREAD_COMPTIME_ENV_POLICY: std::cell::RefCell<Option<ComptimeEnvPolicy>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the policy — called by `tyc build` / `check` / `run` and the
+/// language server once the project's `typhon.toml` is read. Until then the
+/// default applies: credential-named variables are refused.
+///
+/// It is recorded for the calling thread and, as a fallback for threads
+/// that have none of their own, for the process.
+pub fn set_comptime_env_policy(policy: ComptimeEnvPolicy) {
+    THREAD_COMPTIME_ENV_POLICY.with(|slot| *slot.borrow_mut() = Some(policy.clone()));
+    if let Ok(mut slot) = COMPTIME_ENV_POLICY.write() {
+        *slot = Some(policy);
+    }
+}
+
+fn comptime_env_policy() -> ComptimeEnvPolicy {
+    THREAD_COMPTIME_ENV_POLICY
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| {
+            COMPTIME_ENV_POLICY
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        })
+        .unwrap_or_default()
 }
 
 /// A comptime diagnostic for `name`, anchored at `range` when the caller
@@ -1465,8 +1572,13 @@ fn evaluate_comptime_inner(
     anchor: Option<(&str, &str)>,
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
+    env_policy: &ComptimeEnvPolicy,
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
     let source = anchor.map(|(_, source)| source);
+    // One step budget for the whole file. It used to restart for every
+    // binding, so two hundred `comptime let N: int = slow(40)` lines each
+    // spent a full budget and `tyc check` ran for minutes.
+    let mut steps_spent: u64 = 0;
     let mut values = HashMap::new();
     let mut diags = Diagnostics::new();
 
@@ -1526,6 +1638,8 @@ fn evaluate_comptime_inner(
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
                 ctx.source = source;
+                ctx.env_policy = Some(env_policy);
+                ctx.steps = steps_spent;
                 // Seed the evaluator's scope with previously-evaluated
                 // comptime constants so a later binding can reference an
                 // earlier one (FINDINGS #48). Bindings are evaluated in
@@ -1533,7 +1647,9 @@ fn evaluate_comptime_inner(
                 for (name, value) in &values {
                     ctx.locals.insert(name.clone(), value.clone());
                 }
-                match eval_expr(expr, &mut ctx) {
+                let result = eval_expr(expr, &mut ctx);
+                steps_spent = ctx.steps;
+                match result {
                     Ok(v) => {
                         values.insert(binding.name.clone(), v);
                     }
@@ -1580,6 +1696,9 @@ struct EvalContext<'a> {
     /// The source the module was parsed from, when the caller has it (see
     /// [`evaluate_comptime_in_source`]).
     source: Option<&'a str>,
+    /// Which variables `env(...)` may read; `None` only in unit tests that
+    /// build a context by hand.
+    env_policy: Option<&'a ComptimeEnvPolicy>,
     /// Range of the innermost expression of the binding's own initialiser
     /// (call depth 0) whose evaluation failed — the diagnostic's anchor. A
     /// failure inside a `comptime def` body anchors at the call in the
@@ -1597,6 +1716,7 @@ impl<'a> EvalContext<'a> {
             string_bytes: 0,
             steps: 0,
             source: None,
+            env_policy: None,
             error_range: None,
         }
     }
@@ -2791,7 +2911,14 @@ fn eval_env_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeV
         _ => return Err("env() first argument must be a string literal".into()),
     };
 
-    match std::env::var(&var_name) {
+    let current = std::env::var(&var_name).ok();
+    if let Some(refusal) = ctx
+        .env_policy
+        .and_then(|policy| policy.refusal(&var_name, current.as_deref()))
+    {
+        return Err(refusal);
+    }
+    match current.ok_or(()) {
         Ok(val) => Ok(ComptimeValue::Str(val)),
         Err(_) => {
             if args.len() == 2 {
@@ -3549,6 +3676,104 @@ comptime def grow(s: str, n: int) -> str:
         let (_, diags) =
             eval("comptime let DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
         assert!(diags.has_errors(), "missing env var must be a build error");
+    }
+
+    fn eval_with_policy(
+        src: &str,
+        policy: &ComptimeEnvPolicy,
+    ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        evaluate_comptime_in_source_with_policy(
+            &module,
+            "t.ty",
+            &prep.python_source,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+            policy,
+        )
+    }
+
+    /// A credential-named variable is not readable by default — whatever
+    /// the binding is called and however the key is spelled — and the
+    /// refusal never quotes the value.
+    #[test]
+    fn comptime_env_refuses_credential_named_variables_by_default() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMIK7MDENG");
+        let deny = ComptimeEnvPolicy::default();
+        for src in [
+            "comptime let REGION: str = env(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\", \"\")\n",
+            "comptime let REGION: str = env(\"TYPHON_T_AWS_SECRET\" + \"_ACCESS_KEY\", \"\")\n",
+            "comptime let TAGS: list[str] = [env(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\", \"\")]\n",
+            "comptime def cfg(k: str) -> str:\n    return env(k, \"\")\n\n\
+             comptime let CHANNEL: str = cfg(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\")\n",
+        ] {
+            let (values, diags) = eval_with_policy(src, &deny);
+            assert!(diags.has_errors(), "must be refused:\n{src}");
+            assert!(values.is_empty(), "nothing may be inlined:\n{src}");
+            let rendered = format!("{:?}", diags.errors());
+            assert!(!rendered.contains("wJalrXUtnFEMIK7MDENG"), "{rendered}");
+        }
+        std::env::remove_var("TYPHON_T_AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    fn comptime_env_reads_a_credential_the_project_allows() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_API_TOKEN", "abc");
+        let src = "comptime let T: str = env(\"TYPHON_T_API_TOKEN\")\n";
+        let listed = ComptimeEnvPolicy {
+            allow_credentials: false,
+            allowed: vec!["TYPHON_T_API_TOKEN".to_owned()],
+        };
+        let blanket = ComptimeEnvPolicy {
+            allow_credentials: true,
+            allowed: Vec::new(),
+        };
+        for policy in [&listed, &blanket] {
+            let (values, diags) = eval_with_policy(src, policy);
+            assert!(!diags.has_errors(), "{:?}", diags.errors());
+            assert!(matches!(values.get("T"), Some(ComptimeValue::Str(s)) if s == "abc"));
+        }
+        std::env::remove_var("TYPHON_T_API_TOKEN");
+    }
+
+    /// Ordinary configuration is unaffected by the default policy.
+    #[test]
+    fn comptime_env_still_reads_ordinary_variables() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_PORT", "8080");
+        std::env::set_var("TYPHON_T_TOKEN_LIMIT", "5");
+        let src = "comptime let PORT: int = int(env(\"TYPHON_T_PORT\"))\n\
+                   comptime let LIMIT: int = int(env(\"TYPHON_T_TOKEN_LIMIT\"))\n\
+                   comptime let TAG: str = env(\"TYPHON_T_UNSET_BUILD_TAG\", \"dev\")\n";
+        let (values, diags) = eval_with_policy(src, &ComptimeEnvPolicy::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(values.len(), 3);
+        std::env::remove_var("TYPHON_T_PORT");
+        std::env::remove_var("TYPHON_T_TOKEN_LIMIT");
+    }
+
+    /// The step budget is shared by every binding in the file.
+    #[test]
+    fn comptime_step_budget_is_per_file_not_per_binding() {
+        let mut src = String::from(
+            "comptime def f(n: int) -> int:\n    if n == 0:\n        return 1\n    return f(n - 1) + f(n - 1)\n\n",
+        );
+        for i in 0..40 {
+            src.push_str(&format!("comptime let N{i}: int = f(40)\n"));
+        }
+        let started = std::time::Instant::now();
+        let (_values, diags) = eval(&src);
+        assert!(diags.has_errors());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "forty runaway bindings must share one budget, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -343,7 +343,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
 /// control characters are escaped, and every non-ASCII character becomes a
 /// `\uXXXX` / `\UXXXXXXXX` escape, so the literal is plain ASCII and means
 /// exactly `s` to Python whatever the wrapper file's encoding.
-fn python_str_literal(s: &str) -> String {
+pub(crate) fn python_str_literal(s: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

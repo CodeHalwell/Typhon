@@ -409,6 +409,11 @@ impl Default for StrictnessConfig {
 pub struct EnvConfig {
     /// Env vars that must be resolvable at build time for `comptime env()`.
     pub required: Vec<String>,
+    /// Credential-named env vars (`API_KEY`, `GITHUB_TOKEN`, …) that
+    /// `comptime env()` may nevertheless read and inline into the build.
+    /// Anything in `required` is allowed too. See `ComptimeEnvPolicy` in
+    /// `tyc-analyse`.
+    pub allow: Vec<String>,
 }
 
 /// `[checker]` — second-stage type-checking over the emitted Python.

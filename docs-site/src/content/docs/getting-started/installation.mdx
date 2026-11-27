@@ -17,10 +17,10 @@ Pre-built, checksum-verified binaries ship on every [GitHub Release](https://git
 <TabItem label="macOS / Linux">
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
-The installer detects your platform, downloads the matching archive, verifies its SHA-256 against the release manifest over TLS, and installs `tyc` to a per-user directory (no `sudo`). Pin a version with `--version=v1.0.0-beta.7` (or `TYPHON_VERSION=…`).
+The installer detects your platform, downloads the matching archive, verifies its SHA-256 against the release manifest over TLS, checks its [build provenance](#verifying-a-download) when the GitHub CLI is available, and installs `tyc` to a per-user directory (no `sudo`). Pin a version with `--version=v1.0.0-beta.7` (or `TYPHON_VERSION=…`).
 
 </TabItem>
 <TabItem label="Windows (PowerShell)">
@@ -40,6 +40,37 @@ Follow the [manual installation steps](https://typhon.sh/install#manual) for mac
 </Tabs>
 
 If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64), build from source below.
+
+## Verifying a download
+
+Every release archive can be checked two ways. Both installers always do the first, and do the second when they can.
+
+**Checksum.** Each release carries a `SHA256SUMS` file. Download it next to the archive and compare:
+
+```bash
+# macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+This catches a corrupted or truncated download. It does not protect against a tampered release, because `SHA256SUMS` comes from the same place as the archive.
+
+**Build provenance.** Releases after v1.0.0-beta.7 also carry a signed build-provenance attestation for every archive, produced by the release workflow. With the [GitHub CLI](https://cli.github.com/) installed and logged in:
+
+```bash
+gh attestation verify tyc-<version>-<target>.tar.gz --repo CodeHalwell/Typhon
+```
+
+Success means the archive was built by a GitHub Actions run in `CodeHalwell/Typhon`.
+
+The installers run this check themselves when `gh` is on your `PATH`. An archive whose attestation does not verify aborts the install. When there is nothing to verify against (v1.0.0-beta.7 or older, or `gh` missing or not logged in), the installer prints a note and continues on the checksum alone.
+
+<Aside type="tip">
+Set `TYPHON_REQUIRE_ATTESTATION=1` to make anything short of a successful provenance check fatal:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | TYPHON_REQUIRE_ATTESTATION=1 sh
+```
+</Aside>
 
 ## Verify the installation
 

@@ -62,6 +62,38 @@ release pipeline and the installers. No language change.
   character panicked the language server's semantic-token pass. A comptime
   f-string is charged against the memory budget like `+`.
 
+- **`comptime env()` does not read credentials unless the project says
+  so.** A variable whose name marks it as a credential (`GITHUB_TOKEN`,
+  `AWS_SECRET_ACCESS_KEY`; an ambiguous name when its value looks like one)
+  is refused with `tyc::comptime` unless it is listed under the new
+  `[env] allow`, under `[env] required`, or `allow-secret-comptime = true`.
+  The decision is made on the resolved name, so a computed key, a helper
+  `comptime def` or a value wrapped in a list no longer slips past. The
+  comptime step budget is now per file rather than per binding.
+- **A hand-written `model_config` keeps `extra="forbid"`.** Any user
+  `model_config` used to drop the injected setting, so
+  `ConfigDict(frozen=True)` silently meant pydantic's `extra="ignore"`. The
+  project's `[emit] model-extra` is merged into a config that does not
+  mention `extra`.
+- **New `tyc::reserved_name` (error).** A user name starting with
+  `__typhon_` — `def __typhon_checked_cast__(v, t): return v` turned every
+  `as!` in its module into a no-op.
+- **New `tyc::hidden_source_character` (warning).** Bidirectional-control
+  characters ("Trojan Source", CVE-2021-42574) and carriage returns that are
+  not part of a CRLF line ending.
+- **A lone-surrogate escape (`"\ud800"`) is a `tyc::parse` error.** It was
+  silently emitted as U+FFFD.
+- **An introspection timeout kills the whole process group.** A dependency
+  whose import started a subprocess kept `tyc check` and the language server
+  waiting for as long as that subprocess lived.
+- Smaller hardening: the language server caps header-line length and
+  re-checks its private scratch directory before each use; a dependency's
+  annotation longer than 2 KB is not parsed; `tyc profile --instrument` no
+  longer rewrites `def` lines inside string constants; the generated
+  `conftest.py` and `pyproject.toml` escape unusual characters correctly;
+  `TYC_NO_SYNC` accepts any value but empty or `0`; `tyc check` refuses a
+  `src` symlinked out of the project.
+
 ### Release pipeline and packaging
 
 - The release workflow's build jobs run with a read-only token, without
@@ -74,6 +106,22 @@ release pipeline and the installers. No language change.
   are `machine`-scoped. They were `machine-overridable`, which a workspace's
   `.vscode/settings.json` *can* set.
 - A scheduled workflow runs `cargo deny` daily.
+- `install.sh` / `install.ps1` reject archives with absolute, `..` or
+  symlink members, stage the binary under an unpredictable name, and verify
+  build provenance with `gh attestation verify` when `gh` is available
+  (`TYPHON_REQUIRE_ATTESTATION=1` makes that mandatory). Docs use
+  `curl --proto '=https' --tlsv1.2 -fsSL`.
+- The release job runs in a `release` environment (so required reviewers can
+  be configured) and refuses to replace the assets of an existing release
+  unless dispatched with `overwrite: true`. `CODEOWNERS` covers the
+  workflows, installers, `deny.toml`, `Cargo.lock` and `SECURITY.md`.
+- A weekly workflow fails when the vendored Ruff parser pin is more than 120
+  days old.
+- docs-site moves to Astro 7 / Starlight 0.43 and the VS Code extension
+  (0.2.4) updates `brace-expansion`: `npm audit` reports nothing in either.
+  The extension requires an absolute `typhon.server.path` when the value
+  contains a path separator and declares itself unsupported in untrusted
+  workspaces.
 
 ## 1.0.0-beta.7 — 2026-11-02 — beta.6 feedback fixes
 

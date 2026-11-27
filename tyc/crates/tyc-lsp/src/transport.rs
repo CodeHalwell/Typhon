@@ -18,6 +18,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use tokio::sync::mpsc;
 use tower_lsp_server::jsonrpc::{Request, Response};
 
+/// The longest header line accepted (`Content-Length: …` is ~25 bytes).
+const MAX_HEADER_LINE: u64 = 8 * 1024;
+
 /// Bodies larger than this are rejected (and skipped) rather than buffered.
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
@@ -38,8 +41,18 @@ pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(
     let mut content_length: Option<Result<usize, String>> = None;
     let mut saw_header = false;
     loop {
+        // A header line is a few dozen bytes. Cap it: `read_until` on an
+        // endless run of bytes with no newline grew the buffer without limit.
         let mut line = Vec::new();
-        if r.read_until(b'\n', &mut line).await? == 0 {
+        let read = (&mut *r)
+            .take(MAX_HEADER_LINE)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if line.last() != Some(&b'\n') && read as u64 >= MAX_HEADER_LINE {
+            // Not a header we can resynchronise after; end the session.
             return Ok(None);
         }
         let text = String::from_utf8_lossy(&line);

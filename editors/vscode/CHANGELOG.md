@@ -1,5 +1,18 @@
 # Typhon VS Code extension — changelog
 
+## 0.2.4
+
+- Security: a `typhon.server.path` that contains a path separator must now be
+  absolute. A relative value (`./bin/tyc`, `tools\\tyc.exe`) used to be
+  resolved against the extension host's working directory; it is now rejected
+  with a warning that asks for an absolute path. Bare command names (`tyc`)
+  are still looked up on PATH.
+- Security: the extension declares
+  `capabilities.untrustedWorkspaces.supported: false`, so it stays disabled in
+  Restricted Mode — the language server it launches executes project tooling.
+- Dependencies: `brace-expansion` updated past the advisory range (transitive
+  of `vscode-languageclient`).
+
 ## 0.2.3
 
 - Fixed `SCREAMING_CASE` constants (e.g. `AZURE_OPENAI_ENDPOINT`) being

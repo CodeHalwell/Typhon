@@ -40,8 +40,12 @@ async function start(): Promise<void> {
   const configured = config.get<string>("server.path", "tyc");
   const command = resolveCommand(configured);
   if (!command) {
+    const hint = isRelativePath(configured)
+      ? "is a relative path, which is not accepted: set `typhon.server.path` to an absolute path, " +
+        "or to a bare command name such as `tyc` that is looked up on PATH. "
+      : "not found. Set `typhon.server.path` to an absolute path or add `tyc` to PATH. ";
     window.showWarningMessage(
-      `Typhon: \`${configured}\` not found. Set \`typhon.server.path\` or add \`tyc\` to PATH. ` +
+      `Typhon: \`${configured}\` ${hint}` +
         "Syntax highlighting will still work without the language server.",
     );
     return;
@@ -98,11 +102,22 @@ function resolveCommand(configured: string): string | undefined {
   if (path.isAbsolute(configured)) {
     return fs.existsSync(configured) ? configured : undefined;
   }
-  if (configured.includes(path.sep) || configured.includes("/")) {
-    const resolved = path.resolve(configured);
-    return fs.existsSync(resolved) ? resolved : undefined;
+  // A path with a separator must be absolute. A relative one would resolve
+  // against the extension host's working directory, which is not a location
+  // the user chose — it can be the opened folder, so `./tools/tyc` could end
+  // up launching a binary that a cloned repository ships.
+  if (isRelativePath(configured)) {
+    return undefined;
   }
   return findOnPath(configured);
+}
+
+/** True for a non-absolute value that contains a path separator. */
+function isRelativePath(configured: string): boolean {
+  return (
+    !path.isAbsolute(configured) &&
+    (configured.includes("/") || configured.includes("\\"))
+  );
 }
 
 function findOnPath(name: string): string | undefined {

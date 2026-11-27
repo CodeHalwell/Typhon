@@ -58,6 +58,7 @@ external-args = []          # extra flags forwarded verbatim to the external che
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
+allow = []                   # credential-named variables comptime env() may read
 
 # Inline dependency management — synced with `tyc add` / `tyc remove` / `tyc sync`,
 # which write a generated `pyproject.toml` and shell out to `uv`.
@@ -154,7 +155,7 @@ auto-parallel = false       # …but this explicit entry keeps auto-parallel off
 | `nullable-use` | `"error"` \| `"warn"` \| `"off"` | Severity for the *attribute-rooted* form of `tyc::nullable_use` — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). `"error"` (default since the 2026-09-30 review; the check landed at `"warn"` in v1.0.0-alpha.7 as its introduction severity) makes Rule 3 a guarantee rather than advice. `"warn"` relaxes it during a migration; `"off"` suppresses it. The bare-name form (`x.upper()` where `x: str?`) has always been an error and is not governed by this knob. |
 | `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`. `"error"` (default) breaks CI on stub drift. `"warn"` surfaces drift without blocking merges. `"off"` silently drops stub mismatches — useful when running `--stubs` opportunistically. |
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | Severity when a declared dependency is imported but its signatures can't be recovered (no reachable `.venv`/`python3`, the package isn't installed, or it exposes no introspectable signatures) — so its third-party arity/type checks are skipped. `"warn"` (default) surfaces the skipped coverage; `"error"` fails the build/check (CI-gating); `"off"` restores the prior silent behaviour. Install the project's dependencies (`uv sync`) or ship a `.dty` stub to clear it. |
-| `allow-secret-comptime` | bool | When `true`, silences `tyc::contains_secret_literal` — the warning that fires when a credential would land as a string literal: a binding initialised from a string literal (`tyc check`, the editor), or a `comptime let` whose string value reads `env("…")` and would be inlined into the build artifact (`tyc build`). Both fire when the binding name — or, for `env("…")`, the env key — names a credential (`API_KEY`, `DB_PASSWORD`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`; not `TOKEN_LIMIT`, `PRIMARY_KEY` or `PASSWORD_MIN_LENGTH`), weighted by the value; see [the diagnostic page](diagnostics/contains_secret_literal.md). Default `false`; `tyc init` seeds it explicitly. Prefer reading secrets at runtime via `os.environ[...]` over enabling this. |
+| `allow-secret-comptime` | bool | When `true`, silences `tyc::contains_secret_literal` — the warning that fires when a credential would land as a string literal: a binding initialised from a string literal (`tyc check`, the editor), or a `comptime let` whose string value reads `env("…")` and would be inlined into the build artifact (`tyc build`). Both fire when the binding name — or, for `env("…")`, the env key — names a credential (`API_KEY`, `DB_PASSWORD`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`; not `TOKEN_LIMIT`, `PRIMARY_KEY` or `PASSWORD_MIN_LENGTH`), weighted by the value; see [the diagnostic page](diagnostics/contains_secret_literal.md). It also lets `comptime env()` read *any* credential-named variable — without it, each one has to be listed under `[env] allow` or `required`. Default `false`; `tyc init` seeds it explicitly. Prefer reading secrets at runtime via `os.environ[...]` over enabling this. |
 
 > **`TYC_NO_INTROSPECT=1`** (v1.0.0-alpha.3) — an environment kill-switch that disables venv
 > dependency introspection entirely in `tyc check` / `tyc build` / the LSP. Third-party calls
@@ -172,6 +173,7 @@ auto-parallel = false       # …but this explicit entry keeps auto-parallel off
 | Key | Type | Description |
 |-----|------|-------------|
 | `required` | list of strings | Environment variables that **must** resolve at build time. Any `comptime env()` lookup on a missing required variable fails the build. |
+| `allow` | list of strings | Credential-named variables that `comptime env()` may read. By default a variable whose name marks it as a credential (`API_KEY`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`; an ambiguous name such as `STRIPE_KEY` when its value looks like one) is refused with `tyc::comptime`: a comptime value is written into the build output, and `comptime` also runs for `tyc check` and in the editor, so a project you have only cloned could otherwise have your credentials inlined into an artifact or a log. Listing a name here (or under `required`) is the project saying, in a file you can read, that it bakes that value in. Ordinary variables (`PORT`, `BUILD_TAG`, `FEATURE_X`, `TOKEN_LIMIT`) need no entry. |
 
 ### `[checker]`
 

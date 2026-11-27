@@ -920,6 +920,14 @@ from .helper import do_thing   # warning: helper.py outside src/
 
 **Fix:** Move under `src/`, or use an absolute import that names a packaged module.
 
+### `tyc::reserved_name` — error (2026-11 security review)
+
+A name written in `.ty` source that starts with `__typhon_` (binding, `def`, parameter, import alias or reference; strings and comments are ignored). The compiler emits its helpers and temporaries under that prefix — `__typhon_checked_cast__` behind `as!`, `__typhon_freeze__`, `__typhon_ext_str__slug__`, `__typhon_unpack_0__` — and a user binding of the same name silently replaced them (`def __typhon_checked_cast__(v, t): return v` turned every `as!` in the module into a no-op). **Fix:** rename it.
+
+### `tyc::hidden_source_character` — warning (2026-11 security review)
+
+A bidirectional-control character (U+202A–U+202E, U+2066–U+2069) anywhere in a `.ty` file, or a carriage return that is not part of a CRLF line ending. Both make source *display* differently from how it compiles ("Trojan Source", CVE-2021-42574; a lone `\r` ends a line for Python but not for most editors). Never fails a build. Right-to-left text and the ordinary directional marks (U+200E / U+200F) are not reported. **Fix:** delete the character, or write it as an escape (`"\u202e"`, `"\r"`).
+
 ### `tyc::stdlib_module_shadow` — warning (v0.6.0, refined v0.7.0)
 
 A project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (`types`, `ast`, `string`, `io`, `json`, `dataclasses`, `logging`, `random`, `time`, …). The emitted `build/<name>.py` would land on `sys.path` and intercept transitive stdlib imports. Only fires for files at the top of the configured source directory (v0.7.0); nested files like `src/indexer/tokenize.ty` are exempt because they lower to `build/indexer/tokenize.py` which is NOT on `sys.path`.

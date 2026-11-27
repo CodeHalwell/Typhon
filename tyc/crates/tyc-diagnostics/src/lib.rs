@@ -800,6 +800,37 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A user name in the compiler's own `__typhon_` namespace.
+    #[error("`{name}` is in the `__typhon_` namespace, which is reserved for names the compiler generates")]
+    #[diagnostic(
+        code(tyc::reserved_name),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/reserved_name.md"),
+        help("rename it — the compiler emits helpers and temporaries under this prefix (`__typhon_checked_cast__`, `__typhon_freeze__`, …), and a user binding of the same name silently replaces them")
+    )]
+    ReservedName {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("reserved prefix")]
+        span: SourceSpan,
+    },
+
+    /// A character that makes source read differently from how it compiles.
+    #[error("{what}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::hidden_source_character),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/hidden_source_character.md"),
+        help("delete the character; if a string genuinely needs it, write it as an escape (`\\u202e`, `\\r`) so it is visible in the source")
+    )]
+    HiddenSourceCharacter {
+        what: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("here")]
+        span: SourceSpan,
+    },
+
     /// An `extend` declaration named a Python built-in type.
     #[error("{message}")]
     #[diagnostic(
@@ -2197,6 +2228,8 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::ReservedName { src, span, .. }
+            | Self::HiddenSourceCharacter { src, span, .. }
             | Self::RequiresNewerPython { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -2346,6 +2379,8 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::ReservedName { src, span, .. }
+            | Self::HiddenSourceCharacter { src, span, .. }
             | Self::RequiresNewerPython { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -3140,6 +3175,36 @@ impl TycError {
     ) -> Self {
         Self::StubMismatch {
             message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ReservedName`] error.
+    pub fn reserved_name(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ReservedName {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::HiddenSourceCharacter`] warning.
+    pub fn hidden_source_character(
+        what: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::HiddenSourceCharacter {
+            what: what.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
