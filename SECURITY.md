@@ -73,7 +73,7 @@ Three more things are worth knowing about what gets executed:
 - **A `.venv` in a parent directory is only used when it belongs to you.**
   Interpreter discovery walks up from the project to find a workspace-level
   environment. On Unix an environment found that way is ignored unless it is
-  owned by the same user as the project directory (or by root), so a project
+  owned by the user running `tyc` (or by root), so a project
   kept under a shared directory such as `/tmp` does not run an interpreter
   another local user left above it.
 - **`[python] target` must be a plain version** (`3.13`, `3.14t`, `3.15rc1`).

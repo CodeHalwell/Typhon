@@ -26,7 +26,7 @@ release pipeline and the installers. No language change.
   `./3.14post1/bin/python`. The target must now be a plain version, and the
   request passed to uv is rebuilt from the parsed numbers.
 - **A `.venv` in a parent directory is only used when it belongs to the
-  project's owner** (or root), on Unix. Previously the first `.venv` found
+  user running `tyc`** (or root), on Unix. Previously the first `.venv` found
   anywhere up to `/` supplied the interpreter that introspection runs.
 - **`tyc debug` and `tyc repl` ran their script from the shared temp
   directory**, which CPython puts first on `sys.path`: a `json.py` left in
@@ -49,6 +49,18 @@ release pipeline and the installers. No language change.
   `str.join`, `str.split` and list / tuple / dict literals are charged
   against the memory budget before they allocate — three small programs
   aborted `tyc check` with an allocation failure.
+
+- **`os.urandom` under `tyc run` reads the operating system's CSPRNG.** It
+  was filled from `RandomState` hashes, which are not cryptographic, so a key
+  or token made from it was weaker under the VM than under CPython.
+- **The language server does not import standard-library modules that act on
+  import.** `import venv.__main__` in a `.ty` file had a completion request
+  create a virtualenv; `__main__` submodules and the stdlib's demo and
+  test-runner packages are no longer introspected.
+- **Two panics on non-ASCII source are fixed**: the five-byte file `é"|>`
+  crashed `tyc check` and `tyc fmt`, and an `impl` target with a non-BMP
+  character panicked the language server's semantic-token pass. A comptime
+  f-string is charged against the memory budget like `+`.
 
 ### Release pipeline and packaging
 

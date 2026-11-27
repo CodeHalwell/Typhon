@@ -6595,21 +6595,19 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
         (
             "_fs_urandom",
             nf("_fs_urandom", |_i, args| {
-                use std::hash::{BuildHasher, Hasher};
                 let n = crate::limits::ssize_arg(single(&args, "urandom")?)?;
                 if n < 0 {
                     return Err(value_error("negative argument not allowed"));
                 }
                 let n = n as usize;
                 crate::limits::ensure_alloc(n)?;
-                let mut out = Vec::with_capacity(n);
-                while out.len() < n {
-                    let word = std::collections::hash_map::RandomState::new()
-                        .build_hasher()
-                        .finish();
-                    out.extend_from_slice(&word.to_le_bytes());
-                }
-                out.truncate(n);
+                // The kernel CSPRNG, as in CPython. Programs make keys and
+                // tokens from `os.urandom`; it used to be filled from
+                // `RandomState` hashes, which are not cryptographic.
+                let mut out = vec![0u8; n];
+                crate::os_random::fill(&mut out).map_err(|e| {
+                    os_error_unwind(5, &format!("cannot read OS randomness: {e}"), None, None)
+                })?;
                 Ok(Value::Bytes(Rc::new(out)))
             }),
         ),

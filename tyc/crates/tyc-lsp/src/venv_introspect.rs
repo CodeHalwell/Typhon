@@ -214,7 +214,7 @@ impl IntrospectionCache {
         // to run a stranger's module. Recorded as a plain miss (no failure
         // hint) so the editor shows no completions rather than an error.
         let top = module.split('.').next().unwrap_or(module);
-        if !may_introspect(&self.allowed_top_level, top) {
+        if !may_introspect(&self.allowed_top_level, top) || runs_code_on_import(module) {
             return None;
         }
         // Cache check — `None` value short-circuits repeated failures,
@@ -279,6 +279,27 @@ fn introspection_allow_list(project_root: &Path) -> HashSet<String> {
 /// **Declared dependencies** are allowed because declaring a package in
 /// `typhon.toml` is the act of consent. Everything else — including a module
 /// that merely happens to sit next to the file being edited — is refused.
+/// Modules whose *import* is an action rather than a definition, even in the
+/// standard library. `import venv.__main__` runs `venv.main()` — typed into
+/// a `.ty` file, it had the language server create a virtualenv on a
+/// completion request — and `antigravity` opens a web browser. A `__main__`
+/// submodule is an entry point by definition; the rest are the stdlib's own
+/// demo, test-runner and GUI packages.
+fn runs_code_on_import(module: &str) -> bool {
+    const SIDE_EFFECTING_TOP_LEVEL: &[&str] = &[
+        "antigravity",
+        "this",
+        "test",
+        "idlelib",
+        "turtledemo",
+        "__hello__",
+        "__phello__",
+    ];
+    let mut segments = module.split('.');
+    let top = segments.next().unwrap_or(module);
+    SIDE_EFFECTING_TOP_LEVEL.contains(&top) || module.split('.').any(|s| s == "__main__")
+}
+
 fn may_introspect(allowed: &HashSet<String>, top: &str) -> bool {
     tyc_analyse::perf::is_stdlib_top_level(top) || allowed.contains(top)
 }
@@ -663,6 +684,11 @@ mod tests {
         // asserted — a cache entry means we got past it).
         assert!(may_introspect(&cache.allowed_top_level, "rich"));
         assert!(may_introspect(&cache.allowed_top_level, "os"));
+        assert!(!runs_code_on_import("os.path"));
+        assert!(runs_code_on_import("venv.__main__"));
+        assert!(runs_code_on_import("json.tool.__main__"));
+        assert!(runs_code_on_import("antigravity"));
+        assert!(runs_code_on_import("test.autotest"));
         assert!(!may_introspect(
             &cache.allowed_top_level,
             "evil_local_module"

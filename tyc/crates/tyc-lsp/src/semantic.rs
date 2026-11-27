@@ -1167,7 +1167,11 @@ fn utf16_len_of_span(source: &str, start: usize, end: usize) -> u32 {
         return 0;
     }
     let end = end.min(source.len());
-    let slice = &source[start..end];
+    // Spans computed against a rewritten view of the source can land inside
+    // a multi-byte character; a span that does is not a token.
+    let Some(slice) = source.get(start..end) else {
+        return 0;
+    };
     slice.chars().map(|c| c.len_utf16() as u32).sum()
 }
 
@@ -1260,6 +1264,13 @@ fn byte_to_line_col(source: &str, offset: usize) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf16_len_of_span_tolerates_a_span_inside_a_character() {
+        // "𝒳" is four bytes; a span ending at byte 2 is not a token.
+        assert_eq!(utf16_len_of_span("a𝒳b", 1, 3), 0);
+        assert_eq!(utf16_len_of_span("a𝒳b", 1, 5), 2);
+    }
     use ruff_python_parser::parse_module;
     use tyc_resolve::{resolve_module_with, ResolveOptions};
     use tyc_syntax::preprocess::preprocess;

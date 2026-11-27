@@ -1950,7 +1950,12 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
                                         );
                                     }
                                     let v = eval_expr(&interp.expression, ctx)?;
-                                    out.push_str(&comptime_str(&v)?);
+                                    let rendered = comptime_str(&v)?;
+                                    // An interpolation copies its value, so
+                                    // `f"{s}{s}"` doubles exactly like `s + s`
+                                    // and is charged the same way.
+                                    ctx.charge_string(rendered.len())?;
+                                    out.push_str(&rendered);
                                 }
                             }
                         }

@@ -32,6 +32,7 @@ pub mod ffi;
 pub mod hashes;
 pub mod interp;
 pub mod limits;
+mod os_random;
 pub(crate) mod pydict;
 pub mod pyhash;
 pub mod pyset;
