@@ -118,7 +118,7 @@
     "package": "vsce package"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^11.0.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
