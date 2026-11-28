@@ -357,6 +357,18 @@ with tempfile.SpooledTemporaryFile(mode="w+", encoding="ascii", errors="ignore")
     s.write("B")
     s.seek(0)
     show(s._rolled, s.read())
+with tempfile.SpooledTemporaryFile(max_size=3, mode="w+", encoding="utf-8") as s:
+    # The threshold is in encoded bytes: two characters, four bytes.
+    s.write("\u00e9\u00e9")
+    show(s._rolled, s.tell())
+with tempfile.SpooledTemporaryFile(max_size=100, mode="w+", encoding="utf-8", newline="\r\n") as s:
+    # Newline translation happens once, and the cursor accounts for it.
+    s.write("a\n")
+    show(s.tell())
+    s.rollover()
+    s.write("X")
+    s.seek(0)
+    show(s.read())
 shutil.rmtree(d)
 show("cleaned", not os.path.exists(d))
 "#,

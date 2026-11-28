@@ -193,6 +193,24 @@ def TemporaryFile(mode="w+b", buffering=-1, encoding=None, newline=None, suffix=
     return NamedTemporaryFile(mode, buffering, encoding, newline, suffix, prefix, dir, True, errors=errors)
 
 
+class _SpoolText(io.TextIOWrapper):
+    """The in-memory half of a text-mode `SpooledTemporaryFile`.
+
+    CPython uses a `TextIOWrapper` over a `BytesIO`, so everything about
+    the spool is measured in *encoded bytes*: `tell()`, the `max_size`
+    threshold, and the cursor carried over at rollover — after newline
+    translation and under the spool's encoding. This is the same text
+    stream the VM uses for a real text file (so those all agree with the
+    file the spool becomes), with nothing to write back to.
+    """
+
+    def __init__(self, encoding, errors, newline):
+        io.TextIOWrapper.__init__(self, None, "w+", encoding or "utf-8", errors or "strict", newline, True, True, b"", False)
+
+    def flush(self):
+        self._check_closed()
+
+
 class SpooledTemporaryFile:
     """In memory until `max_size` is exceeded (or `fileno()` / `rollover()`
     is called), then a `TemporaryFile`."""
@@ -203,7 +221,7 @@ class SpooledTemporaryFile:
         if "b" in mode:
             self._file = io.BytesIO()
         else:
-            self._file = io.StringIO(newline=newline)
+            self._file = _SpoolText(encoding, errors, newline)
         self._max_size = max_size
         self._rolled = False
         self._mode = mode
@@ -224,20 +242,21 @@ class SpooledTemporaryFile:
         old = self._file
         buffering, suffix, prefix, dir = self._args
         new = TemporaryFile(self._mode, buffering, self._encoding, self._newline, suffix, prefix, dir, errors=self._errors)
-        pos = old.tell()
-        data = old.getvalue()
-        new.write(data)
-        if "b" not in self._mode:
-            # The in-memory text buffer counts characters; the file it
-            # becomes is positioned in encoded bytes. Carrying the character
-            # count over put the cursor inside the text after any multi-byte
-            # character, and the next write overwrote what was there.
-            # Encoded with the spool's own error policy (the text was
-            # accepted under it), and a cursor parked past the end keeps
-            # its distance from the end.
-            encoded = len(data[:pos].encode(self._encoding or "utf-8", self._errors or "strict"))
-            pos = encoded + max(0, pos - len(data))
-        new.seek(pos, 0)
+        if "b" in self._mode:
+            pos = old.tell()
+            new.write(old.getvalue())
+            new.seek(pos, 0)
+        else:
+            # Both halves are the same kind of text stream, so the buffer
+            # (already newline-translated) and the cursor move across as
+            # they are: no re-encoding, no second newline translation, and
+            # a cursor past the end stays where it was.
+            old._load()
+            inner = new.file
+            inner._load()
+            inner._buf = old._buf
+            inner._pos = old._pos
+            inner._dirty = True
         self._file = new
         self._rolled = True
 
