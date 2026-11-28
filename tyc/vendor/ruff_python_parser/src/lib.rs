@@ -69,7 +69,7 @@ pub use crate::error::{
     UnsupportedSyntaxError, UnsupportedSyntaxErrorKind,
 };
 pub use crate::parser::ParseOptions;
-pub use crate::parser::{MAX_INTERPOLATED_STRING_DEPTH, MAX_NESTING_DEPTH};
+pub use crate::parser::{MAX_BLOCK_DEPTH, MAX_INTERPOLATED_STRING_DEPTH, MAX_NESTING_DEPTH};
 
 use crate::parser::Parser;
 

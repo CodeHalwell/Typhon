@@ -66,12 +66,14 @@ Four source-level changes ride on top of the upstream code:
    parser now stops with an ordinary syntax error at
    `MAX_NESTING_DEPTH` (10,000) levels and at
    `MAX_INTERPOLATED_STRING_DEPTH` (1,000) f-/t-strings nested in one
-   another; both constants live in `ruff_python_parser/src/parser/mod.rs`
-   and are re-exported from the crate root.
+   another, and at `MAX_BLOCK_DEPTH` (500) nested indented blocks; the
+   constants live in `ruff_python_parser/src/parser/mod.rs` and are
+   re-exported from the crate root.
    - `Parser::enter_nesting` / `leave_nesting` bracket every recursion
      cycle: `parse_binary_expression_or_higher` (all operand, bracket,
      call-argument and unary nesting), the `lambda` body, the `else` of an
-     `if` expression, `parse_match_pattern_lhs`, and `parse_block`.
+     `if` expression, `parse_match_pattern_lhs`, and `parse_block` (which
+     also counts `Parser::block_depth` against `MAX_BLOCK_DEPTH`).
    - The left-deep chains built without recursion — the binary-operator
      loop, `parse_postfix_expression` (`a.b`, `f()`, `a[i]`) and
      `parse_attr_expr_for_match_pattern` — count their own levels with

@@ -19,8 +19,8 @@ use crate::token::TokenValue;
 use crate::token_set::TokenSet;
 use crate::{Mode, ParseErrorType, UnsupportedSyntaxErrorKind};
 
-use super::Parenthesized;
 use super::expression::ExpressionContext;
+use super::{MAX_BLOCK_DEPTH, Parenthesized};
 
 /// Tokens that represent compound statements.
 const COMPOUND_STMT_SET: TokenSet = TokenSet::new([
@@ -3140,12 +3140,18 @@ impl<'src> Parser<'src> {
     fn parse_block(&mut self) -> Vec<Stmt> {
         self.bump(TokenKind::Indent);
 
-        // Typhon: nested blocks count against `MAX_NESTING_DEPTH` too.
+        // Typhon: nested blocks count against `MAX_NESTING_DEPTH`, and have
+        // a much lower limit of their own (`MAX_BLOCK_DEPTH`).
         if !self.enter_nesting() {
             return Vec::new();
         }
+        self.block_depth += 1;
+        if self.block_depth > MAX_BLOCK_DEPTH {
+            self.report_blocks_too_deep();
+        }
         let statements =
             self.parse_list_into_vec(RecoveryContextKind::BlockStatements, Self::parse_statement);
+        self.block_depth -= 1;
         self.leave_nesting();
 
         self.expect(TokenKind::Dedent);

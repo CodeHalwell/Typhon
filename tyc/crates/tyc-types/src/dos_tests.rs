@@ -253,3 +253,162 @@ fn many_propagations_in_one_function() {
     let d = on_big_stack(|| check(&src));
     assert!(d.errors().is_empty(), "{:?}", messages(&d));
 }
+
+/// A snapshot shares every bucket of a scope, and a write after it copies
+/// the bucket list and the one bucket written — not the scope. With one map
+/// per scope, 5,000 `let v = g()?` lines deep-copied 5,000 bindings 5,000
+/// times (26 s).
+#[test]
+fn scope_writes_after_a_snapshot_copy_one_bucket() {
+    let binding = |name: String| TypeBinding {
+        name,
+        declared: Type::optional(Type::Int),
+        narrowed: Type::optional(Type::Int),
+        span: (0, 0),
+        from_unsafe: false,
+    };
+    let mut env = TypeEnv::default();
+    env.enter();
+    for i in 0..10_000 {
+        env.declare(binding(format!("v{i}")));
+    }
+    let snap = env.snapshot();
+    assert!(Scope::ptr_eq(&env.scopes[0], &snap.scopes[0]));
+
+    env.narrow("v42", Type::Int);
+    assert!(!Scope::ptr_eq(&env.scopes[0], &snap.scopes[0]));
+    let copied = env.scopes[0]
+        .buckets
+        .iter()
+        .zip(snap.scopes[0].buckets.iter())
+        .filter(|(live, saved)| !Rc::ptr_eq(live, saved))
+        .count();
+    assert_eq!(copied, 1, "one bucket un-shared by one narrowing");
+    assert_eq!(env.lookup("v42").map(|b| &b.narrowed), Some(&Type::Int));
+    assert_eq!(
+        snap.lookup("v42").map(|b| &b.narrowed),
+        Some(&Type::optional(Type::Int)),
+        "the snapshot is untouched"
+    );
+
+    env.declare(binding("fresh".to_owned()));
+    assert!(env.lookup("fresh").is_some() && snap.lookup("fresh").is_none());
+    assert_eq!(env.scopes[0].iter().count(), 10_001);
+    assert_eq!(snap.scopes[0].iter().count(), 10_000);
+
+    // A whole-scope rewrite that changes nothing un-shares nothing, and one
+    // that changes a binding restores exactly that binding.
+    let mut restored = env.clone();
+    restored.reset_narrowings_to(&env);
+    assert!(Scope::ptr_eq(&restored.scopes[0], &env.scopes[0]));
+    let mut restored = env.clone();
+    restored.reset_narrowings_to(&snap);
+    assert_eq!(
+        restored.lookup("v42").map(|b| &b.narrowed),
+        Some(&Type::optional(Type::Int))
+    );
+    assert!(
+        restored.lookup("fresh").is_some(),
+        "the binding set is kept"
+    );
+}
+
+/// Hundreds of statements that each declare and narrow (`guard`, `?`) in
+/// one function, end to end.
+#[test]
+fn many_guards_in_one_function() {
+    let mut src = String::from("def f(a: int?) -> int:\n");
+    for i in 0..400 {
+        src.push_str(&format!("    guard v{i} = a else: return {i}\n"));
+    }
+    src.push_str("    return v0 + v399\n");
+    let d = on_big_stack(|| check(&src));
+    assert!(d.errors().is_empty(), "{:?}", messages(&d));
+}
+
+/// `a | None | None | …` that is *not* a type union asked "is this a type
+/// union?" of every prefix of the chain, each answer walking that prefix.
+/// The answers for all prefixes now come from one walk, and they are the
+/// same answers.
+#[test]
+fn value_union_chain_is_linear_and_unchanged() {
+    let src = format!("import typing\nx = typing.Any{}\n", " | None".repeat(4000));
+    let _ = on_big_stack(|| check(&src));
+
+    // A type union of any shape is still one, however it is grouped …
+    let clean = "\
+class A:
+    pass
+
+t1 = int | None | str | bytes
+t2 = (int | None) | (str | A)
+t3 = list[int] | None | A
+";
+    let d = check(clean);
+    assert!(d.errors().is_empty(), "{:?}", messages(&d));
+    // … and a chain with a value in it is still checked as arithmetic, at
+    // every link.
+    let count = |src: &str| {
+        let d = check(src);
+        d.errors().len() + d.warnings().len()
+    };
+    let chain = "def f(a: int) -> None:\n    x = a | None | None | None\n";
+    let grouped = "def f(a: int) -> None:\n    x = ((a | None) | None) | None\n";
+    assert!(count(chain) > 0);
+    assert_eq!(count(chain), count(grouped));
+}
+
+/// A long method chain on a class: every call asked `infer_expr_readonly`
+/// for its receiver, which walked all the calls below it.
+#[test]
+fn long_method_chain_is_linear() {
+    let src = format!(
+        "class A:\n    def next(self) -> \"A\":\n        return self\n\ndef f(a: A) -> None:\n    print(a{})\n",
+        ".next()".repeat(3000)
+    );
+    let d = on_big_stack(|| check(&src));
+    assert!(d.errors().is_empty(), "{:?}", messages(&d));
+
+    // What the chain resolves to is unchanged by the shortcut: a method
+    // missing far down a long chain is still reported, on the right class.
+    let missing = format!(
+        "class A:\n    def next(self) -> \"A\":\n        return self\n\ndef f(a: A) -> None:\n    print(a{}.nope())\n",
+        ".next()".repeat(200)
+    );
+    let d = on_big_stack(|| check(&missing));
+    assert!(
+        d.errors().iter().any(|e| matches!(
+            e,
+            TycError::AttributeNotFound { attr, recv_type, .. } if attr == "nope" && recv_type == "A"
+        )),
+        "{:?}",
+        messages(&d)
+    );
+}
+
+/// The binding lookup behind `callables::origin` used to walk the module
+/// for every call; it must still find a callable's `def`, and follow an
+/// alias to it, wherever they are declared.
+#[test]
+fn callable_origin_lookup_still_resolves_definitions() {
+    let src = "\
+def scale(x: int, factor: int = 2) -> int:
+    return x * factor
+
+alias = scale
+
+def outer() -> int:
+    def inner(a: int, b: int) -> int:
+        return a + b
+    local = inner
+    return local(1, 2) + alias(3) + alias(3, 4) + scale(5)
+";
+    let d = check(src);
+    assert!(d.errors().is_empty(), "{:?}", messages(&d));
+    let bad = src.replace("alias(3, 4)", "alias(3, 4, 5)");
+    let d = check(&bad);
+    assert!(
+        !d.errors().is_empty(),
+        "too many arguments through an alias"
+    );
+}

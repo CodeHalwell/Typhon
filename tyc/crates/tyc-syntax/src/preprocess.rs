@@ -6603,7 +6603,8 @@ pub fn expand_sugar_mapped(source: &str, rewrite_lazy_imports: bool) -> (String,
         stage.1 = compose_line_maps(&map, &stage.1);
         stage.0 = text;
     }
-    let mut stage = expand_typed_let_unpack_mapped(source);
+    let defused = defuse_question_heavy_lines(source);
+    let mut stage = expand_typed_let_unpack_mapped(&defused);
     if rewrite_lazy_imports {
         step(&mut stage, expand_lazy_imports_mapped);
     } else {
@@ -7084,6 +7085,8 @@ pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
             identity_line_map(text_line_count(source)),
         );
     }
+    let defused = defuse_question_heavy_lines(source);
+    let source: &str = &defused;
     // Every pipeline runs this pass, so it is where a one-line compound
     // statement or a `;`-joined line carrying a `?` is split first (a no-op
     // when the compound-header rewrite already ran). The lift below places
@@ -7281,6 +7284,60 @@ fn flush_lifted_statement(
     for (k, l) in buffered.drain(..).enumerate() {
         out.mark(buf_start + k);
         out.push_str(&l);
+    }
+}
+
+/// Upper bound on (code `?` on a line) × (bytes in that line).
+///
+/// The `?` passes decide what each `?` means — nullable marker, optional
+/// chaining, propagation — by looking at the line around it, so a line costs
+/// them its `?` count times its length, and several of them do that once per
+/// operator they rewrite. `a?.b?.b…` with 10,000 links took over a minute.
+/// Fifty `?` on a 5 KB line come to 250,000; a 2,000-parameter signature of
+/// `x: int?` on one line to about 50 million.
+const MAX_QUESTION_LINE_WORK: usize = 1 << 26;
+
+/// Replace each line past [`MAX_QUESTION_LINE_WORK`] with a lone `$` — a
+/// token neither Python nor any later pass knows — so the file fails to
+/// parse *at that line* instead of having every `?` pass grind through it.
+/// The line count does not change, so line tables are unaffected.
+fn defuse_question_heavy_lines(source: &str) -> std::borrow::Cow<'_, str> {
+    // Cheap bound first: no line can cost more than every `?` in the file
+    // times the longest line. Almost every file stops here, with no lexing.
+    let total = source.bytes().filter(|b| *b == b'?').count();
+    if total == 0 {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let longest = source.split('\n').map(str::len).max().unwrap_or(0);
+    if total.saturating_mul(longest) <= MAX_QUESTION_LINE_WORK {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mask = LexMask::new(source);
+    let mut out: Option<String> = None;
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        // `?` in string text and comments are not operators.
+        let questions = line
+            .bytes()
+            .enumerate()
+            .filter(|(i, b)| *b == b'?' && mask.is_code(offset + i))
+            .count();
+        if questions.saturating_mul(line.len()) > MAX_QUESTION_LINE_WORK {
+            let text = out.get_or_insert_with(|| source[..offset].to_owned());
+            let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            text.push_str(&line[..indent]);
+            text.push('$');
+            if line.ends_with('\n') {
+                text.push('\n');
+            }
+        } else if let Some(text) = &mut out {
+            text.push_str(line);
+        }
+        offset += line.len();
+    }
+    match out {
+        Some(text) => std::borrow::Cow::Owned(text),
+        None => std::borrow::Cow::Borrowed(source),
     }
 }
 
@@ -10923,6 +10980,61 @@ mod tests {
         assert!(out.ends_with(")?\n"));
     }
 
+    /// A line whose `?` count times its length passes
+    /// `MAX_QUESTION_LINE_WORK` is replaced by a `$`, so the file is rejected
+    /// at that line; everything else — every real file — is passed through
+    /// untouched (and unlexed).
+    #[test]
+    fn question_heavy_lines_are_defused() {
+        let ordinary = "def f(a: int?, b: str?) -> int?:\n    return g(a)? + h(b)?\n";
+        assert!(matches!(
+            defuse_question_heavy_lines(ordinary),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // 2,000 nullable parameters on one line: big, but within the bound.
+        let params: Vec<String> = (0..2000).map(|i| format!("p{i}: int?")).collect();
+        let signature = format!("def f({}) -> None:\n    pass\n", params.join(", "));
+        assert_eq!(defuse_question_heavy_lines(&signature), signature);
+        // `?` in a string or a comment is text, however many there are.
+        let text = format!(
+            "x = 1\ns = \"{}\"  # {}\ny = f(x)?\n",
+            "?".repeat(20_000),
+            "?".repeat(20_000)
+        );
+        assert_eq!(defuse_question_heavy_lines(&text), text);
+
+        let chain = format!(
+            "class A:\n    b: \"A?\"\n\ndef main(a: A?) -> None:\n    print(a{})\n    return None\n",
+            "?.b".repeat(10_000)
+        );
+        let defused = defuse_question_heavy_lines(&chain);
+        assert_eq!(text_line_count(&defused), text_line_count(&chain));
+        let lines: Vec<&str> = defused.lines().collect();
+        assert_eq!(lines[4], "    $");
+        assert_eq!(lines[3], "def main(a: A?) -> None:");
+        assert_eq!(lines[5], "    return None");
+
+        // Through the whole chain: 10,000 links took over a minute.
+        let lowered = expand_and_preprocess_mapped(&chain, false);
+        let err = crate::parse_module(&lowered.python_source)
+            .expect_err("the defused line is a syntax error");
+        let line = lowered.python_source[..err.location.start().to_usize()]
+            .matches('\n')
+            .count();
+        assert_eq!(
+            lowered.line_map[line], 4,
+            "reported on the line that was too heavy"
+        );
+
+        // Fifty links are lowered exactly as before the cap existed.
+        let short = chain.replace(&"?.b".repeat(10_000), &"?.b".repeat(50));
+        assert!(matches!(
+            defuse_question_heavy_lines(&short),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(!expand_sugar(&short, false).contains('$'));
+    }
+
     /// Up to `MAX_INLINE_QUESTION_OPS_PER_LINE` inline `?` are lifted as
     /// before; a line with more becomes a syntax error instead of costing
     /// quadratic time here and in every pass over what it lowers to (5,000
@@ -10936,7 +11048,7 @@ mod tests {
         let (at_cap, _) =
             expand_inline_question_ops_mapped(&line(MAX_INLINE_QUESTION_OPS_PER_LINE));
         assert!(!at_cap.contains('$'));
-        let (many, _) = expand_inline_question_ops_mapped(&line(50_000));
+        let (many, _) = expand_inline_question_ops_mapped(&line(2_000));
         assert_eq!(
             many.matches("__typhon_Err__):").count(),
             MAX_INLINE_QUESTION_OPS_PER_LINE
@@ -10945,6 +11057,11 @@ mod tests {
         assert!(!many.contains("??"), "the tail is dropped, not passed on");
         let lowered = expand_question_ops(&many);
         assert!(crate::parse_module(&preprocess(&lowered).python_source).is_err());
+        // Far more than that and the line is not looked at at all (see
+        // `question_heavy_lines_are_defused`).
+        let (huge, _) = expand_inline_question_ops_mapped(&line(50_000));
+        assert_eq!(huge.matches("__typhon_Err__):").count(), 0);
+        assert!(huge.contains("    $\n"));
     }
 
     #[test]

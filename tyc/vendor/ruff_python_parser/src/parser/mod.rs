@@ -69,6 +69,9 @@ pub(crate) struct Parser<'src> {
 
     /// Typhon: how many f-/t-strings are open at the current token.
     interpolated_string_depth: u32,
+
+    /// Typhon: how many indented blocks are open at the current token.
+    block_depth: u32,
 }
 
 /// Typhon: the deepest nesting the parser accepts before it reports a syntax
@@ -87,6 +90,13 @@ pub const MAX_NESTING_DEPTH: u32 = 10_000;
 /// checkpoint copies, so parse time is quadratic in this depth; CPython stops
 /// at 150 (`MAXFSTRINGLEVEL`).
 pub const MAX_INTERPOLATED_STRING_DEPTH: u32 = 1000;
+
+/// Typhon: how deep indented blocks (`if`, `def`, `class`, `with`, `try`,
+/// `match` / `case`, loops) may nest. The statement walkers downstream keep
+/// per-block state that grows with the nesting — 2,000 nested `def`s took
+/// the type checker past 3.6 GB — and CPython stops at 100 ("too many levels
+/// of indentation").
+pub const MAX_BLOCK_DEPTH: u32 = 500;
 
 impl<'src> Parser<'src> {
     /// Create a new parser for the given source code.
@@ -115,6 +125,7 @@ impl<'src> Parser<'src> {
             nesting_depth: 0,
             nesting_high_water: 0,
             interpolated_string_depth: 0,
+            block_depth: 0,
         }
     }
 
@@ -310,6 +321,15 @@ impl<'src> Parser<'src> {
         self.report_too_deep(format!(
             "too many nested f-strings: at most \
              {MAX_INTERPOLATED_STRING_DEPTH} can be open at once"
+        ));
+    }
+
+    /// Typhon: report that blocks nest past [`MAX_BLOCK_DEPTH`] and discard
+    /// the rest of the input.
+    fn report_blocks_too_deep(&mut self) {
+        self.report_too_deep(format!(
+            "too many levels of indentation: blocks can nest at most \
+             {MAX_BLOCK_DEPTH} deep"
         ));
     }
 

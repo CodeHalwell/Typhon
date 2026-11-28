@@ -512,6 +512,43 @@ mod tests {
         });
     }
 
+    /// Indented blocks nest at most `MAX_BLOCK_DEPTH` deep. 2,000 nested
+    /// `def`s took the type checker past 3.6 GB; CPython stops at 100.
+    #[test]
+    fn block_nesting_has_its_own_limit() {
+        let limit = ruff_python_parser::MAX_BLOCK_DEPTH as usize;
+        let nest = |head: &str, depth: usize| {
+            let mut source = String::new();
+            for level in 0..depth {
+                source.push_str(&" ".repeat(level));
+                source.push_str(head);
+                source.push('\n');
+            }
+            source.push_str(&" ".repeat(depth));
+            source.push_str("pass\n");
+            source
+        };
+        on_big_stack(|| {
+            for head in [
+                "if True:",
+                "def f():",
+                "class C:",
+                "while x:",
+                "for i in xs:",
+            ] {
+                assert!(parse_module(&nest(head, 12)).is_ok(), "{head}");
+                assert!(parse_module(&nest(head, limit)).is_ok(), "{head}");
+                for depth in [limit + 1, 3000] {
+                    let message = nesting_error(&nest(head, depth));
+                    assert!(
+                        message.contains("too many levels of indentation"),
+                        "{head}: {message}"
+                    );
+                }
+            }
+        });
+    }
+
     /// The renderer panics on a column past `u16::MAX`; an error that far
     /// into a line is reported at a column it can print.
     #[test]
