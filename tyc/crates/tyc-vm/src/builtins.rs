@@ -6666,34 +6666,35 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     .map(|v| v.to_int())
                     .transpose()?
                     .unwrap_or(0o644);
-                #[cfg(any(
-                    target_os = "macos",
-                    target_os = "ios",
-                    target_os = "freebsd",
-                    target_os = "netbsd",
-                    target_os = "openbsd",
-                    target_os = "dragonfly"
-                ))]
+                #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                    // `fchmodat(…, AT_SYMLINK_NOFOLLOW)` is what CPython calls.
+                    // macOS and the BSDs change the link's mode; Linux
+                    // answers "not supported", which becomes `False`.
+                    let c_path = std::ffi::CString::new(path.as_bytes())
                         .map_err(|_| value_error("embedded null byte"))?;
                     // SAFETY: `c_path` is a valid NUL-terminated string that
-                    // outlives the call; `lchmod` reads it and nothing else.
-                    let rc = unsafe { libc::lchmod(c_path.as_ptr(), mode as libc::mode_t) };
-                    if rc != 0 {
-                        return Err(fs_unwind(&display, std::io::Error::last_os_error()));
+                    // outlives the call, which reads it and nothing else.
+                    let rc = unsafe {
+                        libc::fchmodat(
+                            libc::AT_FDCWD,
+                            c_path.as_ptr(),
+                            mode as libc::mode_t,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    if rc == 0 {
+                        return Ok(Value::Bool(true));
                     }
-                    Ok(Value::Bool(true))
+                    let err = std::io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP => {
+                            Ok(Value::Bool(false))
+                        }
+                        _ => Err(fs_unwind(&display, err)),
+                    }
                 }
-                #[cfg(not(any(
-                    target_os = "macos",
-                    target_os = "ios",
-                    target_os = "freebsd",
-                    target_os = "netbsd",
-                    target_os = "openbsd",
-                    target_os = "dragonfly"
-                )))]
+                #[cfg(not(unix))]
                 {
                     let _ = (path, display, mode);
                     Ok(Value::Bool(false))
@@ -8550,7 +8551,7 @@ fn make_re_module() -> Value {
         let mut out = String::new();
         let mut last = 0usize;
         let mut n = 0usize;
-        for caps in re.captures_all(s, 0) {
+        for caps in re.captures_up_to(s, 0, count) {
             if count != 0 && n >= count {
                 break;
             }
@@ -8578,7 +8579,7 @@ fn make_re_module() -> Value {
         let ngroups = re.captures_len().saturating_sub(1);
         let mut out: Vec<Value> = Vec::new();
         let mut last = 0usize;
-        for (n, caps) in re.captures_all(s, 0).into_iter().enumerate() {
+        for (n, caps) in re.captures_up_to(s, 0, maxsplit).into_iter().enumerate() {
             if maxsplit != 0 && n >= maxsplit {
                 break;
             }

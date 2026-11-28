@@ -1195,6 +1195,9 @@ pub(crate) fn python_target_u8(target: &str) -> Option<(u8, u8)> {
 /// `tyc::requires_newer_python` for `tyc build`, which does not run
 /// the editor-lint pass `tyc check` reports it from. See
 /// [`tyc_analyse::target_version_diagnostics`].
+/// How many findings of one kind [`check_source_hygiene`] reports per file.
+const MAX_HYGIENE_REPORTS: usize = 20;
+
 /// Bidirectional-control characters: embeddings, overrides and isolates.
 /// They reorder how the surrounding text is *displayed* without changing the
 /// order the compiler reads it in ("Trojan Source", CVE-2021-42574), so a
@@ -1218,9 +1221,17 @@ pub(crate) fn check_source_hygiene(path: &str, source: &str) -> Diagnostics {
     use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
     let mut diags = Diagnostics::new();
 
+    // Every diagnostic carries its own copy of the source, so reporting each
+    // of 50,000 control characters in a 150 KB comment held 7.5 GB. The first
+    // few of each kind are enough to find and fix the file.
+    let (mut bidi, mut returns, mut reserved) = (0usize, 0usize, 0usize);
     let bytes = source.as_bytes();
     for (offset, c) in source.char_indices() {
         if is_bidi_control(c) {
+            bidi += 1;
+            if bidi > MAX_HYGIENE_REPORTS {
+                continue;
+            }
             diags.push_warning(TycError::hidden_source_character(
                 format!(
                     "bidirectional control character U+{:04X}: the text around it is \
@@ -1233,6 +1244,10 @@ pub(crate) fn check_source_hygiene(path: &str, source: &str) -> Diagnostics {
                 c.len_utf8(),
             ));
         } else if c == '\r' && bytes.get(offset + 1) != Some(&b'\n') {
+            returns += 1;
+            if returns > MAX_HYGIENE_REPORTS {
+                continue;
+            }
             diags.push_warning(TycError::hidden_source_character(
                 "carriage return that is not part of a CRLF line ending: Python starts a \
                  new line here, but most editors show the text after it on the same line",
@@ -1267,7 +1282,8 @@ pub(crate) fn check_source_hygiene(path: &str, source: &str) -> Diagnostics {
                     kinds.get(start),
                     Some(ByteKind::Code | ByteKind::FStringExpr)
                 );
-                if starts_a_name && is_code {
+                if starts_a_name && is_code && reserved < MAX_HYGIENE_REPORTS {
+                    reserved += 1;
                     diags.push_error(TycError::reserved_name(
                         &text[start..end],
                         path,
@@ -1297,6 +1313,9 @@ fn lone_surrogate_escapes(path: &str, source: &str, diags: &mut Diagnostics) {
     // Whether the string being scanned decodes `\\u` escapes at all (a raw or
     // bytes literal does not); carried across the lines of a multi-line one.
     let mut decodes = true;
+    // The same, for the f-string whose replacement field we may be inside.
+    let mut outer_decodes = true;
+    let mut reported = 0usize;
     let mut previous = ByteKind::Code;
     for line in source.split_inclusive('\n') {
         let text = line.trim_end_matches(['\n', '\r']);
@@ -1324,6 +1343,18 @@ fn lone_surrogate_escapes(path: &str, source: &str, diags: &mut Diagnostics) {
                 decodes = !prefix
                     .bytes()
                     .any(|b| matches!(b.to_ascii_lowercase(), b'r' | b'b'));
+                outer_decodes = decodes;
+            } else if previous == ByteKind::FStringExpr {
+                // String text reached from inside a replacement field is
+                // either the enclosing f-string resuming after the field's
+                // `}`, or a literal nested in the field (`f"{r'\\ud800'}"`).
+                // A nested literal has a prefix of its own that this scan
+                // does not track, so it is not judged at all: missing a real
+                // escape there is better than rejecting a raw string.
+                // (The field's closing brace is classified with the string
+                // in some positions and with the field in others.)
+                let resumes_outer = bytes[i] == b'}' || (i > 0 && bytes[i - 1] == b'}');
+                decodes = resumes_outer && outer_decodes;
             }
             previous = kind;
             if bytes[i] != b'\\' {
@@ -1341,9 +1372,15 @@ fn lone_surrogate_escapes(path: &str, source: &str, diags: &mut Diagnostics) {
             let end = i + 2 + digits;
             let in_this_string =
                 end <= bytes.len() && kinds[i..end].iter().all(|k| *k == ByteKind::StringText);
-            if decodes && in_this_string {
-                if let Ok(cp) = u32::from_str_radix(&text[i + 2..end], 16) {
-                    if (0xD800..=0xDFFF).contains(&cp) {
+            // `get`, not indexing: a malformed escape such as `"\\u123é"` puts
+            // `end` inside a multi-byte character.
+            let hex = text
+                .get(i + 2..end)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+            if let (true, true, Some(hex)) = (decodes, in_this_string, hex) {
+                if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                    if (0xD800..=0xDFFF).contains(&cp) && reported < MAX_HYGIENE_REPORTS {
+                        reported += 1;
                         diags.push_error(TycError::parse(
                             path,
                             source,
@@ -1550,6 +1587,24 @@ mod tests {
         assert_eq!(errs("s: str = \"\\\\ud800\"\n"), 0);
         assert_eq!(errs("x: int = 1  # \\ud800\n"), 0);
         assert_eq!(errs("s: str = \"\\u00e9 \\U0001F600 \\n\"\n"), 0);
+        // A raw or bytes literal nested in an f-string field has its own
+        // prefix; the enclosing f-string's text is still checked.
+        assert_eq!(errs("s: str = f\"{r'\\ud800'}\"\n"), 0);
+        assert_eq!(errs("s: str = f\"{len(b'\\ud800')}\"\n"), 0);
+        assert_eq!(errs("s: str = f\"{n}\\ud800{r'\\ud800'}\"\n"), 1);
+        // A malformed escape running into a multi-byte character is the
+        // parser's to report, not a panic here.
+        assert_eq!(errs("s: str = \"\\u123\u{e9}\"\n"), 0);
+        assert_eq!(errs("s: str = \"\\U0000d83\u{e9}\"\n"), 0);
+    }
+
+    #[test]
+    fn hygiene_findings_are_capped_per_file() {
+        let many = format!("# {}\n", "\u{202E}".repeat(5_000));
+        assert_eq!(
+            check_source_hygiene("t.ty", &many).warnings().len(),
+            MAX_HYGIENE_REPORTS
+        );
     }
 
     #[test]

@@ -1520,6 +1520,13 @@ pub fn set_comptime_env_policy(policy: ComptimeEnvPolicy) {
     }
 }
 
+/// Install the policy for the calling thread only — for a process that
+/// serves several projects (the language server), where a process-wide
+/// value would let one project's `[env] allow` list apply to another's file.
+pub fn set_comptime_env_policy_for_thread(policy: ComptimeEnvPolicy) {
+    THREAD_COMPTIME_ENV_POLICY.with(|slot| *slot.borrow_mut() = Some(policy));
+}
+
 fn comptime_env_policy() -> ComptimeEnvPolicy {
     THREAD_COMPTIME_ENV_POLICY
         .with(|slot| slot.borrow().clone())
@@ -3641,9 +3648,9 @@ comptime def grow(s: str, n: int) -> str:
     /// usually `env(...)`, and the diagnostic goes to the terminal and CI log.
     #[test]
     fn unparsable_number_does_not_echo_the_value() {
-        let msg = unparsable_number("wJalrXUtnFEMI", "int");
-        assert!(!msg.contains("wJalrXUtnFEMI"), "{msg}");
-        assert!(msg.contains("13-character"), "{msg}");
+        let msg = unparsable_number("placeholder-xyz", "int");
+        assert!(!msg.contains("placeholder-xyz"), "{msg}");
+        assert!(msg.contains("15-character"), "{msg}");
     }
 
     #[test]
@@ -3717,7 +3724,10 @@ comptime def grow(s: str, n: int) -> str:
     #[test]
     fn comptime_env_refuses_credential_named_variables_by_default() {
         let _guard = lock_env();
-        std::env::set_var("TYPHON_T_AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMIK7MDENG");
+        std::env::set_var(
+            "TYPHON_T_AWS_SECRET_ACCESS_KEY",
+            "typhon-test-placeholder-value",
+        );
         let deny = ComptimeEnvPolicy::default();
         for src in [
             "comptime let REGION: str = env(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\", \"\")\n",
@@ -3730,7 +3740,10 @@ comptime def grow(s: str, n: int) -> str:
             assert!(diags.has_errors(), "must be refused:\n{src}");
             assert!(values.is_empty(), "nothing may be inlined:\n{src}");
             let rendered = format!("{:?}", diags.errors());
-            assert!(!rendered.contains("wJalrXUtnFEMIK7MDENG"), "{rendered}");
+            assert!(
+                !rendered.contains("typhon-test-placeholder-value"),
+                "{rendered}"
+            );
         }
         std::env::remove_var("TYPHON_T_AWS_SECRET_ACCESS_KEY");
     }

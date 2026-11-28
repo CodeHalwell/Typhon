@@ -255,15 +255,34 @@ impl PyRe {
     /// written (`$` at the very end), and the pattern over the haystack
     /// without its final newline (`$` just before it); the leftmost wins.
     pub fn captures_at<'h>(&self, hay: &'h str, pos: usize) -> Option<Captures<'h>> {
+        self.captures_at_in(hay, pos, self.classify(hay))
+    }
+
+    /// Which of the three `$` strategies `hay` needs. It depends only on
+    /// the haystack, so a caller making many searches over one haystack
+    /// works it out once: re-scanning for an interior newline on every
+    /// match made `findall("a|$", "a" * n + "\n")` quadratic.
+    fn classify(&self, hay: &str) -> Dollar {
         if !self.parts.dollar || !hay.ends_with('\n') {
-            return self.re.captures_at(hay, pos);
+            Dollar::Plain
+        } else if hay[..hay.len() - 1].contains('\n') {
+            Dollar::Compare
+        } else {
+            Dollar::LineMode
+        }
+    }
+
+    fn captures_at_in<'h>(&self, hay: &'h str, pos: usize, dollar: Dollar) -> Option<Captures<'h>> {
+        match dollar {
+            Dollar::Plain => return self.re.captures_at(hay, pos),
+            Dollar::LineMode => {
+                return self
+                    .variant(&self.line, || self.parts.line.clone())
+                    .captures_at(hay, pos)
+            }
+            Dollar::Compare => {}
         }
         let head = &hay[..hay.len() - 1];
-        if !head.contains('\n') {
-            return self
-                .variant(&self.line, || self.parts.line.clone())
-                .captures_at(hay, pos);
-        }
         let at_end = self.re.captures_at(hay, pos);
         if pos > head.len() {
             return at_end;
@@ -313,11 +332,20 @@ impl PyRe {
     /// `sub` / `split` walk them: the next search starts where the last
     /// match ended, and an empty match is not repeated at the same place.
     pub fn captures_all<'h>(&self, hay: &'h str, pos: usize) -> Vec<Captures<'h>> {
+        self.captures_up_to(hay, pos, 0)
+    }
+
+    /// [`Self::captures_all`], stopping after `limit` matches (`0` means no
+    /// limit) — `sub(count=…)` and `split(maxsplit=…)` need only that many,
+    /// and `sub("a", "b", "a" * 10**7, count=1)` must not collect ten
+    /// million matches to use one.
+    pub fn captures_up_to<'h>(&self, hay: &'h str, pos: usize, limit: usize) -> Vec<Captures<'h>> {
+        let dollar = self.classify(hay);
         let mut out = Vec::new();
         let mut at = pos;
         let mut last_empty: Option<usize> = None;
-        while at <= hay.len() {
-            let Some(caps) = self.captures_at(hay, at) else {
+        while at <= hay.len() && (limit == 0 || out.len() < limit) {
+            let Some(caps) = self.captures_at_in(hay, at, dollar) else {
                 break;
             };
             let Some(whole) = caps.get(0) else {
@@ -339,6 +367,17 @@ impl PyRe {
         }
         out
     }
+}
+
+/// How `$` is matched for one haystack; see [`PyRe::classify`].
+#[derive(Clone, Copy)]
+enum Dollar {
+    /// The pattern has no `$`, or the haystack does not end in a newline.
+    Plain,
+    /// The haystack's only newline is its last character: `(?m:$)`.
+    LineMode,
+    /// Interior newlines and a final one: two searches, leftmost wins.
+    Compare,
 }
 
 #[cfg(test)]
@@ -388,6 +427,28 @@ mod tests {
         assert_eq!(span(re("b|bc").fullmatch_at("abc", 1)), Some((1, 3)));
         // The preferred alternative still wins for `match`.
         assert_eq!(span(re("x*|xy").match_at("xy", 0)), Some((0, 1)));
+    }
+
+    /// A bounded operation collects only the matches it will use, and many
+    /// matches over one haystack classify it once (both were quadratic or
+    /// worse: `sub(count=1)` over ten million matches, `findall("a|$", …)`).
+    #[test]
+    fn bounded_and_repeated_matching_stay_linear() {
+        let hay = "a".repeat(2_000_000);
+        assert_eq!(re("a").captures_up_to(&hay, 0, 1).len(), 1);
+        assert_eq!(re("a").captures_up_to(&hay, 0, 3).len(), 3);
+        assert_eq!(re("a").captures_up_to("aaaa", 0, 0).len(), 4);
+
+        let mut line = "a".repeat(200_000);
+        line.push('\n');
+        let started = std::time::Instant::now();
+        // 200,000 `a` matches, then `$` before the newline and at the end.
+        assert_eq!(re("a|$").captures_all(&line, 0).len(), 200_002);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

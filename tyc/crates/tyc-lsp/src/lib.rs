@@ -749,6 +749,14 @@ impl Backend {
         let text_for_check = text.clone();
         let generations = Arc::clone(&self.check_generations);
         let result = tokio::task::spawn_blocking(move || {
+            // The editor evaluates `comptime` too. The policy is installed
+            // here, on the thread that runs this check and for this file's
+            // project: a pool thread serves many projects, and one opened
+            // earlier must neither lend its `[env] allow` list to this file
+            // nor withhold this project's own.
+            tyc_analyse::set_comptime_env_policy_for_thread(project_env_policy(
+                workspace.as_ref().map(|(root, _)| root.as_path()),
+            ));
             let still_current = || generation_is_current(&generations, &uri_str_for_check, gen);
             let db_arc = db;
             // Phase 1, under the db lock: register the project's inputs and
@@ -2580,6 +2588,24 @@ enum WorkspaceLookup {
 /// rejects exactly what `tyc check` does. In particular an absolute or `..`
 /// `[project] src` is refused instead of walked (W4-08) — `src = "/"` used to
 /// walk the whole filesystem on every keystroke.
+/// The `comptime env()` policy of the project rooted at `root` (see
+/// [`tyc_analyse::ComptimeEnvPolicy`]); the default — credential-named
+/// variables refused — when there is no project or its config is invalid.
+fn project_env_policy(root: Option<&std::path::Path>) -> tyc_analyse::ComptimeEnvPolicy {
+    let Some(config) = root
+        .and_then(|root| tyc_venv::config::TyphonConfig::load_file(&root.join("typhon.toml")).ok())
+    else {
+        return tyc_analyse::ComptimeEnvPolicy::default();
+    };
+    let mut allowed = config.env.allow.clone();
+    allowed.extend(config.env.required.iter().cloned());
+    tyc_analyse::ComptimeEnvPolicy {
+        allow_credentials: config.strictness.allow_secret_comptime,
+        allowed,
+        strict: config.env.strict,
+    }
+}
+
 fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
     let Some(parent) = file_path.parent() else {
         return WorkspaceLookup::None;
@@ -2590,16 +2616,6 @@ fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
         if candidate.exists() {
             return match tyc_venv::config::TyphonConfig::load_file(&candidate) {
                 Ok(config) => {
-                    // The editor evaluates `comptime` too: apply this
-                    // project's `[env] allow` list (see
-                    // `tyc_analyse::ComptimeEnvPolicy`).
-                    let mut allowed = config.env.allow.clone();
-                    allowed.extend(config.env.required.iter().cloned());
-                    tyc_analyse::set_comptime_env_policy(tyc_analyse::ComptimeEnvPolicy {
-                        allow_credentials: config.strictness.allow_secret_comptime,
-                        allowed,
-                        strict: config.env.strict,
-                    });
                     let src_dir = dir.join(&config.project.src);
                     WorkspaceLookup::Project(dir, src_dir)
                 }

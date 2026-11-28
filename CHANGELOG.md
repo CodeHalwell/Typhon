@@ -133,6 +133,14 @@ release pipeline and the installers. No language change.
   (`tyc run`: 12 s instead of over 90).
 - `os.chmod(link, follow_symlinks=False)` under the VM changes the link's
   own mode on macOS and the BSDs, as CPython does.
+- Review follow-ups: the lone-surrogate check no longer rejects a raw or
+  bytes literal nested in an f-string field and no longer panics on a
+  malformed escape followed by a multi-byte character; source-hygiene
+  findings are capped at 20 of each kind per file (each carried a copy of
+  the source); the language server installs a project's `comptime env()`
+  policy on the thread that checks it; VM `re.sub(count=…)` /
+  `re.split(maxsplit=…)` stop matching at the limit, and many matches over
+  one haystack no longer re-scan it for newlines.
 - `deny.toml` treats a yanked crate as an error.
 
 ### Release pipeline and packaging
