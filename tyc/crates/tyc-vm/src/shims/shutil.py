@@ -151,6 +151,14 @@ def rmtree(path, ignore_errors=False, onerror=None, *, onexc=None, dir_fd=None):
         # call underneath reports the plain `'x'`.
         handle(os.lstat, path, OSError(e.errno, e.strerror, path))
         return
+    if (st.st_mode & 0o170000) == 0o120000:
+        # A symlink is never traversed, even one that points at a directory:
+        # `rmtree` would delete the contents of whatever it leads to.
+        try:
+            raise OSError("Cannot call rmtree on a symbolic link")
+        except OSError as e:
+            handle(os.path.islink, path, e)
+        return
     if (st.st_mode & 0o170000) != 0o040000:
         try:
             raise NotADirectoryError(20, "Not a directory", _fspath(path))

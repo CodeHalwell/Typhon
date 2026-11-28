@@ -285,6 +285,7 @@ impl VenvSignatures {
         // shared (shadowable) directory. The modules stay uncached, so they
         // surface through the `unintrospectable-dependency` warning instead
         // of silently passing unchecked.
+        ScratchDir::revalidate(&mut self.scratch);
         let Some(scratch) = self.scratch.as_ref() else {
             return;
         };
@@ -529,6 +530,43 @@ impl ScratchDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether the path is still the private directory this process made:
+    /// a real directory (not a link), owned by this user, mode `0700`.
+    fn still_private(&self) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        if !meta.is_dir() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            meta.uid() == me && meta.permissions().mode() & 0o077 == 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    /// Check the directory before each use and replace it if it is no longer
+    /// ours. A language server lives for days; a temp-directory reaper can
+    /// remove the (empty, never-touched) directory in that time, and its
+    /// name is visible to every local user, who could then recreate it with
+    /// a `json.py` inside for the next introspection run to import.
+    pub fn revalidate(slot: &mut Option<ScratchDir>) {
+        if slot.as_ref().is_some_and(|dir| !dir.still_private()) {
+            // Not ours any more: do not delete whatever now sits at the path.
+            if let Some(stale) = slot.take() {
+                std::mem::forget(stale);
+            }
+            *slot = ScratchDir::new();
+        }
+    }
 }
 
 impl Drop for ScratchDir {
@@ -536,6 +574,9 @@ impl Drop for ScratchDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+/// Longest annotation text [`annotation_to_type`] will parse.
+const MAX_ANNOTATION_LEN: usize = 2048;
 
 /// Embedded Python helper. Reads one or more dotted module names from
 /// `sys.argv[1:]`, imports each, and prints a single JSON object
@@ -910,6 +951,7 @@ fn introspect_batch_via_python(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    own_process_group(&mut cmd);
     // Retry transient spawn failures once. fork() can fail with EAGAIN
     // under CI fork pressure (parallel tests, container PID limits),
     // and a silent None here would cache the module as a miss for the
@@ -932,7 +974,8 @@ fn introspect_batch_via_python(
     // than a single-module response, so the dedicated reader matters
     // more here.
     let stdout = child.stdout.take()?;
-    let drainer = std::thread::spawn(move || -> Vec<u8> {
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         // Cap the read: a hostile (or merely chatty) dependency that writes to
         // stdout at pipe speed for the whole timeout window would otherwise
         // fill RAM. Introspection output is a few KB of JSON; 32 MiB is vast
@@ -941,7 +984,7 @@ fn introspect_batch_via_python(
         const CAP: u64 = 32 * 1024 * 1024;
         let mut buf = Vec::with_capacity(64 * 1024);
         let _ = std::io::Read::take(stdout, CAP).read_to_end(&mut buf);
-        buf
+        let _ = drained_tx.send(buf);
     });
     // 5 s startup baseline + 1 s per module in the batch. Generous
     // enough that even a ten-module batch with a slow
@@ -955,20 +998,78 @@ fn introspect_batch_via_python(
             Some(status) => break status.success(),
             None => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_group(&mut child);
                     break false;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     };
-    let bytes = drainer.join().ok()?;
     if !success {
+        // The reader thread is left to finish on its own: it ends when the
+        // last holder of the pipe exits, which `kill_process_group` has
+        // just arranged.
+        kill_process_group(&mut child);
         return None;
     }
+    let bytes = collect_drained(&drained_rx, &mut child)?;
     let text = std::str::from_utf8(&bytes).ok()?;
     serde_json::from_str(text.trim()).ok()
+}
+
+/// Run the interpreter as the leader of a new process group, so that
+/// [`kill_process_group`] reaches everything an imported package started.
+pub fn own_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+/// Kill an introspection child *and its descendants*, then reap it.
+///
+/// `Child::kill` signals one process. A dependency whose import starts a
+/// subprocess leaves that grandchild holding the stdout pipe, so the reader
+/// waited on it for as long as it lived — `sleep infinity` made `tyc check`
+/// and the language server hang forever, well past the documented timeout.
+/// The child was spawned with [`own_process_group`], so the whole group is
+/// signalled.
+pub fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            if pid > 1 {
+                // SAFETY: `kill` only sends a signal; a negative pid names
+                // the process group this child was made the leader of.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The bytes the reader thread collected, waiting only briefly for it.
+///
+/// The interpreter has exited, so its output is complete as soon as the pipe
+/// closes. If something it started is still holding the pipe open, the group
+/// is killed rather than waited for.
+pub fn collect_drained(
+    drained: &std::sync::mpsc::Receiver<Vec<u8>>,
+    child: &mut std::process::Child,
+) -> Option<Vec<u8>> {
+    match drained.recv_timeout(Duration::from_secs(2)) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            kill_process_group(child);
+            drained.recv_timeout(Duration::from_secs(2)).ok()
+        }
+    }
 }
 
 /// Convert an introspection result into the [`ModuleShapes`] form the
@@ -1189,6 +1290,14 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
 /// only ever *add* true positives; it never rejects valid code on a shape
 /// we can't represent.
 fn annotation_to_type(ann: &str) -> Type {
+    // The text comes from a dependency's own annotations. Real ones are tens
+    // of characters; a package returning 100 KB of nested `list[list[…` made
+    // this (recursive, re-scanning) parser run for minutes. Anything that
+    // long degrades to the permissive `Unknown`, like every other shape the
+    // checker does not model.
+    if ann.len() > MAX_ANNOTATION_LEN {
+        return Type::Unknown;
+    }
     let mut s = ann.trim();
     // Unwrap the `<class 'X'>` form that `str(type_object)` produces.
     if let Some(inner) = s

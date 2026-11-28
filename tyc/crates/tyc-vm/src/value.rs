@@ -2626,6 +2626,85 @@ pub enum IterState {
     },
 }
 
+impl IterState {
+    /// An exhausted leaf: what a state moved out for dropping leaves behind.
+    const fn spent() -> IterState {
+        IterState::Range {
+            current: 0,
+            stop: 0,
+            step: 1,
+        }
+    }
+}
+
+/// How many iterator drops may nest before the rest of a chain is deferred.
+const DROP_NESTING_LIMIT: usize = 48;
+
+thread_local! {
+    /// How many `IterState` drops are running on this thread's stack.
+    static DROP_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Set just before a state taken out by `IterState::drop` is dropped
+    /// for its fields alone.
+    static DROP_FIELDS_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// States met past the nesting limit, dropped by the outermost drop.
+    static DROP_DEFERRED: RefCell<Vec<IterState>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A chain of iterators — `g = (x for x in g)`, `it = map(f, it)` or a
+/// generator wrapping a generator, built in a loop — is a linked list as
+/// deep as the loop ran, and the derived drop recurses once per link:
+/// a few million links overflow the native stack (SIGABRT) when the chain
+/// is released. CPython frees such a chain with its "trashcan", and this is
+/// the same idea: past a nesting limit a state is parked on a list instead
+/// of being dropped in place, and the outermost drop empties the list in a
+/// loop. Whatever sits between two iterators of the chain (a generator's
+/// scope, a list, a closure) is dropped normally; only the iterator links
+/// are cut.
+impl Drop for IterState {
+    fn drop(&mut self) {
+        // Leaves own nothing that can lead back to an iterator.
+        if matches!(self, IterState::Range { .. } | IterState::Str { .. }) {
+            return;
+        }
+        // The second visit of a state this function moved out below: let
+        // the compiler-generated glue drop its fields.
+        if DROP_FIELDS_ONLY.try_with(|f| f.replace(false)) != Ok(false) {
+            return;
+        }
+        let Ok(depth) = DROP_DEPTH.try_with(Cell::get) else {
+            return;
+        };
+        let state = std::mem::replace(self, IterState::spent());
+        if depth >= DROP_NESTING_LIMIT {
+            let mut slot = Some(state);
+            let _ = DROP_DEFERRED.try_with(|d| {
+                if let (Ok(mut d), Some(state)) = (d.try_borrow_mut(), slot.take()) {
+                    d.push(state);
+                }
+            });
+            if let Some(state) = slot {
+                // The list is unavailable (thread teardown): drop in place,
+                // recursively, as the derived drop would.
+                let _ = DROP_FIELDS_ONLY.try_with(|f| f.set(true));
+                drop(state);
+            }
+            return;
+        }
+        DROP_DEPTH.with(|d| d.set(depth + 1));
+        DROP_FIELDS_ONLY.with(|f| f.set(true));
+        drop(state);
+        if depth == 0 {
+            // Each parked state is dropped at nesting depth one, so its own
+            // chain parks again rather than recursing.
+            while let Some(next) = DROP_DEFERRED.with(|d| d.borrow_mut().pop()) {
+                DROP_FIELDS_ONLY.with(|f| f.set(true));
+                drop(next);
+            }
+        }
+        DROP_DEPTH.with(|d| d.set(depth));
+    }
+}
+
 /// The `type(it).__name__` CPython reports for an iterator of this shape.
 pub fn iter_type_name(state: &IterState) -> &'static str {
     match state {
@@ -4057,6 +4136,32 @@ pub fn class_is_pydantic_model(class: &Class) -> bool {
         .class_attrs
         .borrow()
         .contains_key("__typhon_pydantic_model__")
+}
+
+/// What a pydantic `model` does with keyword arguments that name no field:
+/// the `extra` entry (`"forbid"`, `"ignore"` or `"allow"`) of the nearest
+/// `model_config` along the MRO, or `None` when that config does not set it.
+/// `model_config` is a `ConfigDict(...)` call or a dict literal — a dict
+/// either way.
+///
+/// Only the nearest config is consulted: every `model` gets a `model_config`
+/// (the lowering injects one where the source has none), and the build
+/// merges the project's `[emit] model-extra` into a config that omits
+/// `extra`, so an omitted `extra` means that setting, not the parent's.
+pub fn pydantic_model_extra(class: &Rc<Class>) -> Option<String> {
+    let config = std::iter::once(class)
+        .chain(class.mro.iter())
+        .find_map(|c| match c.class_attrs.borrow().get("model_config") {
+            Some(Value::Dict(config)) => Some(Rc::clone(config)),
+            _ => None,
+        })?;
+    let config = config.borrow();
+    config.iter().find_map(|(k, v)| match (k, v) {
+        (HashKey::Str(key), Value::Str(policy)) if key.as_str() == "extra" => {
+            Some((**policy).clone())
+        }
+        _ => None,
+    })
 }
 
 /// Whether `@dataclass` decorated `class` itself (not just an ancestor), so

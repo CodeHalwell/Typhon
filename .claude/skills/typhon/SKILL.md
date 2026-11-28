@@ -1345,6 +1345,8 @@ SHIPS_AUTH: bool = True
 
 `tyc::contains_secret_literal` (warn) fires in two places, both silenced by `[strictness] allow-secret-comptime`: `tyc check` flags a binding initialised from a bare string literal whose name names a credential (`API_KEY = "sk-…"`), and `tyc build` flags a `comptime let` whose string value reads `env("…")` — the emitted Python would contain the resolved value. A name names a credential when, split into words (underscores, digits, camelCase, squashed acronyms), it contains a credential noun (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`, …) or a key noun (`KEY`, `PASS`, `PWD`, `PIN`) after a secret qualifier (`API`, `ACCESS`, `DB`, `PRIVATE`, …); metadata words (`TOKEN_LIMIT`, `API_KEY_HEADER`), counting words (`MAX_TOKENS`) and non-secret qualifiers (`PUBLIC_KEY`, `PRIMARY_KEY`) do not; ambiguous names (`STRIPE_KEY`, `DATABASE_DSN`) let the value decide, and placeholder values are skipped. Read secrets at runtime via `os.environ[...]` instead. Full rules: `docs/diagnostics/contains_secret_literal.md`.
 
+**Credential gate (2026-11 security review).** `comptime env("NAME")` *refuses* a variable whose name marks it as a credential (same naming rules as the lint above; an ambiguous name such as `STRIPE_KEY` is refused when its value looks like a credential) with `tyc::comptime` — "comptime env() may not read 'GITHUB_TOKEN'" — unless `typhon.toml` lists the name under `[env] allow` or `[env] required`, or sets `[strictness] allow-secret-comptime = true`. The decision is made on the resolved name at evaluation time, so computed keys and helper `comptime def`s are covered. A failed `int(env(...))` no longer quotes the value. Ordinary variables (`PORT`, `BUILD_TAG`, `TOKEN_LIMIT`) are unaffected.
+
 ---
 
 ## 13. `typhon.toml` reference
@@ -1402,6 +1404,8 @@ external-args = []               # extra flags forwarded verbatim to the externa
 
 [env]
 required = ["DATABASE_URL"]      # comptime env() lookups that must resolve at build
+allow = []                       # credential-named variables comptime env() may read (required ones are allowed too)
+strict = false                   # true: comptime env() may read ONLY names in allow / required
 
 [dependencies]
 requests = ">=2.31"

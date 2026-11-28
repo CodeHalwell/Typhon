@@ -55,6 +55,9 @@ class _Hash:
 
 
 def new(name, data=b"", *, usedforsecurity=True):
+    # Algorithm names are case-insensitive, as OpenSSL's are.
+    if isinstance(name, str) and name.lower() in algorithms_available:
+        name = name.lower()
     if name not in algorithms_available:
         raise ValueError("unsupported hash type " + name)
     return _Hash(name, data)

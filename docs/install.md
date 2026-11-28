@@ -45,7 +45,7 @@ under `gcompat` or build from source.
 ### macOS / Linux
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
 The installer:
@@ -58,9 +58,13 @@ The installer:
    `SHA256SUMS` file from the release assets.
 4. Verifies the SHA-256 checksum with `shasum -a 256 -c` (macOS) or
    `sha256sum -c` (Linux).
-5. Extracts the tarball and installs `tyc` to `$HOME/.local/bin` by
-   default (no `sudo` needed).
-6. On macOS only: clears the `com.apple.quarantine` extended attribute
+5. If the GitHub CLI (`gh`) is on your `PATH`, verifies the archive's
+   signed build provenance with `gh attestation verify` — see
+   [Verifying a download](#verifying-a-download).
+6. Checks that the archive holds only regular files and directories
+   under relative paths, extracts it, and installs `tyc` to
+   `$HOME/.local/bin` by default (no `sudo` needed).
+7. On macOS only: clears the `com.apple.quarantine` extended attribute
    so Gatekeeper doesn't prompt you on first run.
 
 Re-running the script upgrades to the latest release in place.
@@ -80,10 +84,13 @@ The installer:
 3. Downloads `tyc-<version>-<target>.zip` and the matching
    `SHA256SUMS` file from the release assets.
 4. Verifies the SHA-256 checksum using `Get-FileHash`.
-5. Extracts the zip and installs `tyc.exe` to
+5. If the GitHub CLI (`gh`) is on your `PATH`, verifies the archive's
+   signed build provenance with `gh attestation verify` — see
+   [Verifying a download](#verifying-a-download).
+6. Extracts the zip and installs `tyc.exe` to
    `%LOCALAPPDATA%\Programs\Typhon\` by default (no admin rights
    needed).
-6. Adds the install directory to your **user-level** `PATH` via
+7. Adds the install directory to your **user-level** `PATH` via
    `[Environment]::SetEnvironmentVariable`. Open a new terminal for
    the PATH change to take effect.
 
@@ -94,8 +101,8 @@ Re-running the script upgrades to the latest release in place.
 macOS / Linux:
 
 ```bash
-TYPHON_VERSION=v0.11.0 \
-  curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh \
+  | TYPHON_VERSION=v0.11.0 sh
 ```
 
 Or with the script saved locally:
@@ -122,8 +129,8 @@ Or with the script saved locally:
 macOS / Linux:
 
 ```bash
-TYPHON_INSTALL_DIR=/opt/typhon/bin \
-  curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh \
+  | TYPHON_INSTALL_DIR=/opt/typhon/bin sh
 ```
 
 Or:
@@ -150,6 +157,59 @@ iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 
 
 Use `-NoPath` to skip the user-PATH update if you'd rather manage that
 yourself.
+
+## Verifying a download
+
+Every release archive can be checked two ways. Both installers do the
+first always and the second when they can.
+
+**1. Checksum.** Each release carries a `SHA256SUMS` file listing the
+SHA-256 of every archive. Download it next to the archive and compare:
+
+```bash
+# macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+This catches a corrupted or truncated download. It does not protect
+against a tampered release, because `SHA256SUMS` comes from the same
+place as the archive.
+
+**2. Build provenance.** Releases **after v1.0.0-beta.7** also carry a
+signed [build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+for every archive, produced by the release workflow itself. With the
+[GitHub CLI](https://cli.github.com/) installed and logged in
+(`gh auth login`):
+
+```bash
+gh attestation verify tyc-<version>-<target>.tar.gz --repo CodeHalwell/Typhon
+```
+
+(Use the `.zip` name on Windows.) Success means the archive was built
+by a GitHub Actions run in `CodeHalwell/Typhon`; the output names the
+workflow and the source commit.
+
+The installers run this check for you when `gh` is on your `PATH`:
+
+- The attestation verifies: the install continues.
+- The archive has an attestation and it does **not** verify: the
+  install aborts.
+- There is nothing to verify against — the release is v1.0.0-beta.7 or
+  older, or `gh` is missing or not logged in: the installer prints a
+  note and continues on the checksum alone.
+
+To make every outcome except a successful verification fatal, set
+`TYPHON_REQUIRE_ATTESTATION=1`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh \
+  | TYPHON_REQUIRE_ATTESTATION=1 sh
+```
+
+```powershell
+$env:TYPHON_REQUIRE_ATTESTATION = '1'
+iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
+```
 
 ## Manual download
 
@@ -181,6 +241,13 @@ list while Typhon is pre-1.0.)
    $expected = (Get-Content SHA256SUMS | Where-Object { $_ -match 'tyc-.*\.zip$' }) -split '\s+' | Select-Object -First 1
    $actual   = (Get-FileHash tyc-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
    if ($expected.ToLower() -eq $actual) { 'OK' } else { 'MISMATCH' }
+   ```
+
+   For releases after v1.0.0-beta.7, also check the build provenance
+   (see [Verifying a download](#verifying-a-download)):
+
+   ```bash
+   gh attestation verify tyc-<version>-<target>.tar.gz --repo CodeHalwell/Typhon
    ```
 
 4. Extract and move the binary onto your `PATH`:

@@ -800,6 +800,37 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A user name in the compiler's own `__typhon_` namespace.
+    #[error("`{name}` is in the `__typhon_` namespace, which is reserved for names the compiler generates")]
+    #[diagnostic(
+        code(tyc::reserved_name),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/reserved_name.md"),
+        help("rename it — the compiler emits helpers and temporaries under this prefix (`__typhon_checked_cast__`, `__typhon_freeze__`, …), and a user binding of the same name silently replaces them")
+    )]
+    ReservedName {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("reserved prefix")]
+        span: SourceSpan,
+    },
+
+    /// A character that makes source read differently from how it compiles.
+    #[error("{what}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::hidden_source_character),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/hidden_source_character.md"),
+        help("delete the character; if a string genuinely needs it, write it as an escape (`\\u202e`, `\\r`) so it is visible in the source")
+    )]
+    HiddenSourceCharacter {
+        what: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("here")]
+        span: SourceSpan,
+    },
+
     /// An `extend` declaration named a Python built-in type.
     #[error("{message}")]
     #[diagnostic(
@@ -2197,6 +2228,8 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::ReservedName { src, span, .. }
+            | Self::HiddenSourceCharacter { src, span, .. }
             | Self::RequiresNewerPython { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -2346,6 +2379,8 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::ReservedName { src, span, .. }
+            | Self::HiddenSourceCharacter { src, span, .. }
             | Self::RequiresNewerPython { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -3140,6 +3175,36 @@ impl TycError {
     ) -> Self {
         Self::StubMismatch {
             message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ReservedName`] error.
+    pub fn reserved_name(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ReservedName {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::HiddenSourceCharacter`] warning.
+    pub fn hidden_source_character(
+        what: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::HiddenSourceCharacter {
+            what: what.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -5017,6 +5082,11 @@ fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option
     Some(slice.trim_end_matches(['\r', '\n']))
 }
 
+/// The longest source line a diagnostic is rendered with an excerpt of (see
+/// `SanitisedDiagnostic::unrenderable_location`). Far beyond any line a
+/// person writes or reads.
+const MAX_RENDERED_LINE: usize = 8 * 1024;
+
 /// FINDINGS #32: an owning wrapper around a [`TycError`] that overrides
 /// `Diagnostic::source_code` to return a sanitised view (synthetic
 /// `__typhon_*` lines blanked out / restored). Every other trait
@@ -5052,6 +5122,39 @@ pub struct SanitisedDiagnostic {
 }
 
 impl SanitisedDiagnostic {
+    /// `(line, column)` of the first label, 1-based, when that label sits
+    /// on a line too long to print — otherwise `None`.
+    ///
+    /// Two things go wrong on a machine-generated megabyte line, which is
+    /// exactly where the limits that reject hostile input report from. The
+    /// graphical renderer formats a label's column as a padding width and
+    /// panics ("Formatting argument out of range") once it passes
+    /// `u16::MAX`; and every diagnostic on the line prints the whole line,
+    /// so N of them cost N × its length — 10,000 took over a minute and
+    /// produced hundreds of megabytes. Such a diagnostic keeps its message,
+    /// code and help, and names its position in words instead.
+    fn unrenderable_location(&self) -> Option<(usize, usize)> {
+        let labels = self.inner.labels()?;
+        let text = named_source_text(self.sanitised.as_ref()?);
+        let bytes = text.as_bytes();
+        for label in labels {
+            let offset = label.inner().offset().min(bytes.len());
+            let line_start = bytes[..offset]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |newline| newline + 1);
+            let line_end = bytes[offset..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |newline| offset + newline);
+            if line_end - line_start > MAX_RENDERED_LINE {
+                let line = bytes[..line_start].iter().filter(|b| **b == b'\n').count() + 1;
+                return Some((line, offset - line_start + 1));
+            }
+        }
+        None
+    }
+
     /// Render with `severity` instead of the variant's own. Renderers pass
     /// the bucket the diagnostic was reported in (`Diagnostics::warnings()`
     /// → `Severity::Warning`).
@@ -5735,19 +5838,33 @@ impl miette::Diagnostic for SanitisedDiagnostic {
         self.severity.or_else(|| self.inner.severity())
     }
     fn help<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
-        self.inner.help()
+        let Some((line, column)) = self.unrenderable_location() else {
+            return self.inner.help();
+        };
+        let place = format!("at line {line}, column {column} (the line is too long to show here)");
+        Some(match self.inner.help() {
+            Some(help) => Box::new(format!("{help}\n{place}")),
+            None => Box::new(place),
+        })
     }
     fn url<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
         self.inner.url()
     }
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
         let labels = self.inner.labels()?;
+        // A label on a very long line is rendered without its source
+        // excerpt (see `unrenderable_location`); `help` says where it was.
+        if self.unrenderable_location().is_some() {
+            return None;
+        }
+        let labels: Vec<miette::LabeledSpan> = labels.collect();
+        let labels = labels.into_iter();
         // B15: redirect any label that landed in a synthetic duplicated
         // `impl Variant:` block (past the real source's EOF) back onto the
         // first, real-source-aligned block. No-op when the file carries
         // no distributed impl group.
         let Some(remap) = self.block_remap.clone() else {
-            return Some(labels);
+            return Some(Box::new(labels));
         };
         let remapped = labels.map(move |label| {
             let span = label.inner();

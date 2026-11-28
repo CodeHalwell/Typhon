@@ -4,6 +4,178 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — security review (2026-11-27)
+
+Fixes from a full security review of the toolchain, the generated code, the
+release pipeline and the installers. No language change.
+
+### Security
+
+- **t-string literal braces were emitted as code.** `t"{{run()}}"` was
+  written back as `t"{run()}"`, so text that reads as inert in `.ty` became
+  an interpolation that calls `run()` in the emitted Python; `!r` and format
+  specs were dropped as well. t-strings now go through the f-string printer.
+- **`--no-sync` could still run a project's code.** When the dependency list
+  changed and a `uv.lock` existed, the build ran `uv lock`, which executes
+  the build backend of any path, git or sdist dependency — including one the
+  project points at itself with `[tool.uv.sources]`. The relock now uses
+  `uv lock --no-build`. `tyc check --with-ty` no longer merges
+  `pyproject.toml` or runs `uv` at all.
+- **`[python] target` reached `uv --python` unvalidated.** uv reads a value
+  it cannot parse as a version as a path, so `target = "3.14post1"` executed
+  `./3.14post1/bin/python`. The target must now be a plain version, and the
+  request passed to uv is rebuilt from the parsed numbers.
+- **A `.venv` in a parent directory is only used when it belongs to the
+  user running `tyc`** (or root), on Unix. Previously the first `.venv` found
+  anywhere up to `/` supplied the interpreter that introspection runs.
+- **`tyc debug` and `tyc repl` ran their script from the shared temp
+  directory**, which CPython puts first on `sys.path`: a `json.py` left in
+  `/tmp` by another user was imported. The script now lives in a private
+  directory.
+- **`tyc profile --instrument` wrote through symlinks** in the build
+  directory and followed linked directories, rewriting `.py` files outside
+  the project. It now writes the way `tyc build` does and skips links.
+- **The stale-file sweep trusted the manifest.** With `out = "."`, a
+  committed `.tyc-build-manifest` could have `tyc build` delete `.git/config`
+  or the project's own sources. Only `.py`, `.pyi` and `.sourcemaps/*.py.map`
+  entries outside the source directory are swept.
+- **`src` may not be a symlink out of the project**, and **`tyc init` does
+  not scaffold through a symlink**.
+- **`tyc trace` and the generated traceback remapper only quote `.ty` /
+  `.dty` files.** A tampered `.py.map` could name any file and have a line of
+  it printed into a traceback.
+- **`comptime` no longer echoes a value it failed to parse** (`int(env("…"))`
+  printed the variable's value from `tyc check`), and `str.replace`,
+  `str.join`, `str.split` and list / tuple / dict literals are charged
+  against the memory budget before they allocate — three small programs
+  aborted `tyc check` with an allocation failure.
+
+- **`os.urandom` under `tyc run` reads the operating system's CSPRNG.** It
+  was filled from `RandomState` hashes, which are not cryptographic, so a key
+  or token made from it was weaker under the VM than under CPython.
+- **The language server does not import standard-library modules that act on
+  import.** `import venv.__main__` in a `.ty` file had a completion request
+  create a virtualenv; `__main__` submodules and the stdlib's demo and
+  test-runner packages are no longer introspected.
+- **Two panics on non-ASCII source are fixed**: the five-byte file `é"|>`
+  crashed `tyc check` and `tyc fmt`, and an `impl` target with a non-BMP
+  character panicked the language server's semantic-token pass. A comptime
+  f-string is charged against the memory budget like `+`.
+
+- **`comptime env()` does not read credentials unless the project says
+  so.** A variable whose name marks it as a credential (`GITHUB_TOKEN`,
+  `AWS_SECRET_ACCESS_KEY`; an ambiguous name when its value looks like one)
+  is refused with `tyc::comptime` unless it is listed under the new
+  `[env] allow`, under `[env] required`, or `allow-secret-comptime = true`.
+  The decision is made on the resolved name, so a computed key, a helper
+  `comptime def` or a value wrapped in a list no longer slips past. The
+  comptime step budget is now per file rather than per binding.
+- **A hand-written `model_config` keeps `extra="forbid"`.** Any user
+  `model_config` used to drop the injected setting, so
+  `ConfigDict(frozen=True)` silently meant pydantic's `extra="ignore"`. The
+  project's `[emit] model-extra` is merged into a config that does not
+  mention `extra`.
+- **New `tyc::reserved_name` (error).** A user name starting with
+  `__typhon_` — `def __typhon_checked_cast__(v, t): return v` turned every
+  `as!` in its module into a no-op.
+- **New `tyc::hidden_source_character` (warning).** Bidirectional-control
+  characters ("Trojan Source", CVE-2021-42574) and carriage returns that are
+  not part of a CRLF line ending.
+- **A lone-surrogate escape (`"\ud800"`) is a `tyc::parse` error.** It was
+  silently emitted as U+FFFD.
+- **An introspection timeout kills the whole process group.** A dependency
+  whose import started a subprocess kept `tyc check` and the language server
+  waiting for as long as that subprocess lived.
+- Smaller hardening: the language server caps header-line length and
+  re-checks its private scratch directory before each use; a dependency's
+  annotation longer than 2 KB is not parsed; `tyc profile --instrument` no
+  longer rewrites `def` lines inside string constants; the generated
+  `conftest.py` and `pyproject.toml` escape unusual characters correctly;
+  `TYC_NO_SYNC` accepts any value but empty or `0`; `tyc check` refuses a
+  `src` symlinked out of the project.
+
+- **Hostile input can no longer crash or stall the front end.** The parser
+  stops at 10,000 levels of nesting (1,000 for nested f-strings) with a
+  `tyc::parse` error instead of overflowing the stack — 300,000 nested
+  parentheses used to abort `tyc check`, `tyc fmt` and the language server on
+  open. A type larger than 100,000 nodes degrades to `Unknown` (a 24-line
+  file of doubling tuples took 10 s and 3 GB); method and attribute chains
+  are inferred once per link (an `extend str` chain of 24 calls took 6 s, of
+  48 never finished); and long runs of `?`, `as!` and `rescue` on one line
+  are linear or capped. A diagnostic more than 50,000 columns into a line
+  renders without its source excerpt instead of panicking the renderer.
+- **The VM raises where it used to abort.** Results too large to allocate
+  (`1 << 10**12`, `list(range(10**12))`, `",".join(big)`, big-int products)
+  raise `MemoryError` as CPython does; deep iterator chains and deeply nested
+  `json.loads` input raise `RecursionError`.
+- **VM `tempfile` matches CPython's guarantees.** Names come from
+  `os.urandom` rather than the program-seedable `random`; files are created
+  exclusively with mode `0600` and written through the file that was
+  created, not through its name.
+- **VM `eval(text, globals, locals)` honours its scope arguments** (they
+  were ignored, so `eval(text, {})` could read module globals);
+  `os.chmod(..., follow_symlinks=False)` and `Path.lchmod` no longer change
+  the link's target; `shutil.rmtree` refuses a symlink with CPython's error;
+  `os.system` returns the raw wait status; the pydantic shim honours
+  `model_config`'s `extra`; under `--no-fallback`, `re`'s `$` and
+  `fullmatch` follow CPython.
+- More front-end bounds from the same pass: blocks nest at most 500 deep
+  (CPython stops at 100); a line whose `?` operators would take quadratic
+  work to lower is a `tyc::parse` error; scopes are copy-on-write and the
+  resolver looks names up by hash, so a function of 10,000 `let` lines checks
+  in about 2 s instead of 7 (20,000: 7 s instead of 41); a diagnostic on a
+  line longer than 8 KB names its line and column in words instead of
+  printing the line.
+- **`[env] strict = true`** (opt-in) limits `comptime env()` to exactly the
+  variables listed under `[env] allow` and `[env] required`.
+- Files nested past the block limit are cut off before preprocessing, so a
+  150 MB file of nested `try:` blocks is rejected in about 6 s instead of 24
+  (`tyc run`: 12 s instead of over 90).
+- `os.chmod(link, follow_symlinks=False)` under the VM changes the link's
+  own mode on macOS and the BSDs, as CPython does.
+- Review follow-ups: the lone-surrogate check no longer rejects a raw or
+  bytes literal nested in an f-string field and no longer panics on a
+  malformed escape followed by a multi-byte character; source-hygiene
+  findings are capped at 20 of each kind per file (each carried a copy of
+  the source); the language server installs a project's `comptime env()`
+  policy on the thread that checks it; VM `re.sub(count=…)` /
+  `re.split(maxsplit=…)` stop matching at the limit, and many matches over
+  one haystack no longer re-scan it for newlines.
+- VM: `bytes.split` / `bytes.rsplit` honour `maxsplit` (it was ignored); a
+  bounded `split` of a very large string is no longer refused with
+  `MemoryError`; `SpooledTemporaryFile` in text mode enforces its encoding
+  before rollover and keeps the cursor in the right place after it.
+- `deny.toml` treats a yanked crate as an error.
+
+### Release pipeline and packaging
+
+- The release workflow's build jobs run with a read-only token, without
+  persisted credentials or a restored cargo cache, and with `--locked`; the
+  publish job attests build provenance for every archive
+  (`gh attestation verify <file> --repo CodeHalwell/Typhon`).
+- `install.sh` runs inside a function called on its last line, so a download
+  cut short executes nothing; both installers end with a sentinel line.
+- The VS Code extension's `typhon.server.path` / `typhon.server.arguments`
+  are `machine`-scoped. They were `machine-overridable`, which a workspace's
+  `.vscode/settings.json` *can* set.
+- A scheduled workflow runs `cargo deny` daily.
+- `install.sh` / `install.ps1` reject archives with absolute, `..` or
+  symlink members, stage the binary under an unpredictable name, and verify
+  build provenance with `gh attestation verify` when `gh` is available
+  (`TYPHON_REQUIRE_ATTESTATION=1` makes that mandatory). Docs use
+  `curl --proto '=https' --tlsv1.2 -fsSL`.
+- The release job runs in a `release` environment (so required reviewers can
+  be configured) and refuses to replace the assets of an existing release
+  unless dispatched with `overwrite: true`. `CODEOWNERS` covers the
+  workflows, installers, `deny.toml`, `Cargo.lock` and `SECURITY.md`.
+- A weekly workflow fails when the vendored Ruff parser pin is more than 120
+  days old.
+- docs-site moves to Astro 7 / Starlight 0.43 and the VS Code extension
+  (0.2.4) updates `brace-expansion`: `npm audit` reports nothing in either.
+  The extension requires an absolute `typhon.server.path` when the value
+  contains a path separator and declares itself unsupported in untrusted
+  workspaces.
+
 ## 1.0.0-beta.7 — 2026-11-02 — beta.6 feedback fixes
 
 Fixes from the beta.6 feedback session. No language change.

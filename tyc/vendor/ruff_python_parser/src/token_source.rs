@@ -17,6 +17,12 @@ pub(crate) struct TokenSource<'src> {
     /// is finished consuming all the tokens. Note that unlike the emitted tokens, this vector
     /// holds both the trivia and non-trivia tokens.
     tokens: Vec<Token>,
+
+    /// Typhon: set once the parser gives up on the rest of the input (the
+    /// nesting-depth limit). From then on the source reports `EndOfFile`
+    /// forever, so every parse loop unwinds the way it does on a truncated
+    /// file instead of recursing any further.
+    exhausted: bool,
 }
 
 impl<'src> TokenSource<'src> {
@@ -26,6 +32,7 @@ impl<'src> TokenSource<'src> {
         TokenSource {
             lexer,
             tokens: vec![],
+            exhausted: false,
         }
     }
 
@@ -41,7 +48,20 @@ impl<'src> TokenSource<'src> {
 
     /// Returns the kind of the current token.
     pub(crate) fn current_kind(&self) -> TokenKind {
+        if self.exhausted {
+            return TokenKind::EndOfFile;
+        }
         self.lexer.current_kind()
+    }
+
+    /// Typhon: stop handing out tokens; see [`TokenSource::exhausted`].
+    pub(crate) fn exhaust(&mut self) {
+        self.exhausted = true;
+    }
+
+    /// Typhon: whether [`TokenSource::exhaust`] was called.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// Returns the range of the current token.
@@ -67,6 +87,9 @@ impl<'src> TokenSource<'src> {
     ///
     /// [`re_lex_logical_token`]: Lexer::re_lex_logical_token
     pub(crate) fn re_lex_logical_token(&mut self) {
+        if self.exhausted {
+            return;
+        }
         let mut non_logical_newline = None;
 
         #[cfg(debug_assertions)]
@@ -127,11 +150,17 @@ impl<'src> TokenSource<'src> {
         &mut self,
         kind: InterpolatedStringKind,
     ) {
+        if self.exhausted {
+            return;
+        }
         self.lexer
             .re_lex_string_token_in_interpolation_element(kind);
     }
 
     pub(crate) fn re_lex_raw_string_in_format_spec(&mut self) {
+        if self.exhausted {
+            return;
+        }
         self.lexer.re_lex_raw_string_in_format_spec();
     }
 
@@ -141,6 +170,9 @@ impl<'src> TokenSource<'src> {
     ///
     /// [`peek2`]: TokenSource::peek2
     pub(crate) fn peek(&mut self) -> TokenKind {
+        if self.exhausted {
+            return TokenKind::EndOfFile;
+        }
         let checkpoint = self.lexer.checkpoint();
         let next = self.next_non_trivia_token();
         self.lexer.rewind(checkpoint);
@@ -153,6 +185,9 @@ impl<'src> TokenSource<'src> {
     ///
     /// [`peek`]: TokenSource::peek
     pub(crate) fn peek2(&mut self) -> (TokenKind, TokenKind) {
+        if self.exhausted {
+            return (TokenKind::EndOfFile, TokenKind::EndOfFile);
+        }
         let checkpoint = self.lexer.checkpoint();
         let first = self.next_non_trivia_token();
         let second = self.next_non_trivia_token();
@@ -172,6 +207,9 @@ impl<'src> TokenSource<'src> {
     /// Bumps the token source to the next non-trivia token without adding the current token to the
     /// token vector. It does add the trivia tokens to the token vector.
     fn do_bump(&mut self) {
+        if self.exhausted {
+            return;
+        }
         loop {
             let kind = self.lexer.next_token();
             if kind.is_trivia() {

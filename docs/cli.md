@@ -70,7 +70,7 @@ Python environment for the project:
    `uv add` rather than `tyc add` is dropped — the note says so. A
    `model` declaration (`pub model` included) adds `pydantic`.
    With `--no-sync` and an existing `uv.lock`, a changed manifest is
-   relocked with `uv lock` (resolution only, nothing is installed) so a
+   relocked with `uv lock --no-build` (resolution only: nothing is installed and no package is built from source) so a
    later `uv sync --locked` does not fail on a stale lockfile.
 3. **`.py` files in `src/` are copied verbatim** to the output dir
    (skipping `__pycache__/`, `tests/`, `.venv/`, and dotfiles), so a
@@ -123,7 +123,7 @@ module instead; see the multi-file note under `tyc run` below.
 | `--out DIR` / `-o` | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run: list every file that *would* be created or overwritten without touching disk. The full pipeline still runs, so type errors continue to surface. |
-| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up, and an existing `uv.lock` is refreshed with `uv lock` when the dependency list changed. Also honoured via `TYC_NO_SYNC=1`. |
+| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up, and an existing `uv.lock` is refreshed with `uv lock --no-build` when the dependency list changed. Also honoured via `TYC_NO_SYNC=1`. |
 | `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flip the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins (so `-O` never silently re-enables a knob you set to `false` by hand). See [`[optimise]`](configuration.md#optimise). |
 | `--with-ty` (v0.12.0) | After a successful emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check) and re-attribute its diagnostics to the `.ty` source. `ty` errors fail the build. Equivalent to setting `[checker] external = "ty"` for one invocation; requires `ty` on `PATH`. |
 

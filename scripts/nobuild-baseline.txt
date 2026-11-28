@@ -140,6 +140,8 @@ stress/round-2026-09-01/emit/go_sync.ty
 stress/round-2026-09-01/emit/q_in_lambda.ty
 stress/round-2026-09-01/emit/question_forms.ty
 stress/round-2026-09-01/emit/raw_class_chain2.ty
+stress/round-2026-09-01/emit/surrogate.ty
+stress/round-2026-09-01/emit/surrogate_ord.ty
 stress/round-2026-09-01/syntax/guard_shift.ty
 stress/round-2026-09-01/syntax/soft_kw_idents.ty
 stress/round-2026-09-01/tooling/em_src.ty
@@ -239,6 +241,7 @@ stress/round-2026-09-01/types/t5_typevar_breadth.ty
 stress/round-2026-09-01/types/t7_finally_narrow.ty
 stress/round-2026-09-01/types/t8_while_backedge.ty
 stress/round-2026-09-01/vm/p14.ty
+stress/round-2026-09-01/vm/p2.ty
 stress/round-2026-09-01/vm/p3.ty
 stress/round-2026-09-01/vm/p4.ty
 stress/round-2026-09-01/vm/p9.ty

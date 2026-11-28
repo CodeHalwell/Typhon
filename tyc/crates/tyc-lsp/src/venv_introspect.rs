@@ -214,7 +214,7 @@ impl IntrospectionCache {
         // to run a stranger's module. Recorded as a plain miss (no failure
         // hint) so the editor shows no completions rather than an error.
         let top = module.split('.').next().unwrap_or(module);
-        if !may_introspect(&self.allowed_top_level, top) {
+        if !may_introspect(&self.allowed_top_level, top) || runs_code_on_import(module) {
             return None;
         }
         // Cache check — `None` value short-circuits repeated failures,
@@ -231,6 +231,7 @@ impl IntrospectionCache {
         // No private scratch directory could be created — refuse to run the
         // subprocess in a shared (shadowable) directory. Recorded like a
         // spawn failure so the hover hint names the interpreter involved.
+        tyc_venv::ScratchDir::revalidate(&mut self.scratch);
         let Some(scratch) = self.scratch.as_ref() else {
             self.failures.insert(
                 module.to_owned(),
@@ -279,6 +280,27 @@ fn introspection_allow_list(project_root: &Path) -> HashSet<String> {
 /// **Declared dependencies** are allowed because declaring a package in
 /// `typhon.toml` is the act of consent. Everything else — including a module
 /// that merely happens to sit next to the file being edited — is refused.
+/// Modules whose *import* is an action rather than a definition, even in the
+/// standard library. `import venv.__main__` runs `venv.main()` — typed into
+/// a `.ty` file, it had the language server create a virtualenv on a
+/// completion request — and `antigravity` opens a web browser. A `__main__`
+/// submodule is an entry point by definition; the rest are the stdlib's own
+/// demo, test-runner and GUI packages.
+fn runs_code_on_import(module: &str) -> bool {
+    const SIDE_EFFECTING_TOP_LEVEL: &[&str] = &[
+        "antigravity",
+        "this",
+        "test",
+        "idlelib",
+        "turtledemo",
+        "__hello__",
+        "__phello__",
+    ];
+    let mut segments = module.split('.');
+    let top = segments.next().unwrap_or(module);
+    SIDE_EFFECTING_TOP_LEVEL.contains(&top) || module.split('.').any(|s| s == "__main__")
+}
+
 fn may_introspect(allowed: &HashSet<String>, top: &str) -> bool {
     tyc_analyse::perf::is_stdlib_top_level(top) || allowed.contains(top)
 }
@@ -450,8 +472,8 @@ fn introspect_via_python(
     let spawn_failure = || IntrospectionFailure::SpawnFailed {
         python_bin: python.to_path_buf(),
     };
-    let mut child = match Command::new(python)
-        .arg("-")
+    let mut cmd = Command::new(python);
+    cmd.arg("-")
         .arg(module)
         // Run outside the project tree. With the project root as cwd,
         // Python puts it on `sys.path`, so a file named after a stdlib
@@ -459,9 +481,10 @@ fn introspect_via_python(
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    // Its own process group, so a timeout can kill what the import started.
+    tyc_venv::own_process_group(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return (None, Some(spawn_failure())),
     };
@@ -484,7 +507,8 @@ fn introspect_via_python(
     let Some(stdout) = child.stdout.take() else {
         return (None, Some(spawn_failure()));
     };
-    let drainer = std::thread::spawn(move || -> Vec<u8> {
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         // Cap the read so a dependency that floods stdout can't OOM the
         // language server (see the same guard in `tyc-venv`). 32 MiB is far
         // above any real introspection response; an over-cap read fails to
@@ -492,7 +516,7 @@ fn introspect_via_python(
         const CAP: u64 = 32 * 1024 * 1024;
         let mut buf = Vec::with_capacity(64 * 1024);
         let _ = std::io::Read::take(stdout, CAP).read_to_end(&mut buf);
-        buf
+        let _ = drained_tx.send(buf);
     });
     // Wait with a timeout. `Child::wait` blocks indefinitely, so we
     // poll. Coarse 50 ms polling is fine for the 10 s ceiling and
@@ -505,8 +529,7 @@ fn introspect_via_python(
             Ok(Some(status)) => break status.success(),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    tyc_venv::kill_process_group(&mut child);
                     timed_out = true;
                     break false;
                 }
@@ -515,7 +538,6 @@ fn introspect_via_python(
             Err(_) => return (None, Some(spawn_failure())),
         }
     };
-    let stdout_bytes = drainer.join().unwrap_or_default();
     if timed_out {
         return (
             None,
@@ -525,8 +547,14 @@ fn introspect_via_python(
         );
     }
     if !success {
+        tyc_venv::kill_process_group(&mut child);
         return (None, Some(spawn_failure()));
     }
+    // Never wait on the reader unboundedly: a process the import left
+    // running keeps the pipe open (see `tyc_venv::collect_drained`).
+    let Some(stdout_bytes) = tyc_venv::collect_drained(&drained_rx, &mut child) else {
+        return (None, Some(spawn_failure()));
+    };
     let stdout_str = match std::str::from_utf8(&stdout_bytes) {
         Ok(s) => s,
         Err(_) => return (None, Some(spawn_failure())),
@@ -663,6 +691,11 @@ mod tests {
         // asserted — a cache entry means we got past it).
         assert!(may_introspect(&cache.allowed_top_level, "rich"));
         assert!(may_introspect(&cache.allowed_top_level, "os"));
+        assert!(!runs_code_on_import("os.path"));
+        assert!(runs_code_on_import("venv.__main__"));
+        assert!(runs_code_on_import("json.tool.__main__"));
+        assert!(runs_code_on_import("antigravity"));
+        assert!(runs_code_on_import("test.autotest"));
         assert!(!may_introspect(
             &cache.allowed_top_level,
             "evil_local_module"

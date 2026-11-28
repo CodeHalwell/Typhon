@@ -50,7 +50,7 @@ If `tyc` is not found the extension falls back to grammar-only highlighting.
 
 | Setting | Default | Description |
 |---|---|---|
-| `typhon.server.path` | `tyc` | Path to the `tyc` binary. |
+| `typhon.server.path` | `tyc` | Path to the `tyc` binary: a bare name looked up on PATH, or an absolute path (relative paths are rejected). |
 | `typhon.server.arguments` | `["lsp"]` | Arguments passed to `tyc`. |
 | `typhon.server.enable` | `true` | Disable to use grammar-only highlighting. |
 | `typhon.trace.server` | `off` | LSP trace level for debugging. |

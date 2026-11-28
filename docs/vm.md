@@ -87,8 +87,9 @@ tyc run --compile --temp      # legacy with ephemeral build dir
 `bin`, `oct`, `chr`, `ord`, `round`, `input`, `hash`, `id`, `callable`,
 `issubclass` (v1.0.0-beta.1, incl. a tuple of classes),
 `eval` (v1.0.0-beta.1 — a single *expression*, resolved against the module
-globals since the VM has no frame introspection; `exec` is deliberately
-absent),
+globals since the VM has no frame introspection; when `globals` / `locals`
+are passed, the expression sees only those, as in CPython — they used to be
+ignored; `exec` is deliberately absent),
 `open` (read / write / append / binary modes since v0.9.0, plus
 `__enter__` / `__exit__` for `with` blocks). Since v0.10.0 also `divmod`
 (raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
@@ -153,7 +154,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `pydantic` (v0.9.0, expanded v0.10.0 and v1.0.0-beta.1) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `Model.model_validate(mapping)` constructs an instance from a dict — annotated sub-models included, recursively, since v1.0.0-beta.1, alongside `model_validate_json` — `inst.model_dump()` returns a dict of the fields in declaration order (unwrapping nested models back to dicts, as pydantic's does), and `model_dump_json()` the JSON form. It does not *validate*: a field of the wrong type is stored as given rather than raising `ValidationError` |
 | `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file. Residual: `open()` without `encoding=` always uses UTF-8 and reports it as `utf-8`. That is CPython 3.15's default on every platform (PEP 686); CPython 3.13 and 3.14 use the host locale encoding instead, so on a non-UTF-8 locale (Windows' `cp1252`, for example) a 3.13-target program that omits `encoding=` reads and writes differently under `tyc run` |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
-| `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
+| `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile`, `SpooledTemporaryFile`. Names are drawn from `os.urandom` (never from the program's seedable `random`); files are created `O_EXCL | O_NOFOLLOW` with mode `0600`, retried on collision, and later writes go to the file that was created (checked by device and inode), not to whatever the name points at by then. |
 | `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` — the same matcher `pathlib.Path.glob` uses, including `**` |
 | `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, plus unkeyed `blake2b` / `blake2s` at their default digest sizes (a `key=` / `digest_size=` argument raises rather than returning a wrong digest), `new`, with `update` / `digest` / `hexdigest` / `copy` and the `digest_size` / `block_size` / `name` attributes. 2026-09-30 review: `sha3_224` / `sha3_256` / `sha3_384` / `sha3_512`, `pbkdf2_hmac` (any modelled digest; an unknown digest name raises `ValueError` where CPython raises `UnsupportedDigestmodError`), `file_digest` |
 | `base64` (v1.0.0-beta.1) | `b64encode` / `b64decode` (incl. `altchars`), `urlsafe_*`, `standard_*`, `b32encode` / `b32decode`, `b16encode` / `b16decode`, `encodebytes` / `decodebytes` |
@@ -361,6 +362,20 @@ target as CPython does (`list[int]`, `typing.Sequence[int]`, `Pair[int]`,
 object (callable, `__supertype__`, printed `__main__.UserId`).
 
 ### Size limits raise, they do not abort (beta)
+
+2026-11 security review: this now covers results the VM cannot allocate at
+all, not only sized constructors. `1 << 10**12`, `bin(1 << 10**11)`,
+`random.getrandbits(10**12)`, `",".join(big)`, `list(range(10**12))`,
+`set(...)` / `sorted(...)` / comprehensions over a huge iterable, big-int
+multiplication and `str.replace` blow-ups raise `MemoryError` (or
+`OverflowError`, where CPython does) instead of aborting the process. A
+small reserve is released when an ordinary allocation fails, so the
+interpreter can raise `MemoryError` at the next statement. `2 ** 10**12`
+raises at once where CPython would compute for minutes. Deeply nested
+iterator chains (`g = (x for x in g)` a hundred thousand times) and
+`json.loads` of deeply nested text raise `RecursionError` rather than
+overflowing the native stack. `os.urandom` reads the operating system's
+CSPRNG.
 
 Everywhere CPython reports a size problem as an exception, so does the VM;
 it used to abort (`memory allocation of … bytes failed`, exit 134) or
@@ -916,4 +931,4 @@ interp.root.set("custom", tyc_vm::Value::Int(42.into()));
 
 The crate is in `tyc/crates/tyc-vm`. See `lib.rs` for the public surface.
 
-Regular-expression imports (`re`) select compiled CPython execution in normal `tyc run`, before user code starts, so dynamic patterns, lookaround, backreferences and Python flags retain their Python semantics. `--no-fallback` explicitly requires the VM subset; unsupported regex syntax or flags raise an error. The VM honours `re.ASCII` for its supported patterns.
+Regular-expression imports (`re`) select compiled CPython execution in normal `tyc run`, before user code starts, so dynamic patterns, lookaround, backreferences and Python flags retain their Python semantics. `--no-fallback` explicitly requires the VM subset; unsupported regex syntax or flags raise an error. The VM honours `re.ASCII` for its supported patterns. Under `--no-fallback`, `$` matches before a trailing newline and `fullmatch` anchors the whole alternation, as CPython does (two edge cases remain for a haystack that has interior newlines *and* ends in one: `a$\n` is not found, and `(a|a\n)$` prefers the longer match).

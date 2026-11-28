@@ -328,6 +328,17 @@ including the standard library's own.
 **Fix:** rename the file (`lang_types.ty`) and update its imports. Checked
 only in a project with a `typhon.toml`.
 
+## `tyc::reserved_name`
+
+A name in your source starts with `__typhon_`. That prefix belongs to the
+compiler: the helpers and temporaries it emits live there
+(`__typhon_checked_cast__` behind `as!`, `__typhon_freeze__`,
+`__typhon_unpack_0__`), and a user binding of the same name silently replaced
+them — a `def __typhon_checked_cast__(v, t): return v` turned every `as!` in
+the module into a no-op. Names inside strings and comments are ignored.
+
+**Fix:** rename it.
+
 ## `tyc::orphan_py_import` (warning)
 
 A relative import resolves to a `.py` file outside `src/`. The build copies

@@ -409,6 +409,14 @@ impl Default for StrictnessConfig {
 pub struct EnvConfig {
     /// Env vars that must be resolvable at build time for `comptime env()`.
     pub required: Vec<String>,
+    /// Credential-named env vars (`API_KEY`, `GITHUB_TOKEN`, …) that
+    /// `comptime env()` may nevertheless read and inline into the build.
+    /// Anything in `required` is allowed too. See `ComptimeEnvPolicy` in
+    /// `tyc-analyse`.
+    pub allow: Vec<String>,
+    /// When `true`, `comptime env()` may read *only* the variables listed
+    /// in `allow` and `required`; any other name is a build error.
+    pub strict: bool,
 }
 
 /// `[checker]` — second-stage type-checking over the emitted Python.
@@ -516,6 +524,13 @@ impl TyphonConfig {
                 target: raw.to_owned(),
                 reason: "expected a `MAJOR.MINOR` string such as `3.13` or `3.14t`".to_owned(),
             })?;
+        if !is_well_formed_python_target(raw) {
+            return Err(ConfigError::UnsupportedPythonTarget {
+                path: source_path.to_string_lossy().into_owned(),
+                target: raw.to_owned(),
+                reason: "expected a `MAJOR.MINOR` string such as `3.13` or `3.14t`".to_owned(),
+            });
+        }
         if (major, minor) < (3, 13) {
             return Err(ConfigError::UnsupportedPythonTarget {
                 path: source_path.to_string_lossy().into_owned(),
@@ -763,6 +778,32 @@ pub fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Whether a `[python] target` is a plain CPython version: `3.13`, `3.14t`,
+/// `3.15.2`, or a pre-release such as `3.15rc1` / `3.15.0b2t`. The value is
+/// used to pick an interpreter, so nothing else is accepted — [`parse_python_target`]
+/// alone reads only the leading digits and would let `3.14/../x` or
+/// `3.14post1` through.
+fn is_well_formed_python_target(s: &str) -> bool {
+    let body = s.strip_suffix('t').unwrap_or(s);
+    // Split off an optional pre-release tag: a1 / b2 / rc1.
+    let (version, pre) = match body.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => body.split_at(i),
+        None => (body, ""),
+    };
+    let pre_ok = pre.is_empty()
+        || ["rc", "a", "b"].iter().any(|tag| {
+            pre.strip_prefix(tag).is_some_and(|n| {
+                !n.is_empty() && n.len() <= 3 && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
+    let segments: Vec<&str> = version.split('.').collect();
+    pre_ok
+        && (2..=3).contains(&segments.len())
+        && segments
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.len() <= 3 && seg.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Errors that can occur when loading a `typhon.toml` file.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -962,6 +1003,45 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_target_must_be_a_plain_version() {
+        for ok in [
+            "3.13",
+            "3.13t",
+            "3.14",
+            "3.15t",
+            "3.15.2",
+            "3.15rc1",
+            "3.15.0b2t",
+            "3.16a1",
+        ] {
+            assert!(is_well_formed_python_target(ok), "{ok} should be accepted");
+        }
+        // uv reads a `--python` value that is not a version as a path.
+        for bad in [
+            "3.14post1",
+            "3.14dev0",
+            "3.14-1",
+            "3.14_post1",
+            "3.14/../x",
+            "3.14 ",
+            "./3.14",
+            "3",
+            "3.",
+            "3.14.",
+            "3.14.1.2",
+            "3.14tt",
+            "3.14rc",
+            "py3.14",
+            "",
+        ] {
+            assert!(
+                !is_well_formed_python_target(bad),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
 
     fn cfg_with_target(t: &str) -> TyphonConfig {
         TyphonConfig {

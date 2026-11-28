@@ -24,7 +24,7 @@ and re-apply the Typhon-specific extensions described below.
 
 ## Typhon-specific extensions
 
-Three source-level changes ride on top of the upstream code:
+Four source-level changes ride on top of the upstream code:
 
 1. **`Mutability` enum + field** — `ruff_python_ast::Mutability` (`Let` /
    `Mut`) and a `mutability: Option<Mutability>` field on `StmtAssign`
@@ -58,6 +58,36 @@ Three source-level changes ride on top of the upstream code:
    target and `tyc::requires_newer_python` rejects it
    below 3.15. Drop this patch when a vendor bump brings upstream's own
    version of the change.
+
+4. **Nesting limits** — upstream's parser has none: a few hundred thousand
+   nested brackets overflow the native stack in the recursive descent, and
+   a million-term `a + 1 + 1 + …` (built by a loop, so it parses) yields a
+   tree every later recursive walk overflows on, `Drop` included. The
+   parser now stops with an ordinary syntax error at
+   `MAX_NESTING_DEPTH` (10,000) levels and at
+   `MAX_INTERPOLATED_STRING_DEPTH` (1,000) f-/t-strings nested in one
+   another, and at `MAX_BLOCK_DEPTH` (500) nested indented blocks; the
+   constants live in `ruff_python_parser/src/parser/mod.rs` and are
+   re-exported from the crate root.
+   - `Parser::enter_nesting` / `leave_nesting` bracket every recursion
+     cycle: `parse_binary_expression_or_higher` (all operand, bracket,
+     call-argument and unary nesting), the `lambda` body, the `else` of an
+     `if` expression, `parse_match_pattern_lhs`, and `parse_block` (which
+     also counts `Parser::block_depth` against `MAX_BLOCK_DEPTH`).
+   - The left-deep chains built without recursion — the binary-operator
+     loop, `parse_postfix_expression` (`a.b`, `f()`, `a[i]`) and
+     `parse_attr_expr_for_match_pattern` — count their own levels with
+     `Parser::note_chain_height`. `height_mark` / `height_since` measure the
+     height of a just-parsed operand, so a chain stacked on a deep operand
+     is charged for both; `parse_binary_expression_or_higher_recursive` and
+     `parse_postfix_expression` take that height as a new argument.
+   - On hitting a limit the parser records the error and calls
+     `TokenSource::exhaust`, after which the token source reports
+     `EndOfFile` forever and every parse loop unwinds as on a truncated
+     file.
+
+   Keep the patch when syncing: nothing downstream bounds the depth of the
+   tree.
 
 Smoke tests at `vendor/ruff_python_parser/tests/typhon_mutability.rs` and
 `crates/tyc-syntax/src/ruff.rs::tests` cover the new shapes.

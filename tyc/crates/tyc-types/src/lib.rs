@@ -2126,8 +2126,42 @@ fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
     if !matches!(b.op, Operator::BitOr) {
         return false;
     }
+    // `a | b | c | …` is a left-deep chain, and when the whole chain is not a
+    // type union the checker asks the same question of each shorter prefix
+    // on its way down: quadratic in the chain's length, and each leaf costs a
+    // lookup. Answer for every prefix in this one pass; the descent that
+    // follows — before any operand is inferred — takes its answers from the
+    // table.
+    let address = |node: &ruff_python_ast::ExprBinOp| std::ptr::from_ref(node) as usize;
+    if let Some(known) = c.runtime_union_prefixes.borrow_mut().remove(&address(b)) {
+        return known;
+    }
+    let mut spine = vec![b];
+    let mut innermost = b;
+    while let Expr::BinOp(inner) = innermost.left.as_ref() {
+        if !matches!(inner.op, Operator::BitOr) {
+            break;
+        }
+        spine.push(inner);
+        innermost = inner;
+    }
+    // Leaves in source order, exactly as the recursion over the chain
+    // visited them, stopping at the first that is not a type.
     let mut saw_type = false;
-    leaf(c, &b.left, &mut saw_type) && leaf(c, &b.right, &mut saw_type) && saw_type
+    let mut all_types = leaf(c, &innermost.left, &mut saw_type);
+    let mut prefixes = c.runtime_union_prefixes.borrow_mut();
+    prefixes.clear();
+    let mut whole = false;
+    for (depth, node) in spine.iter().enumerate().rev() {
+        all_types = all_types && leaf(c, &node.right, &mut saw_type);
+        let is_union = all_types && saw_type;
+        if depth == 0 {
+            whole = is_union;
+        } else {
+            prefixes.insert(address(node), is_union);
+        }
+    }
+    whole
 }
 
 /// How a module spells `typing.TypedDict` / `typing_extensions.TypedDict`:
@@ -3197,7 +3231,89 @@ struct TypeBinding {
 /// (`Rc::make_mut`), which for a function body means its own frame and not
 /// the module's. Before this, checking a module was quadratic in its
 /// top-level definitions: 4 000 one-`if` functions took 35 s.
-type ScopeMap = Rc<HashMap<String, TypeBinding>>;
+type ScopeMap = Scope;
+
+/// How many buckets a [`Scope`] spreads its bindings over.
+const SCOPE_BUCKETS: usize = 64;
+
+/// One lexical scope's bindings, shared copy-on-write.
+///
+/// Every branch, loop and `try` snapshots the environment, and the first
+/// narrowing or declaration after a snapshot has to un-share what it writes.
+/// With one map per scope that copied every binding of the scope: a function
+/// of *n* statements that each narrow or declare something (`let v = g()?`,
+/// `guard v = x else: …`) deep-copied *n* bindings *n* times — 26 s for
+/// 5,000 lines. The bindings are spread over [`SCOPE_BUCKETS`] maps instead,
+/// so a write copies the bucket list (64 pointers) and the one bucket it
+/// lands in.
+#[derive(Debug, Clone)]
+struct Scope {
+    buckets: Rc<Vec<Rc<HashMap<String, TypeBinding>>>>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        let empty = Rc::new(HashMap::new());
+        Self {
+            buckets: Rc::new(vec![empty; SCOPE_BUCKETS]),
+        }
+    }
+    /// FNV-1a over the name; only has to spread names evenly.
+    fn bucket_of(name: &str) -> usize {
+        let mut hash: u32 = 0x811c_9dc5;
+        for byte in name.bytes() {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+        }
+        hash as usize % SCOPE_BUCKETS
+    }
+    fn get(&self, name: &str) -> Option<&TypeBinding> {
+        self.buckets[Self::bucket_of(name)].get(name)
+    }
+    fn contains_key(&self, name: &str) -> bool {
+        self.buckets[Self::bucket_of(name)].contains_key(name)
+    }
+    fn iter(&self) -> impl Iterator<Item = (&String, &TypeBinding)> {
+        self.buckets.iter().flat_map(|bucket| bucket.iter())
+    }
+    /// Whether the two are the same allocation — and therefore hold the same
+    /// bindings with the same narrowings — without comparing them.
+    fn ptr_eq(a: &Scope, b: &Scope) -> bool {
+        Rc::ptr_eq(&a.buckets, &b.buckets)
+    }
+    /// The binding for writing. Un-shares its bucket, so only call this once
+    /// a write is certain.
+    fn get_mut(&mut self, name: &str) -> Option<&mut TypeBinding> {
+        let index = Self::bucket_of(name);
+        if !self.buckets[index].contains_key(name) {
+            return None;
+        }
+        Rc::make_mut(&mut Rc::make_mut(&mut self.buckets)[index]).get_mut(name)
+    }
+    fn insert(&mut self, binding: TypeBinding) {
+        let index = Self::bucket_of(&binding.name);
+        Rc::make_mut(&mut Rc::make_mut(&mut self.buckets)[index])
+            .insert(binding.name.clone(), binding);
+    }
+    /// Set the narrowed type of every binding `narrowing` returns one for.
+    /// A bucket in which nothing changes stays shared.
+    fn renarrow(&mut self, mut narrowing: impl FnMut(&String, &TypeBinding) -> Option<Type>) {
+        for index in 0..self.buckets.len() {
+            let changes: Vec<(String, Type)> = self.buckets[index]
+                .iter()
+                .filter_map(|(name, b)| narrowing(name, b).map(|ty| (name.clone(), ty)))
+                .collect();
+            if changes.is_empty() {
+                continue;
+            }
+            let bucket = Rc::make_mut(&mut Rc::make_mut(&mut self.buckets)[index]);
+            for (name, ty) in changes {
+                if let Some(b) = bucket.get_mut(&name) {
+                    b.narrowed = ty;
+                }
+            }
+        }
+    }
+}
 
 /// The envs reaching a loop's `break`s and `continue`s, recorded while its
 /// body is checked.
@@ -3259,14 +3375,14 @@ struct TypeEnv {
 
 impl TypeEnv {
     fn enter(&mut self) {
-        self.scopes.push(Rc::new(HashMap::new()));
+        self.scopes.push(Scope::new());
     }
     fn leave(&mut self) {
         self.scopes.pop();
     }
     fn declare(&mut self, b: TypeBinding) {
         if let Some(top) = self.scopes.last_mut() {
-            Rc::make_mut(top).insert(b.name.clone(), b);
+            top.insert(b);
         }
     }
     fn lookup(&self, name: &str) -> Option<&TypeBinding> {
@@ -3291,7 +3407,7 @@ impl TypeEnv {
         if self.scopes[idx].get(name).map(|b| &b.narrowed) == Some(&new_type) {
             return;
         }
-        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+        if let Some(b) = self.scopes[idx].get_mut(name) {
             b.narrowed = new_type;
         }
     }
@@ -3310,7 +3426,7 @@ impl TypeEnv {
         {
             return;
         }
-        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+        if let Some(b) = self.scopes[idx].get_mut(name) {
             b.narrowed = b.declared.clone();
         }
     }
@@ -3340,19 +3456,19 @@ impl TypeEnv {
             // Untouched scope: the body never wrote it, so there is nothing
             // to undo. This is the common case for every scope outside the
             // function's own frame, and it keeps the restore O(1) there.
-            if Rc::ptr_eq(scope, &saved) {
+            if Scope::ptr_eq(scope, &saved) {
                 continue;
             }
-            let live = Rc::make_mut(scope);
-            for (name, b) in live.iter_mut() {
+            scope.renarrow(|name, b| {
                 // A binding the snapshot knew: restore its narrowing.
                 // One the body introduced: widen it to its declared type,
                 // which is the state an un-narrowed binding has.
-                b.narrowed = match saved.get(name) {
-                    Some(sb) => sb.narrowed.clone(),
-                    None => b.declared.clone(),
+                let restored = match saved.get(name) {
+                    Some(sb) => &sb.narrowed,
+                    None => &b.declared,
                 };
-            }
+                (b.narrowed != *restored).then(|| restored.clone())
+            });
         }
     }
     /// Narrow an attribute access path (`"self.value"`) to `ty`.
@@ -3434,11 +3550,9 @@ impl TypeEnv {
             if !needs_reset {
                 continue;
             }
-            for (name, b) in Rc::make_mut(scope).iter_mut() {
-                if rebound.contains(name) && b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
-            }
+            scope.renarrow(|name, b| {
+                (rebound.contains(name) && b.narrowed != b.declared).then(|| b.declared.clone())
+            });
         }
     }
 
@@ -3458,11 +3572,9 @@ impl TypeEnv {
         if !needs_reset {
             return;
         }
-        for (name, b) in Rc::make_mut(globals).iter_mut() {
-            if rebound.contains(name) && b.narrowed != b.declared {
-                b.narrowed = b.declared.clone();
-            }
-        }
+        globals.renarrow(|name, b| {
+            (rebound.contains(name) && b.narrowed != b.declared).then(|| b.declared.clone())
+        });
     }
 
     /// Reset every binding's narrowing to the value it had in `base`, keeping
@@ -3481,7 +3593,7 @@ impl TypeEnv {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let base_scope = base.scopes.get(i);
             // Identical scope objects already agree on every narrowing.
-            if base_scope.is_some_and(|b| Rc::ptr_eq(scope, b)) {
+            if base_scope.is_some_and(|b| Scope::ptr_eq(scope, b)) {
                 continue;
             }
             let differs =
@@ -3494,12 +3606,13 @@ impl TypeEnv {
             if !differs {
                 continue;
             }
-            for (name, b) in Rc::make_mut(scope).iter_mut() {
-                match base_scope.and_then(|s| s.get(name)) {
-                    Some(bb) => b.narrowed = bb.narrowed.clone(),
-                    None => b.narrowed = b.declared.clone(),
-                }
-            }
+            scope.renarrow(|name, b| {
+                let reset = match base_scope.and_then(|s| s.get(name)) {
+                    Some(bb) => &bb.narrowed,
+                    None => &b.declared,
+                };
+                (b.narrowed != *reset).then(|| reset.clone())
+            });
         }
         self.attr_narrowings = base.attr_narrowings.clone();
     }
@@ -3514,7 +3627,7 @@ impl TypeEnv {
     fn intersect_narrowings(&mut self, other: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let other_scope = other.scopes.get(i);
-            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+            if other_scope.is_some_and(|o| Scope::ptr_eq(scope, o)) {
                 continue;
             }
             let widens = scope.iter().any(|(name, b)| {
@@ -3526,14 +3639,12 @@ impl TypeEnv {
             if !widens {
                 continue;
             }
-            for (name, b) in Rc::make_mut(scope).iter_mut() {
+            scope.renarrow(|name, b| {
                 let agree = other_scope
                     .and_then(|s| s.get(name))
                     .is_some_and(|ob| ob.narrowed == b.narrowed);
-                if !agree && b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
-            }
+                (!agree && b.narrowed != b.declared).then(|| b.declared.clone())
+            });
         }
         self.attr_narrowings
             .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
@@ -3547,17 +3658,16 @@ impl TypeEnv {
     fn take_narrowings_from(&mut self, other: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let other_scope = other.scopes.get(i);
-            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+            if other_scope.is_some_and(|o| Scope::ptr_eq(scope, o)) {
                 continue;
             }
-            for (name, b) in Rc::make_mut(scope).iter_mut() {
-                b.narrowed = match other_scope.and_then(|s| s.get(name)) {
-                    Some(ob) if ob.span == b.span && ob.declared == b.declared => {
-                        ob.narrowed.clone()
-                    }
-                    _ => b.declared.clone(),
+            scope.renarrow(|name, b| {
+                let taken = match other_scope.and_then(|s| s.get(name)) {
+                    Some(ob) if ob.span == b.span && ob.declared == b.declared => &ob.narrowed,
+                    _ => &b.declared,
                 };
-            }
+                (b.narrowed != *taken).then(|| taken.clone())
+            });
         }
         self.attr_narrowings = other.attr_narrowings.clone();
     }
@@ -3598,7 +3708,7 @@ impl TypeEnv {
                 .names
                 .iter()
                 .any(|n| after_scope.contains_key(n.as_str()));
-            if !assigned_here && before_scope.is_some_and(|b| Rc::ptr_eq(b, after_scope)) {
+            if !assigned_here && before_scope.is_some_and(|b| Scope::ptr_eq(b, after_scope)) {
                 continue;
             }
             // `finally` affected a binding if it *assigned* to it — even to a
@@ -3621,16 +3731,17 @@ impl TypeEnv {
             if !has_delta {
                 continue;
             }
-            let live = Rc::make_mut(scope);
             for (name, ab) in after_scope.iter() {
-                let changed = changed_of(name, ab);
-                if let Some(b) = live.get_mut(name) {
-                    if changed {
-                        b.narrowed = ab.narrowed.clone();
+                match scope.get(name) {
+                    Some(b) => {
+                        if changed_of(name, ab) && b.narrowed != ab.narrowed {
+                            if let Some(b) = scope.get_mut(name) {
+                                b.narrowed = ab.narrowed.clone();
+                            }
+                        }
                     }
-                } else {
                     // A name `finally` introduced — keep it visible downstream.
-                    live.insert(name.clone(), ab.clone());
+                    None => scope.insert(ab.clone()),
                 }
             }
         }
@@ -3789,6 +3900,75 @@ fn read_view_head_accepts(abc: &str, container: &str) -> bool {
 /// crash the process.
 const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 
+/// Size bound on the type of one expression: more nodes than this, or nesting
+/// deeper than [`MAX_EXPR_TYPE_DEPTH`], and the expression is typed `Unknown`.
+///
+/// `Type` is a by-value tree, so `x1 = (x0, x0)`, `x2 = (x1, x1)`, … doubles
+/// the type of each binding: twenty lines built a million-node type, every
+/// later use deep-copied it, and `tyc check` ran out of memory a few lines
+/// further on. `Unknown` is the permissive answer (see
+/// [`INFER_EXPR_MAX_DEPTH`]): it cannot reject a correct program, it only
+/// stops the checker reasoning about a type nobody could have written down.
+/// The largest type in the example and stress corpora is a 2,700-member
+/// literal union; hand-written types are a few dozen nodes.
+const MAX_EXPR_TYPE_NODES: usize = 100_000;
+
+/// See [`MAX_EXPR_TYPE_NODES`]. A type this deep can only come from a chain
+/// of bindings each wrapping the previous one (`x1 = (x0,)`, `x2 = (x1,)`,
+/// …); left alone it grows by a level per line until the recursive walks
+/// over it — `clone`, `==`, `drop` included — overflow the stack.
+const MAX_EXPR_TYPE_DEPTH: usize = 1_000;
+
+/// Whether `ty` is past [`MAX_EXPR_TYPE_NODES`] / [`MAX_EXPR_TYPE_DEPTH`].
+/// Stops counting as soon as either bound is crossed, so the cost is bounded
+/// however large the type is.
+fn expr_type_too_large(ty: &Type) -> bool {
+    fn over(ty: &Type, nodes: &mut usize, depth: usize) -> bool {
+        if *nodes == 0 || depth > MAX_EXPR_TYPE_DEPTH {
+            return true;
+        }
+        *nodes -= 1;
+        match ty {
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|p| over(p, nodes, depth + 1)) || over(ret, nodes, depth + 1)
+            }
+            Type::Generic(_, args) | Type::Union(args) => {
+                args.iter().any(|a| over(a, nodes, depth + 1))
+            }
+            _ => false,
+        }
+    }
+    // Leaves and the everyday one-level containers need no walk at all.
+    match ty {
+        Type::Function { .. } | Type::Generic(..) | Type::Union(_) => {
+            over(ty, &mut { MAX_EXPR_TYPE_NODES }, 0)
+        }
+        _ => false,
+    }
+}
+
+/// How many lambdas deep (`lambda: lambda: lambda: …`) lambda *bodies* are
+/// still checked. Past it a lambda keeps its structural type and its body is
+/// left alone.
+///
+/// Each lambda body is checked in its own scope under a snapshot of the
+/// environment, and both grow with the nesting, so memory was quadratic in
+/// it: 1.7 GB for 100,000 nested lambdas. CPython's own parser gives up
+/// below 3,000.
+const MAX_CHECKED_LAMBDA_NESTING: u32 = 256;
+
+/// Attribute chains (`a.b.c.d…`) with more links than this are folded with a
+/// running `infer_expr_readonly` type for the receiver.
+///
+/// Several per-attribute checks (the deprecated-property lookup, the
+/// nullable-receiver check) ask `infer_expr_readonly` for the receiver's
+/// type, and that function walks the whole chain below it: quadratic in the
+/// chain's length, 10 s for 20,000 links. While a chain longer than this is
+/// folded, the type of each link's receiver is computed once from the
+/// previous link's and handed to those lookups. Shorter chains — every chain
+/// a person writes — take the unchanged path.
+const READONLY_HINT_MIN_CHAIN: usize = 64;
+
 /// Recursion bound for [`Checker::is_assignable`].
 ///
 /// Sized so that no real program reaches it: the deepest nesting in the
@@ -3809,6 +3989,27 @@ struct Checker<'a> {
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
     module: Option<&'a ModModule>,
+    /// Lazily built index of the module's `class` statements; see
+    /// `class_contracts::class_defs`.
+    class_defs: std::cell::OnceCell<Vec<&'a ruff_python_ast::StmtClassDef>>,
+    /// Lazily built index of the module's binding statements; see
+    /// `callables::declaration_at`.
+    declarations: std::cell::OnceCell<callables::Declarations<'a>>,
+    /// `(address of an expression, its `infer_expr_readonly` type)`, set while
+    /// a long attribute chain is folded; see [`READONLY_HINT_MIN_CHAIN`]. The
+    /// address is only ever compared, never dereferenced.
+    readonly_hint: Option<(usize, Type)>,
+    /// Answers [`is_runtime_type_union`] worked out for the prefixes of the
+    /// `|` chain it was last asked about, by node address. Emptied whenever
+    /// a new top-level expression is inferred.
+    runtime_union_prefixes: std::cell::RefCell<HashMap<usize, bool>>,
+    /// `infer_expr_readonly` answers for the links of a long receiver chain,
+    /// by node address. Emptied whenever a new top-level expression is
+    /// inferred.
+    readonly_memo: std::cell::RefCell<HashMap<usize, Type>>,
+    /// How many lambda bodies are being checked right now; see
+    /// [`MAX_CHECKED_LAMBDA_NESTING`].
+    lambda_depth: u32,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -4428,6 +4629,12 @@ impl<'a> Checker<'a> {
     fn new(path: String, source: &'a str, resolved: &'a ResolvedModule) -> Self {
         Self {
             module: None,
+            class_defs: std::cell::OnceCell::new(),
+            declarations: std::cell::OnceCell::new(),
+            readonly_hint: None,
+            runtime_union_prefixes: std::cell::RefCell::new(HashMap::new()),
+            readonly_memo: std::cell::RefCell::new(HashMap::new()),
+            lambda_depth: 0,
             path,
             source,
             resolved,
@@ -12934,7 +13141,50 @@ fn expression_attr_narrowing(c: &Checker, expr: &Expr) -> Option<Type> {
     })
 }
 
+/// Whether the receiver chain under `expr` — through calls, attribute reads
+/// and subscripts — is at least `links` long. Looks no further than that.
+fn receiver_chain_reaches(expr: &Expr, links: usize) -> bool {
+    let mut node = expr;
+    for _ in 0..links {
+        node = match node {
+            Expr::Call(call) => &call.func,
+            Expr::Attribute(attr) => &attr.value,
+            Expr::Subscript(sub) => &sub.value,
+            _ => return false,
+        };
+    }
+    true
+}
+
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
+    let address = std::ptr::from_ref(e) as usize;
+    if let Some((hinted, ty)) = &c.readonly_hint {
+        if *hinted == address {
+            return ty.clone();
+        }
+    }
+    // The checks on a call ask for its receiver's type before the receiver
+    // is inferred, so in a long chain (`x.f().g().h()…`) the outermost call
+    // walks every link, then the next one walks all but one, and so on:
+    // quadratic — a 1,000-call chain on a class took over a minute. Past
+    // `READONLY_HINT_MIN_CHAIN` links the answer for each link is kept for
+    // the rest of the enclosing expression, so the first walk is the only
+    // one. Shorter chains — every chain a person writes — are not cached.
+    let cached = matches!(e, Expr::Call(_) | Expr::Attribute(_))
+        && receiver_chain_reaches(e, READONLY_HINT_MIN_CHAIN);
+    if cached {
+        if let Some(ty) = c.readonly_memo.borrow().get(&address) {
+            return ty.clone();
+        }
+    }
+    let ty = infer_expr_readonly_uncached(c, e);
+    if cached {
+        c.readonly_memo.borrow_mut().insert(address, ty.clone());
+    }
+    ty
+}
+
+fn infer_expr_readonly_uncached(c: &Checker, e: &Expr) -> Type {
     match e {
         Expr::Name(n) => c
             .env
@@ -17255,7 +17505,7 @@ fn run_definite_assignment_pass(
         state.assign(p);
     }
     for name in tracked.keys().chain(locals.iter()) {
-        state.unassigned.insert(name.clone());
+        state.mark_unassigned(name);
     }
     let ctx = DaCtx { tracked, locals };
     da_walk_stmts(c, body, &ctx, &mut state);
@@ -17273,17 +17523,23 @@ struct DaCtx {
 }
 
 #[derive(Clone, Debug)]
+///
+/// The three tables are shared copy-on-write: every `if` / `match` arm
+/// starts from a clone of the state before it, and most arms (a `return`,
+/// the lowered form of `?`) never write to it. Deep-copying every name for
+/// every arm made a function with *n* branches and *n* locals quadratic —
+/// `x = g()?????…` with 5,000 `?` took 7 s.
 struct DaState {
     /// Names that have been assigned on every path reaching the
     /// current point.
-    assigned: std::collections::HashSet<String>,
+    assigned: Rc<std::collections::HashSet<String>>,
     /// Names that have been assigned on *no* path reaching the current
     /// point — never bound yet, or unbound again by `del` / the end of an
     /// `except ... as` handler on every path.
-    unassigned: std::collections::HashSet<String>,
+    unassigned: Rc<std::collections::HashSet<String>>,
     /// Why a name in `unassigned` is unbound, when it is more specific
     /// than "not assigned yet".
-    unbound_reason: HashMap<String, &'static str>,
+    unbound_reason: Rc<HashMap<String, &'static str>>,
     /// True when control flow definitely cannot fall through (a
     /// `return` / `raise` / unconditional terminator has been seen).
     /// A diverging branch is ignored by the intersection step.
@@ -17293,24 +17549,41 @@ struct DaState {
 impl DaState {
     fn new() -> Self {
         Self {
-            assigned: std::collections::HashSet::new(),
-            unassigned: std::collections::HashSet::new(),
-            unbound_reason: HashMap::new(),
+            assigned: Rc::default(),
+            unassigned: Rc::default(),
+            unbound_reason: Rc::default(),
             diverges: false,
         }
     }
+    // Each write is guarded by a read, so a no-op never un-shares a table.
     fn assign(&mut self, name: &str) {
-        self.assigned.insert(name.to_owned());
-        self.unassigned.remove(name);
-        self.unbound_reason.remove(name);
+        if !self.assigned.contains(name) {
+            Rc::make_mut(&mut self.assigned).insert(name.to_owned());
+        }
+        if self.unassigned.contains(name) {
+            Rc::make_mut(&mut self.unassigned).remove(name);
+        }
+        if self.unbound_reason.contains_key(name) {
+            Rc::make_mut(&mut self.unbound_reason).remove(name);
+        }
+    }
+    /// Record `name` as definitely unassigned, with no particular reason.
+    fn mark_unassigned(&mut self, name: &str) {
+        if !self.unassigned.contains(name) {
+            Rc::make_mut(&mut self.unassigned).insert(name.to_owned());
+        }
     }
     /// `del NAME` unbinds the name: a later read on a path where it was
     /// deleted is a `NameError` / `UnboundLocalError`, so it is no longer
     /// definitely-assigned — and is definitely *un*assigned on this path.
     fn unassign(&mut self, name: &str, reason: &'static str) {
-        self.assigned.remove(name);
-        self.unassigned.insert(name.to_owned());
-        self.unbound_reason.insert(name.to_owned(), reason);
+        if self.assigned.contains(name) {
+            Rc::make_mut(&mut self.assigned).remove(name);
+        }
+        self.mark_unassigned(name);
+        if self.unbound_reason.get(name) != Some(&reason) {
+            Rc::make_mut(&mut self.unbound_reason).insert(name.to_owned(), reason);
+        }
     }
 }
 
@@ -17626,7 +17899,7 @@ fn da_while_true_prefix_assignments(body: &[Stmt]) -> Vec<String> {
                 for t in &a.targets {
                     let mut probe = DaState::new();
                     da_collect_assign_targets(t, &mut probe);
-                    out.extend(probe.assigned);
+                    out.extend(probe.assigned.iter().cloned());
                 }
             }
             Stmt::AnnAssign(a) if a.value.is_some() => {
@@ -17650,12 +17923,24 @@ fn da_while_true_prefix_assignments(body: &[Stmt]) -> Vec<String> {
 /// knowledge — a name the body may have bound is no longer certainly
 /// unbound.
 fn da_join_loop_exit(state: &mut DaState, body_state: &DaState) {
-    state
+    if state
         .unassigned
-        .retain(|name| body_state.unassigned.contains(name));
-    state
-        .unbound_reason
-        .retain(|name, _| state.unassigned.contains(name));
+        .iter()
+        .any(|name| !body_state.unassigned.contains(name))
+    {
+        Rc::make_mut(&mut state.unassigned).retain(|name| body_state.unassigned.contains(name));
+    }
+    da_drop_stale_reasons(&mut state.unbound_reason, &state.unassigned);
+}
+
+/// Keep only the reasons for names that are still definitely unassigned.
+fn da_drop_stale_reasons(
+    reasons: &mut Rc<HashMap<String, &'static str>>,
+    unassigned: &std::collections::HashSet<String>,
+) {
+    if reasons.keys().any(|name| !unassigned.contains(name)) {
+        Rc::make_mut(reasons).retain(|name, _| unassigned.contains(name));
+    }
 }
 
 fn da_walk_stmt(c: &mut Checker, stmt: &Stmt, ctx: &DaCtx, state: &mut DaState) {
@@ -18415,25 +18700,43 @@ fn intersect_branches(pre: &DaState, branches: &[DaState]) -> DaState {
     let non_diverging: Vec<&DaState> = branches.iter().filter(|b| !b.diverges).collect();
     if non_diverging.is_empty() {
         return DaState {
-            assigned: pre.assigned.clone(),
-            unassigned: pre.unassigned.clone(),
-            unbound_reason: pre.unbound_reason.clone(),
+            assigned: Rc::clone(&pre.assigned),
+            unassigned: Rc::clone(&pre.unassigned),
+            unbound_reason: Rc::clone(&pre.unbound_reason),
             diverges: true,
         };
     }
     // Definitely assigned / definitely unassigned only when so on every
     // non-diverging arm; a name in neither set is "possibly" bound.
-    let mut assigned: std::collections::HashSet<String> = non_diverging[0].assigned.clone();
-    let mut unassigned: std::collections::HashSet<String> = non_diverging[0].unassigned.clone();
-    let mut reasons: HashMap<String, &'static str> = non_diverging[0].unbound_reason.clone();
+    //
+    // Arms that never wrote still share their tables with `pre` (and so with
+    // each other): pointer-equal tables are equal, and every step below
+    // leaves a table alone unless it would actually change it.
+    let mut assigned = Rc::clone(&non_diverging[0].assigned);
+    let mut unassigned = Rc::clone(&non_diverging[0].unassigned);
+    let mut reasons = Rc::clone(&non_diverging[0].unbound_reason);
     for branch in &non_diverging[1..] {
-        assigned.retain(|name| branch.assigned.contains(name));
-        unassigned.retain(|name| branch.unassigned.contains(name));
-        for (name, reason) in &branch.unbound_reason {
-            reasons.entry(name.clone()).or_insert(reason);
+        if !Rc::ptr_eq(&assigned, &branch.assigned)
+            && assigned.iter().any(|name| !branch.assigned.contains(name))
+        {
+            Rc::make_mut(&mut assigned).retain(|name| branch.assigned.contains(name));
+        }
+        if !Rc::ptr_eq(&unassigned, &branch.unassigned)
+            && unassigned
+                .iter()
+                .any(|name| !branch.unassigned.contains(name))
+        {
+            Rc::make_mut(&mut unassigned).retain(|name| branch.unassigned.contains(name));
+        }
+        if !Rc::ptr_eq(&reasons, &branch.unbound_reason) {
+            for (name, reason) in branch.unbound_reason.iter() {
+                if !reasons.contains_key(name) {
+                    Rc::make_mut(&mut reasons).insert(name.clone(), reason);
+                }
+            }
         }
     }
-    reasons.retain(|name, _| unassigned.contains(name));
+    da_drop_stale_reasons(&mut reasons, &unassigned);
     DaState {
         assigned,
         unassigned,
@@ -21481,18 +21784,30 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     if depth >= INFER_EXPR_MAX_DEPTH {
         return Type::Unknown;
     }
+    if depth == 0 {
+        // The per-expression shortcuts below describe the state this
+        // expression is inferred in; none may outlive it.
+        c.readonly_hint = None;
+        c.runtime_union_prefixes.borrow_mut().clear();
+        c.readonly_memo.borrow_mut().clear();
+    }
     c.infer_depth.set(depth + 1);
     let result = match expr {
         // A lambda body runs later, when captured names may have been
         // reassigned; check it without their narrowings, and let nothing it
         // does leak into the enclosing flow.
+        Expr::Lambda(lam) if c.lambda_depth >= MAX_CHECKED_LAMBDA_NESTING => {
+            lambda_structural_type(lam)
+        }
         Expr::Lambda(lam) => {
             let snap = c.env.snapshot();
             widen_captured_names(c, lam.range.start().to_usize());
             // A `yield` in a lambda body makes the *lambda* a generator; it
             // does not yield from the enclosing function.
             let saved_in_generator = std::mem::replace(&mut c.in_generator, false);
+            c.lambda_depth += 1;
             let r = infer_expr_ctx_inner(c, expr, expected);
+            c.lambda_depth -= 1;
             c.in_generator = saved_in_generator;
             c.env.restore(snap);
             r
@@ -21508,7 +21823,23 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 leaf = &attr.value;
             }
             let mut receiver = infer_expr_ctx(c, leaf, None);
+            let long_chain = chain.len() > READONLY_HINT_MIN_CHAIN;
+            // A short chain keeps whatever hint its leaf left (see the call
+            // case at the end of this function).
+            let outer_hint = if long_chain {
+                c.readonly_hint.take()
+            } else {
+                None
+            };
+            let mut link_receiver = leaf;
             for node in chain.into_iter().rev() {
+                if long_chain {
+                    // Uses the hint left by the previous link, so this is one
+                    // step, not a walk down the chain.
+                    let readonly = infer_expr_readonly(c, link_receiver);
+                    c.readonly_hint = Some((std::ptr::from_ref(link_receiver) as usize, readonly));
+                }
+                link_receiver = node;
                 c.attribute_receiver_type = Some(receiver);
                 receiver = infer_expr_ctx_inner(
                     c,
@@ -21528,12 +21859,30 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     receiver.clone(),
                 );
             }
+            if long_chain {
+                c.readonly_hint = outer_hint;
+            }
             receiver
         }
         _ => infer_expr_ctx_inner(c, expr, expected),
     };
+    let result = if expr_type_too_large(&result) {
+        Type::Unknown
+    } else {
+        result
+    };
     after_expr_effects(c, expr);
     c.infer_depth.set(depth);
+    // A long method chain (`x.f().g().h()…`): the checks on each call ask
+    // `infer_expr_readonly` for the receiver's type, which walks every link
+    // below it — quadratic, 2.7 s for 5,000 calls. Past
+    // `READONLY_HINT_MIN_CHAIN` links, leave the answer for this call where
+    // the call it is the receiver of will look. Computing it here takes one
+    // step: the hint its own receiver left is still in place.
+    if matches!(expr, Expr::Call(_)) && receiver_chain_reaches(expr, READONLY_HINT_MIN_CHAIN) {
+        let readonly = infer_expr_readonly(c, expr);
+        c.readonly_hint = Some((std::ptr::from_ref(expr) as usize, readonly));
+    }
     c.expression_types.insert(
         (
             expr.range().start().to_usize(),
@@ -22758,7 +23107,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
             if let Expr::Attribute(attr) = call.func.as_ref() {
-                let recv = infer_expr(c, &attr.value);
+                // Inferring the callee just above inferred its receiver and
+                // recorded the type. Inferring it again here doubled the work
+                // at every link of a method chain (`a.f().f().f()…` took
+                // 2^n).
+                let recorded = c
+                    .expression_types
+                    .get(&(
+                        attr.value.range().start().to_usize(),
+                        attr.value.range().end().to_usize(),
+                    ))
+                    .cloned();
+                let recv = match recorded {
+                    Some(recv) => recv,
+                    None => infer_expr(c, &attr.value),
+                };
                 if recv.is_nullable() {
                     check_nullable_receiver(c, &attr.value, &recv);
                 }
@@ -29774,7 +30137,7 @@ def f(xs: list[int]) -> int:
             env.scopes
                 .iter()
                 .zip(&snap.scopes)
-                .all(|(a, b)| Rc::ptr_eq(a, b)),
+                .all(|(a, b)| Scope::ptr_eq(a, b)),
             "an untouched snapshot must share every scope"
         );
         // Writing the inner scope copies only that one.
@@ -29786,11 +30149,11 @@ def f(xs: list[int]) -> int:
             from_unsafe: false,
         });
         assert!(
-            Rc::ptr_eq(&env.scopes[0], &snap.scopes[0]),
+            Scope::ptr_eq(&env.scopes[0], &snap.scopes[0]),
             "the module scope must stay shared when only a local is declared"
         );
         assert!(
-            !Rc::ptr_eq(&env.scopes[1], &snap.scopes[1]),
+            !Scope::ptr_eq(&env.scopes[1], &snap.scopes[1]),
             "the written scope must have been copied"
         );
         // Re-narrowing to the type a binding already has is a no-op, so it
@@ -29798,12 +30161,12 @@ def f(xs: list[int]) -> int:
         let before = env.scopes[0].clone();
         env.narrow("g", Type::optional(Type::Int));
         assert!(
-            Rc::ptr_eq(&env.scopes[0], &before),
+            Scope::ptr_eq(&env.scopes[0], &before),
             "a narrowing that changes nothing must not copy the scope"
         );
         env.narrow("g", Type::Int);
         assert!(
-            !Rc::ptr_eq(&env.scopes[0], &before),
+            !Scope::ptr_eq(&env.scopes[0], &before),
             "a real narrowing must copy the scope it writes"
         );
         assert_eq!(env.lookup("g").map(|b| b.narrowed.clone()), Some(Type::Int));
@@ -44174,5 +44537,7 @@ def main() -> None:
     }
 }
 
+#[cfg(test)]
+mod dos_tests;
 #[cfg(test)]
 mod flow_tests;

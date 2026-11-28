@@ -32,8 +32,11 @@ pub mod ffi;
 pub mod hashes;
 pub mod interp;
 pub mod limits;
+pub mod oom;
+mod osrandom;
 pub(crate) mod pydict;
 pub mod pyhash;
+mod pyre;
 pub mod pyset;
 pub mod slots;
 mod stack;
@@ -2090,6 +2093,9 @@ pub fn call_accepts_keyword(
 
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+mod robustness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4307,6 +4313,77 @@ def main() -> None:
         raise ValueError("model str wrong: " + str(u))
     if repr(u) != "User(id=1, name='Ada', active=True)":
         raise ValueError("model repr wrong: " + repr(u))
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A `model` honours `extra` from its `model_config` — a `ConfigDict(...)`
+    /// call or a dict literal — the way pydantic does: `"ignore"` drops
+    /// keywords that name no field, `"allow"` keeps them as attributes,
+    /// `"forbid"` rejects them. A model with no `model_config`, or with one
+    /// that omits `extra`, gets the project's `[emit] model-extra`
+    /// (`"forbid"` by default) — including a model that derives from a
+    /// lenient one, because the build writes that setting into every model
+    /// that does not choose for itself.
+    #[test]
+    fn pydantic_model_config_extra_is_honoured() {
+        let src = r#"
+from pydantic import ConfigDict
+
+model Loose:
+    model_config = ConfigDict(frozen=True, extra="ignore")
+    name: str
+
+model Open:
+    model_config = {"extra": "allow"}
+    name: str
+
+model Strict:
+    model_config = ConfigDict(extra="forbid")
+    name: str
+
+model Default:
+    name: str
+
+model Frozen:
+    model_config = ConfigDict(frozen=True)
+    name: str
+
+model Child(Loose):
+    age: int = 0
+
+def rejects(build: object) -> bool:
+    try:
+        build()
+    except Exception:
+        return True
+    return False
+
+def main() -> None:
+    let a = Loose.model_validate({"name": "a", "extra_field": 1})
+    if a.name != "a" or hasattr(a, "extra_field"):
+        raise ValueError("ignore: extra key kept")
+    if repr(a) != "Loose(name='a')":
+        raise ValueError("ignore: repr wrong: " + repr(a))
+    if Loose(name="z", other=2).name != "z":
+        raise ValueError("ignore: constructor keyword not dropped")
+    let b = Open.model_validate({"name": "b", "extra_field": 1})
+    if b.name != "b" or b.extra_field != 1:
+        raise ValueError("allow: extra key lost")
+    if Open(name="c", other="x").other != "x":
+        raise ValueError("allow: constructor keyword lost")
+    if not rejects(lambda: Strict.model_validate({"name": "s", "extra_field": 1})):
+        raise ValueError("forbid: extra key accepted")
+    if not rejects(lambda: Default.model_validate({"name": "d", "extra_field": 1})):
+        raise ValueError("default: extra key accepted")
+    if not rejects(lambda: Frozen.model_validate({"name": "f", "extra_field": 1})):
+        raise ValueError("config without `extra`: extra key accepted")
+    let c = Child.model_validate({"name": "k", "age": 3})
+    if c.name != "k" or c.age != 3:
+        raise ValueError("derived model fields wrong")
+    if not rejects(lambda: Child.model_validate({"name": "k", "junk": 1})):
+        raise ValueError("derived model without its own config: extra key accepted")
 main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);

@@ -1,5 +1,9 @@
-# `tempfile` — temporary files and directories over `os`; names come from
-# the module-level random generator like CPython's `_RandomNameSequence`.
+# `tempfile` — temporary files and directories over `os`.
+#
+# Natives: `_fs_create_private(path, mode)` creates a file with
+# `O_CREAT | O_EXCL` at `mode` and binds the *name* to the file created, so
+# every later write the VM makes to that name (its file objects write back
+# by name) goes to that file or nowhere; `_fs_tempdir()`; `_fspath(obj)`.
 
 tempdir = None
 template = "tmp"
@@ -23,7 +27,16 @@ def gettempprefix():
 
 
 def _random_name():
-    return "".join([random.choice(_characters) for _ in range(8)])
+    # CPython draws names from a private `random.Random()` seeded from the
+    # OS (`_RandomNameSequence`), so the program's own `random.seed(n)` has
+    # no say in them. Here each character comes straight from `os.urandom`;
+    # bytes of 222 and above are skipped so that `b % 37` is unbiased.
+    out = []
+    while len(out) < 8:
+        for b in os.urandom(16):
+            if b < 222 and len(out) < 8:
+                out.append(_characters[b % 37])
+    return "".join(out)
 
 
 def _sanitize(prefix, suffix, dir):
@@ -51,20 +64,26 @@ def mkdtemp(suffix=None, prefix=None, dir=None):
     raise FileExistsError(17, "No usable temporary directory name found")
 
 
-def mkstemp(suffix=None, prefix=None, dir=None, text=False):
-    prefix, suffix, dir = _sanitize(prefix, suffix, dir)
+def _create_private(prefix, suffix, dir):
+    # CPython's `_mkstemp_inner`: `os.open(file, O_RDWR | O_CREAT | O_EXCL,
+    # 0o600)`, trying a new name (up to `TMP_MAX` of them) when one is
+    # taken. The mode is part of the create, so the file is never visible
+    # with wider permissions.
+    dir = os.path.abspath(dir)
     for _ in range(TMP_MAX):
-        name = _random_name()
-        file = os.path.join(dir, prefix + name + suffix)
+        file = os.path.join(dir, prefix + _random_name() + suffix)
         try:
-            # 0600 at creation, as CPython's `mkstemp` guarantees — a
-            # create-then-chmod would leave the file world-readable for a
-            # moment, and under a 022 umask it stayed 0644 outright.
-            _fs_write(file, b"", "x", 0o600)
+            _fs_create_private(file, 0o600)
         except FileExistsError:
             continue
-        return os._register_fd(file), os.path.abspath(file)
+        return file
     raise FileExistsError(17, "No usable temporary file name found")
+
+
+def mkstemp(suffix=None, prefix=None, dir=None, text=False):
+    prefix, suffix, dir = _sanitize(prefix, suffix, dir)
+    file = _create_private(prefix, suffix, dir)
+    return os._register_fd(file), file
 
 
 def mktemp(suffix="", prefix=template, dir=None):
@@ -116,6 +135,13 @@ class _TemporaryFileWrapper:
 
     def __exit__(self, exc, value, tb):
         self.close()
+        # CPython: `delete=True, delete_on_close=False` removes the file
+        # when the `with` block ends rather than at `close()`.
+        if self.delete and not self.delete_on_close:
+            try:
+                os.unlink(self.name)
+            except FileNotFoundError:
+                pass
         return False
 
     def __iter__(self):
@@ -140,25 +166,214 @@ class _TemporaryFileWrapper:
 
 def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=None, newline=None, suffix=None, prefix=None, dir=None, delete=True, *, errors=None, delete_on_close=True):
     prefix, suffix, dir = _sanitize(prefix, suffix, dir)
-    if "b" in mode:
-        create_mode = "wb"
-    else:
-        create_mode = "w"
-    for _ in range(TMP_MAX):
-        name = _random_name()
-        file = os.path.join(dir, prefix + name + suffix)
-        if os.path.exists(file):
-            continue
-        break
-    file = os.path.abspath(file)
-    # Owner-only, like `mkstemp` above and like CPython.
-    _fs_write(file, b"", "x", 0o600)
-    f = open(file, mode, buffering, encoding, errors, newline)
+    file = _create_private(prefix, suffix, dir)
+    # The file exists, empty, and is ours. A mode that would create it
+    # (`x`) or read it by name first (`r+`) opens it as the writable,
+    # empty file it is; the file object reports the mode asked for.
+    open_mode = mode
+    if "x" in mode:
+        open_mode = mode.replace("x", "w")
+    elif "r" in mode and "+" in mode:
+        open_mode = mode.replace("r", "w")
+    try:
+        f = open(file, open_mode, buffering, encoding, errors, newline)
+    except BaseException:
+        os.unlink(file)
+        raise
+    if open_mode != mode and "b" not in mode:
+        f.mode = mode
     return _TemporaryFileWrapper(f, file, delete, delete_on_close)
 
 
 def TemporaryFile(mode="w+b", buffering=-1, encoding=None, newline=None, suffix=None, prefix=None, dir=None, *, errors=None):
+    # CPython unlinks the file at once (or never links it: `O_TMPFILE`) and
+    # keeps the descriptor. The VM's files are written back by name, so the
+    # name stays until `close()`; it is owner-only and bound to the file
+    # created, like `NamedTemporaryFile`'s.
     return NamedTemporaryFile(mode, buffering, encoding, newline, suffix, prefix, dir, True, errors=errors)
 
 
-SpooledTemporaryFile = NamedTemporaryFile
+class _SpoolText(io.TextIOWrapper):
+    """The in-memory half of a text-mode `SpooledTemporaryFile`.
+
+    CPython uses a `TextIOWrapper` over a `BytesIO`, so everything about
+    the spool is measured in *encoded bytes*: `tell()`, the `max_size`
+    threshold, and the cursor carried over at rollover — after newline
+    translation and under the spool's encoding. This is the same text
+    stream the VM uses for a real text file (so those all agree with the
+    file the spool becomes), with nothing to write back to.
+    """
+
+    def __init__(self, encoding, errors, newline):
+        io.TextIOWrapper.__init__(self, None, "w+", encoding or "utf-8", errors or "strict", newline, True, True, b"", False)
+
+    def flush(self):
+        self._check_closed()
+
+
+class SpooledTemporaryFile:
+    """In memory until `max_size` is exceeded (or `fileno()` / `rollover()`
+    is called), then a `TemporaryFile`."""
+
+    def __init__(self, max_size=0, mode="w+b", buffering=-1, encoding=None, newline=None, suffix=None, prefix=None, dir=None, *, errors=None):
+        if not isinstance(max_size, int):
+            raise TypeError("'%s' object cannot be interpreted as an integer" % type(max_size).__name__)
+        if "b" in mode:
+            self._file = io.BytesIO()
+        else:
+            self._file = _SpoolText(encoding, errors, newline)
+        self._max_size = max_size
+        self._rolled = False
+        self._mode = mode
+        self._encoding = encoding
+        self._errors = errors
+        self._newline = newline
+        self._args = (buffering, suffix, prefix, dir)
+
+    def _check(self):
+        if self._rolled:
+            return
+        if self._max_size and self._file.tell() > self._max_size:
+            self.rollover()
+
+    def rollover(self):
+        if self._rolled:
+            return
+        old = self._file
+        buffering, suffix, prefix, dir = self._args
+        new = TemporaryFile(self._mode, buffering, self._encoding, self._newline, suffix, prefix, dir, errors=self._errors)
+        if "b" in self._mode:
+            pos = old.tell()
+            new.write(old.getvalue())
+            new.seek(pos, 0)
+        else:
+            # Both halves are the same kind of text stream, so the buffer
+            # (already newline-translated) and the cursor move across as
+            # they are: no re-encoding, no second newline translation, and
+            # a cursor past the end stays where it was.
+            old._load()
+            inner = new.file
+            inner._load()
+            inner._buf = old._buf
+            inner._pos = old._pos
+            inner._dirty = True
+        self._file = new
+        self._rolled = True
+
+    def __enter__(self):
+        if self._file.closed:
+            raise ValueError("Cannot enter context with closed file")
+        return self
+
+    def __exit__(self, exc, value, tb):
+        self._file.close()
+
+    def __iter__(self):
+        return iter(self._file)
+
+    def close(self):
+        self._file.close()
+
+    @property
+    def closed(self):
+        return self._file.closed
+
+    @property
+    def encoding(self):
+        if "b" in self._mode:
+            raise AttributeError("'_io.BytesIO' object has no attribute 'encoding'")
+        if self._rolled:
+            return self._file.encoding
+        return self._encoding or "utf-8"
+
+    @property
+    def errors(self):
+        if "b" in self._mode:
+            raise AttributeError("'_io.BytesIO' object has no attribute 'errors'")
+        if self._rolled:
+            return self._file.errors
+        return self._errors or "strict"
+
+    @property
+    def mode(self):
+        if self._rolled:
+            return self._file.mode
+        return self._mode
+
+    @property
+    def name(self):
+        if self._rolled:
+            return self._file.name
+        return None
+
+    @property
+    def newlines(self):
+        if "b" in self._mode:
+            raise AttributeError("'_io.BytesIO' object has no attribute 'newlines'")
+        return self._file.newlines
+
+    def fileno(self):
+        self.rollover()
+        return self._file.fileno()
+
+    def flush(self):
+        self._file.flush()
+
+    def isatty(self):
+        return self._file.isatty()
+
+    def read(self, *args):
+        return self._file.read(*args)
+
+    def readline(self, *args):
+        return self._file.readline(*args)
+
+    def readlines(self, *args):
+        return self._file.readlines(*args)
+
+    def readable(self):
+        return self._file.readable()
+
+    def writable(self):
+        return self._file.writable()
+
+    def seekable(self):
+        return self._file.seekable()
+
+    def seek(self, *args):
+        return self._file.seek(*args)
+
+    def tell(self):
+        return self._file.tell()
+
+    def truncate(self, size=None):
+        if size is None:
+            return self._file.truncate()
+        if size > self._max_size:
+            self.rollover()
+        return self._file.truncate(size)
+
+    def _coerce(self, s):
+        # The in-memory buffer holds text; CPython's holds *encoded* bytes,
+        # so its encoding and error policy apply at every write, not only
+        # once the spool rolls over to a real file. Round-tripping through
+        # the codec gives the same result: "strict" raises
+        # `UnicodeEncodeError` for text the encoding cannot hold, and
+        # "ignore" / "replace" / "xmlcharrefreplace" change the text now.
+        if self._rolled or "b" in self._mode or self._encoding is None or not isinstance(s, str):
+            return s
+        return s.encode(self._encoding, self._errors or "strict").decode(self._encoding)
+
+    def write(self, s):
+        rv = self._file.write(self._coerce(s))
+        self._check()
+        # The count is of the characters given, whatever the codec kept.
+        return len(s) if isinstance(s, str) else rv
+
+    def writelines(self, iterable):
+        rv = self._file.writelines([self._coerce(line) for line in iterable])
+        self._check()
+        return rv
+
+    def __repr__(self):
+        return "<%s object at %s>" % (type(self).__name__, hex(id(self)))

@@ -29,6 +29,68 @@ pub(super) fn constructor(c: &Checker, name: &str) -> Option<Type> {
     })
 }
 
+/// The statements that bind a name, keyed by the offset the bound name starts
+/// at: `def` statements by their name, assignments by each target.
+#[derive(Default)]
+pub(super) struct Declarations<'a> {
+    functions: HashMap<usize, &'a ruff_python_ast::StmtFunctionDef>,
+    /// `None` for an annotation without a value (`x: int`).
+    values: HashMap<usize, Option<&'a Expr>>,
+}
+
+/// The `def`, or the assigned value, of the binding whose name starts at
+/// byte `start`. Looked up in an index built once per check: [`origin`] runs
+/// for every call, and walking the whole module for each one made a module
+/// quadratic in its size.
+fn declaration_at<'a>(
+    c: &Checker<'a>,
+    start: usize,
+) -> (
+    Option<&'a ruff_python_ast::StmtFunctionDef>,
+    Option<&'a Expr>,
+) {
+    struct Collect<'a>(Declarations<'a>);
+    impl<'a> Visitor<'a> for Collect<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    self.0.functions.insert(f.name.range.start().to_usize(), f);
+                }
+                Stmt::AnnAssign(a) => {
+                    self.0
+                        .values
+                        .insert(a.target.range().start().to_usize(), a.value.as_deref());
+                }
+                Stmt::Assign(a) => {
+                    for target in &a.targets {
+                        self.0
+                            .values
+                            .insert(target.range().start().to_usize(), Some(&a.value));
+                    }
+                }
+                _ => {}
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+        // No statement lives inside an expression.
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let Some(module) = c.module else {
+        return (None, None);
+    };
+    let index = c.declarations.get_or_init(|| {
+        let mut collect = Collect(Declarations::default());
+        for stmt in &module.body {
+            collect.visit_stmt(stmt);
+        }
+        collect.0
+    });
+    (
+        index.functions.get(&start).copied(),
+        index.values.get(&start).copied().flatten(),
+    )
+}
+
 pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
     fn resolve(c: &Checker, expr: &Expr, seen: &mut HashSet<usize>) -> Option<ArityInfo> {
         if let Expr::Lambda(lam) = expr {
@@ -69,49 +131,15 @@ pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
         if !seen.insert(binding.span.0) {
             return None;
         }
-        struct Find<'a> {
-            start: usize,
-            value: Option<&'a Expr>,
-            function: Option<&'a ruff_python_ast::StmtFunctionDef>,
-        }
-        impl<'a> Visitor<'a> for Find<'a> {
-            fn visit_stmt(&mut self, stmt: &'a Stmt) {
-                match stmt {
-                    Stmt::FunctionDef(f) if f.name.range.start().to_usize() == self.start => {
-                        self.function = Some(f)
-                    }
-                    Stmt::AnnAssign(a) if a.target.range().start().to_usize() == self.start => {
-                        self.value = a.value.as_deref()
-                    }
-                    Stmt::Assign(a)
-                        if a.targets
-                            .iter()
-                            .any(|t| t.range().start().to_usize() == self.start) =>
-                    {
-                        self.value = Some(&a.value)
-                    }
-                    _ => visitor::walk_stmt(self, stmt),
-                }
-            }
-        }
-        let mut find = Find {
-            start: binding.span.0,
-            value: None,
-            function: None,
-        };
-        if let Some(module) = c.module {
-            for stmt in &module.body {
-                find.visit_stmt(stmt);
-            }
-        }
-        if let Some(f) = find.function {
+        let (function, value) = declaration_at(c, binding.span.0);
+        if let Some(f) = function {
             return Some(arity_info_from_parameters(
                 &f.parameters,
                 &c.classes,
                 &type_param_names_from(f.type_params.as_deref()),
             ));
         }
-        if let Some(value) = find.value {
+        if let Some(value) = value {
             return resolve(c, value, seen);
         }
         c.function_arity_info.get(n.id.as_str()).cloned()

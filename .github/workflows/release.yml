@@ -23,9 +23,18 @@ on:
         required: false
         type: string
         default: ""
+      overwrite:
+        description: "Allow replacing the assets of a release that is already published for `tag`. Leave off unless you are deliberately re-publishing."
+        required: false
+        type: boolean
+        default: false
 
+# Least privilege by default: the five `build` jobs compile ~250 third-party
+# crates (build scripts and proc-macros run arbitrary code), so they get a
+# read-only token. Only the `release` job, which runs no third-party build
+# code, is granted write access (see its own `permissions:` block).
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,6 +80,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
+          # Do not leave the token in `.git/config` where build scripts
+          # could read it.
+          persist-credentials: false
 
       - name: Resolve release tag
         id: tag
@@ -97,18 +109,11 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
-      # Release binaries are cold builds: only the registry/git caches are
-      # restored, never a prior `tyc/target/` (a stale incremental cache
-      # must not leak into a shipped binary).
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+      # Release binaries are fully cold builds: no Actions cache is restored,
+      # neither a prior `tyc/target/` nor `~/.cargo/registry`. cargo does not
+      # re-verify already-extracted registry sources, so a cache entry written
+      # by any other job on the default branch could otherwise end up in a
+      # shipped binary.
 
       - name: Install cross-compile toolchain (Linux aarch64)
         if: matrix.apt != ''
@@ -131,7 +136,9 @@ jobs:
         working-directory: tyc
         shell: bash
         run: |
-          cargo build --release -p tyc --target ${{ matrix.target }}
+          # `--locked`: ship exactly the dependency versions in the reviewed
+          # Cargo.lock; fail rather than silently re-resolve.
+          cargo build --locked --release -p tyc --target ${{ matrix.target }}
 
       - name: Ad-hoc codesign (macOS)
         if: matrix.os == 'macos'
@@ -167,7 +174,17 @@ jobs:
           cp README.md "$stage/$name/README.md" 2>/dev/null || true
 
           mkdir -p dist
-          tar -C "$stage" -czf "dist/${name}.tar.gz" "$name"
+          # Record root (0:0) as the owner of every member instead of the
+          # runner's build account, so that extracting as root cannot hand
+          # the files to whichever local uid happens to match. GNU tar (the
+          # Linux runners) and bsdtar (the macOS runners) spell this
+          # differently.
+          if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+            tar_owner=(--owner=0 --group=0 --numeric-owner)
+          else
+            tar_owner=(--uid 0 --gid 0)
+          fi
+          tar -C "$stage" "${tar_owner[@]}" -czf "dist/${name}.tar.gz" "$name"
           # Pick whichever sha256 tool exists on the runner. macOS ships
           # `shasum`; Ubuntu ships `sha256sum`. Both emit the same
           # `<hash>  <file>` line shape that the combined SHA256SUMS
@@ -233,7 +250,75 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # Publishing goes through the `release` deployment environment so that
+    # required reviewers (and a wait timer, or a tag/branch restriction) can
+    # be switched on under Settings -> Environments without another workflow
+    # change. An environment with no protection rules passes straight
+    # through — GitHub creates it on first use — so this is a no-op until
+    # someone configures it.
+    environment: release
+    permissions:
+      contents: write        # create the tag / release and upload assets
+      id-token: write        # sign the build-provenance attestation
+      attestations: write    # store the attestation
     steps:
+      # A published release is what `install.sh` / `install.ps1` download, and
+      # its archives are what the attestations below vouch for. Re-running
+      # this workflow for a tag that already has assets would silently swap
+      # those bytes, so refuse unless the run was dispatched with
+      # `overwrite: true`. (A tag push never sets it; `auto-tag.yml`
+      # dispatches without it and only ever for a brand-new tag.) A release
+      # that does not exist yet, or exists with no assets, counts as zero.
+      # Every value travels via `env:`, never interpolated into `run:`.
+      - name: Refuse to overwrite a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if out="$(gh release view "$TAG" --json assets --jq '.assets | length' 2>&1)"; then
+            count="$out"
+          elif printf '%s\n' "$out" | grep -qi 'release not found'; then
+            count=0
+          else
+            # Not the wording we know for "no such release". Rather than
+            # guess, ask the REST API, where a missing release is an
+            # unambiguous HTTP 404.
+            err="$(mktemp)"
+            if rest="$(gh api "repos/${GH_REPO}/releases/tags/${TAG}" --jq '.assets | length' 2>"$err")"; then
+              count="$rest"
+            elif grep -q 'HTTP 404' "$err"; then
+              count=0
+            else
+              echo "::error::could not query the release for ${TAG}: ${out} / $(cat "$err")"
+              exit 1
+            fi
+          fi
+          case "$count" in
+            ''|*[!0-9]*)
+              echo "::error::unexpected asset count for ${TAG}: ${count}"
+              exit 1
+              ;;
+          esac
+          echo "Release ${TAG} currently has ${count} asset(s)."
+          if [ "$count" -gt 0 ]; then
+            if [ "$OVERWRITE" = "true" ]; then
+              echo "::warning::overwrite=true: replacing the ${count} existing asset(s) of ${TAG}."
+            else
+              echo "::error::release ${TAG} already has ${count} asset(s); refusing to replace them. Re-run via workflow_dispatch with overwrite=true if that is intended."
+              exit 1
+            fi
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
@@ -260,10 +345,9 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
-        # Kept on the v4 line to match upload-artifact@v4 above: artifact
-        # up/download pairing across majors is unverified, and this job is
-        # the release pipeline. Bump BOTH halves together (with a
-        # pre-release dry-run tag) when moving off v4.
+        # Bump this together with `upload-artifact` above (with a
+        # pre-release dry-run tag): the pairing across majors matters and
+        # this job is the release pipeline.
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
@@ -301,3 +385,18 @@ jobs:
             release/*.tar.gz
             release/*.zip
             release/SHA256SUMS
+
+      # Signed SLSA build provenance for every archive, so a download can be
+      # tied back to this workflow run and source commit independently of
+      # the same-origin SHA256SUMS file:
+      #   gh attestation verify tyc-<version>-<target>.tar.gz --repo CodeHalwell/Typhon
+      # Runs after publishing so that an attestation-service outage cannot
+      # block a release; the job still goes red. Recovering then means a new
+      # workflow_dispatch run with `overwrite: true` — the guard at the top of
+      # this job refuses a plain re-run, because the assets already exist.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip

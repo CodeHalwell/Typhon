@@ -2149,6 +2149,7 @@ dependencies = [
 name = "tyc-venv"
 version = "1.0.0-beta.7"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2161,6 +2162,7 @@ dependencies = [
 name = "tyc-vm"
 version = "1.0.0-beta.7"
 dependencies = [
+ "getrandom 0.4.2",
  "hashbrown 0.17.1",
  "indexmap",
  "libc",

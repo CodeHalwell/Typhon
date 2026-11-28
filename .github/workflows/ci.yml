@@ -611,8 +611,10 @@ jobs:
       # python3.13 gates. `TYC_REQUIRE_PYTHON=1` below is the second line of
       # defence: it makes *any* reduced-coverage fixture fatal, whatever the
       # cause. (PR #360 review, Codex P2.)
+      # Pinned to the same version the differential jobs install, so a new
+      # pydantic release cannot change (or compromise) what CI runs on main.
       - name: Install pydantic (model-extra fixture runtime)
-        run: python3.13 -m pip install --quiet pydantic
+        run: python3.13 -m pip install --quiet pydantic==2.13.4
 
       - name: Knob codegen matrix
         run: scripts/knob-matrix.sh
@@ -659,7 +661,7 @@ jobs:
       # See the knob-matrix job: model-extra needs pydantic to execute, and a
       # reduced fixture is fatal under TYC_REQUIRE_PYTHON.
       - name: Install pydantic (model-extra fixture runtime)
-        run: python3.15 -m pip install --quiet pydantic
+        run: python3.15 -m pip install --quiet pydantic==2.13.4
 
       - name: Knob codegen matrix on 3.15
         run: scripts/knob-matrix.sh
@@ -737,6 +739,9 @@ jobs:
 
       # pydantic-core may not publish wheels for a 3.16 alpha yet; a missing
       # package only reduces the fixtures that need it, so failure is allowed.
+      # Deliberately the only unpinned pip install in this file: the pinned
+      # pydantic the other jobs use may never support a 3.16 pre-release, and
+      # this job is a non-blocking canary whose point is the newest pairing.
       - name: Install runtime packages (best effort)
         if: steps.py316.outputs.available == 'true'
         continue-on-error: true

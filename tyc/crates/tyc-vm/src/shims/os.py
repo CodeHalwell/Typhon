@@ -416,6 +416,13 @@ def access(path, mode, *, dir_fd=None, effective_ids=False, follow_symlinks=True
 
 
 def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+    # A symlink's own mode: macOS and the BSDs can change it (`lchmod`);
+    # Linux cannot, and CPython says so rather than changing the mode of
+    # the file the link points at. Never fall through to the target.
+    if not follow_symlinks and (lstat(path).st_mode & 0o170000) == 0o120000:
+        if not _fs_lchmod(path, mode):
+            raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+        return
     _fs_chmod(path, mode)
 
 

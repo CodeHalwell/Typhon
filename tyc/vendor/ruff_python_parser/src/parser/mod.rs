@@ -56,7 +56,47 @@ pub(crate) struct Parser<'src> {
 
     /// The start offset in the source code from which to start parsing at.
     start_offset: TextSize,
+
+    /// Typhon: how many nesting constructs (expressions, patterns, blocks)
+    /// are open at the current token. See [`MAX_NESTING_DEPTH`].
+    nesting_depth: u32,
+
+    /// Typhon: the deepest absolute nesting level any node built since the
+    /// last [`Parser::height_mark`] sits at. Used to measure the height of a
+    /// just-parsed subtree, so that the iteratively built left-deep chains
+    /// (`a + b + …`, `a.b.c…`, `f()()…`) count against the limit too.
+    nesting_high_water: u32,
+
+    /// Typhon: how many f-/t-strings are open at the current token.
+    interpolated_string_depth: u32,
+
+    /// Typhon: how many indented blocks are open at the current token.
+    block_depth: u32,
 }
+
+/// Typhon: the deepest nesting the parser accepts before it reports a syntax
+/// error and stops.
+///
+/// Upstream has no limit: the recursive descent overflows the native stack on
+/// a few hundred thousand nested brackets, and a million-term `a + 1 + 1 + …`
+/// parses (the loop is iterative) into a tree every later recursive walker --
+/// including `Drop` -- overflows on. CPython draws the same line for the same
+/// reason (`MAXSTACK` 6000 in its parser, plus the compiler's recursion
+/// limit); this value is deliberately a little above it.
+pub const MAX_NESTING_DEPTH: u32 = 10_000;
+
+/// Typhon: how deep f-strings (and t-strings) may nest inside one another's
+/// replacement fields. The lexer keeps a stack of open strings that every
+/// checkpoint copies, so parse time is quadratic in this depth; CPython stops
+/// at 150 (`MAXFSTRINGLEVEL`).
+pub const MAX_INTERPOLATED_STRING_DEPTH: u32 = 1000;
+
+/// Typhon: how deep indented blocks (`if`, `def`, `class`, `with`, `try`,
+/// `match` / `case`, loops) may nest. The statement walkers downstream keep
+/// per-block state that grows with the nesting — 2,000 nested `def`s took
+/// the type checker past 3.6 GB — and CPython stops at 100 ("too many levels
+/// of indentation").
+pub const MAX_BLOCK_DEPTH: u32 = 500;
 
 impl<'src> Parser<'src> {
     /// Create a new parser for the given source code.
@@ -82,6 +122,10 @@ impl<'src> Parser<'src> {
             prev_token_end: TextSize::new(0),
             start_offset,
             current_token_id: TokenId::default(),
+            nesting_depth: 0,
+            nesting_high_water: 0,
+            interpolated_string_depth: 0,
+            block_depth: 0,
         }
     }
 
@@ -209,6 +253,96 @@ impl<'src> Parser<'src> {
             errors: merged,
             unsupported_syntax_errors: self.unsupported_syntax_errors,
         }
+    }
+
+    /// Typhon: open one nesting level. Returns `false` -- after reporting the
+    /// error and discarding the rest of the input -- when that would pass
+    /// [`MAX_NESTING_DEPTH`]; the caller must then return a placeholder node
+    /// without recursing and without calling [`Parser::leave_nesting`].
+    fn enter_nesting(&mut self) -> bool {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            self.report_nesting_too_deep();
+            return false;
+        }
+        self.nesting_depth += 1;
+        if self.nesting_high_water < self.nesting_depth {
+            self.nesting_high_water = self.nesting_depth;
+        }
+        true
+    }
+
+    /// Typhon: close the level opened by a successful [`Parser::enter_nesting`].
+    fn leave_nesting(&mut self) {
+        self.nesting_depth -= 1;
+    }
+
+    /// Typhon: start measuring the height of the subtree parsed next. Pass
+    /// the returned value to [`Parser::height_since`].
+    fn height_mark(&mut self) -> u32 {
+        std::mem::replace(&mut self.nesting_high_water, self.nesting_depth)
+    }
+
+    /// Typhon: how many levels below the current one the nodes parsed since
+    /// the matching [`Parser::height_mark`] reach.
+    fn height_since(&mut self, mark: u32) -> u32 {
+        let height = self.nesting_high_water.saturating_sub(self.nesting_depth);
+        if self.nesting_high_water < mark {
+            self.nesting_high_water = mark;
+        }
+        height
+    }
+
+    /// Typhon: record that a chain built by a loop (so without recursion) at
+    /// the current level is now `height` nodes tall, and enforce the limit on
+    /// it. Once the limit is hit the token source is exhausted, which ends
+    /// the caller's loop.
+    fn note_chain_height(&mut self, height: u32) {
+        let reached = self.nesting_depth.saturating_add(height);
+        if self.nesting_high_water < reached {
+            self.nesting_high_water = reached;
+        }
+        if reached > MAX_NESTING_DEPTH {
+            self.report_nesting_too_deep();
+        }
+    }
+
+    /// Typhon: report the nesting-limit error (once) and make every later
+    /// token `EndOfFile`.
+    fn report_nesting_too_deep(&mut self) {
+        self.report_too_deep(format!(
+            "too deeply nested: expressions, patterns and blocks can nest \
+             at most {MAX_NESTING_DEPTH} levels deep"
+        ));
+    }
+
+    /// Typhon: report that f-strings nest past
+    /// [`MAX_INTERPOLATED_STRING_DEPTH`] and discard the rest of the input.
+    fn report_interpolated_strings_too_deep(&mut self) {
+        self.report_too_deep(format!(
+            "too many nested f-strings: at most \
+             {MAX_INTERPOLATED_STRING_DEPTH} can be open at once"
+        ));
+    }
+
+    /// Typhon: report that blocks nest past [`MAX_BLOCK_DEPTH`] and discard
+    /// the rest of the input.
+    fn report_blocks_too_deep(&mut self) {
+        self.report_too_deep(format!(
+            "too many levels of indentation: blocks can nest at most \
+             {MAX_BLOCK_DEPTH} deep"
+        ));
+    }
+
+    fn report_too_deep(&mut self, message: String) {
+        if self.tokens.is_exhausted() {
+            return;
+        }
+        let location = self.current_token_range();
+        self.errors.push(ParseError {
+            error: ParseErrorType::OtherError(message),
+            location,
+        });
+        self.tokens.exhaust();
     }
 
     /// Returns the start position for a node that starts at the current token.

@@ -160,6 +160,18 @@ fn ty_source_row(
     } else {
         Path::new(py_dir).join(path)
     };
+    // The path comes from a `.py.map` sidecar's `source` field, which is
+    // whatever the build directory says it is — and a cloned project can
+    // commit its own maps. Only ever quote a Typhon source file: a map naming
+    // `~/.ssh/id_ed25519` or `../.env` must not get a line of that file
+    // printed into a traceback somebody is about to paste into an issue.
+    let is_typhon_source = candidate
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "ty" || e == "dty");
+    if !is_typhon_source {
+        return None;
+    }
     let lines = sources.entry(path.to_owned()).or_insert_with(|| {
         std::fs::read_to_string(&candidate)
             .ok()
@@ -243,6 +255,31 @@ fn parse_line_suffix(s: &str) -> Option<(u32, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_traceback_never_quotes_a_non_typhon_file() {
+        // The map's `source` is data from the build directory. Naming a
+        // file that is not Typhon source must not get its content printed.
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("main.py");
+        let secret = dir.path().join("secret.env");
+        std::fs::write(&py, "").unwrap();
+        std::fs::write(&secret, "TOKEN=hunter2\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.py.map"),
+            format!(
+                r#"{{"version":2,"source":{:?},"line_strategy":"table","lines":[1]}}"#,
+                secret.display().to_string()
+            ),
+        )
+        .unwrap();
+        let text = format!(
+            "Traceback (most recent call last):\n  File \"{py}\", line 1, in <module>\n    x = 1\nValueError: bad\n",
+            py = py.display()
+        );
+        let result = rewrite_traceback(&text, None);
+        assert!(!result.contains("hunter2"), "leaked:\n{result}");
+    }
     use crate::commands::source_map::LineStrategy;
 
     // ── map parsing ──────────────────────────────────────────────────────────

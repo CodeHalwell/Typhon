@@ -291,7 +291,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
     //    back to plain `python -m <debugger>`.
     let use_wrapper = !args.raw_pdb && args.debugger == "pdb";
 
-    let mut wrapper_guard: Option<tempfile::NamedTempFile> = None;
+    let mut wrapper_guard: Option<crate::commands::util::PrivateScript> = None;
 
     let mut cmd = Command::new(&args.python);
     if use_wrapper {
@@ -343,7 +343,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
 /// control characters are escaped, and every non-ASCII character becomes a
 /// `\uXXXX` / `\UXXXXXXXX` escape, so the literal is plain ASCII and means
 /// exactly `s` to Python whatever the wrapper file's encoding.
-fn python_str_literal(s: &str) -> String {
+pub(crate) fn python_str_literal(s: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -374,15 +374,14 @@ fn python_str_literal(s: &str) -> String {
 /// `pdb.Pdb`, loads the project's `.py.map` sidecars, and prints the
 /// originating `.ty:line` next to every paused frame.
 ///
-/// The wrapper returns a [`tempfile::NamedTempFile`]. Caller is
+/// Returns a [`crate::commands::util::PrivateScript`]. Caller is
 /// responsible for keeping it alive until the child process exits —
-/// dropping the handle deletes the file.
+/// dropping the handle deletes the file and its private directory.
 fn write_typhon_pdb_wrapper(
     out_dir: &Path,
     entry: &Path,
     breakpoint_cmds: &[String],
-) -> std::io::Result<tempfile::NamedTempFile> {
-    use std::io::Write;
+) -> std::io::Result<crate::commands::util::PrivateScript> {
     let entry_str = entry.to_string_lossy().into_owned();
     let map_dir = out_dir.to_string_lossy().into_owned();
     // Every value is spliced in as a Python string literal built by
@@ -673,13 +672,9 @@ if __name__ == "__main__":
         break_cmds = break_cmds,
     );
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix("typhon-pdb-")
-        .suffix(".py")
-        .tempfile()?;
-    tmp.write_all(body.as_bytes())?;
-    tmp.flush()?;
-    Ok(tmp)
+    // In a private directory, not loose in the shared temp dir: the script's
+    // directory is `sys.path[0]` for its `import json` / `pdb` / `runpy`.
+    crate::commands::util::PrivateScript::create("typhon-pdb-", "typhon_pdb_wrapper.py", &body)
 }
 
 #[cfg(test)]

@@ -43,9 +43,14 @@ pub(super) fn continued_fstring_field_exprs(line: &str, quote: u8) -> Vec<Range<
 /// `quote_at`, or `""`.
 pub(super) fn string_prefix(code: &str, quote_at: usize) -> &str {
     let head = &code[..quote_at];
+    // `rfind` gives the *start* of the last non-letter; step over all of its
+    // bytes. `p + 1` landed inside a multi-byte character (`é"…`) and the
+    // slice below panicked.
     let start = head
-        .rfind(|c: char| !c.is_ascii_alphabetic())
-        .map_or(0, |p| p + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_alphabetic())
+        .map_or(0, |(p, c)| p + c.len_utf8());
     let letters = &head[start..];
     if letters.len() <= 3
         && letters
@@ -171,4 +176,19 @@ pub(super) fn field_expression_len(field: &str) -> usize {
         }
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `p + 1` after a multi-byte character sliced inside it and panicked
+    /// `tyc check` / `tyc fmt` on the five-byte file `é"|>`.
+    #[test]
+    fn string_prefix_steps_over_a_multibyte_character() {
+        let code = "é\"x\"";
+        assert_eq!(string_prefix(code, code.find('"').unwrap()), "");
+        let code = "λ rb\"x\"";
+        assert_eq!(string_prefix(code, code.find('"').unwrap()), "rb");
+    }
 }

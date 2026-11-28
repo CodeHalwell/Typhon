@@ -91,6 +91,18 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
+    run_with_manifest(args, true)
+}
+
+/// A build that only exists to feed a checker — `tyc check --with-ty`
+/// emitting into a throwaway directory. It must leave the project exactly as
+/// it found it: `pyproject.toml` is not merged, and `uv` is never spawned
+/// (resolving or building a dependency can execute code the project ships).
+pub fn run_scratch(args: BuildArgs) -> Result<()> {
+    run_with_manifest(args, false)
+}
+
+fn run_with_manifest(args: BuildArgs, update_manifest: bool) -> Result<()> {
     // A single `.ty` file is not a project root. Inside a project it names
     // one file to build (`tyc build tests/test_app.ty`); outside one there
     // is nothing to anchor it to — without this guard the path got joined
@@ -254,6 +266,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
         config.project.src = rel.to_string_lossy().into_owned();
     }
     let src_dir = config_dir.join(&config.project.src);
+    refuse_src_symlink_outside_project(&src_dir, &config_dir)?;
+    crate::commands::util::apply_comptime_env_policy(&config);
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
     // writes to `path/to/proj/build` rather than the caller's cwd.
@@ -402,7 +416,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             {
                 live.push(out_dir.join("conftest.py"));
             }
-            remove_stale_outputs(&out_dir, &live, &project_root, false);
+            remove_stale_outputs(&out_dir, &live, &project_root, &src_dir, false);
         }
         return Ok(());
     }
@@ -473,12 +487,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // `--no-sync` (or `TYC_NO_SYNC=1`) skips the `uv sync` step while
     // still merging the manifest, so stress harnesses and REPL-like
     // iteration don't pay the per-invocation reprovision cost.
-    let skip_sync = args.no_sync || std::env::var_os("TYC_NO_SYNC").is_some_and(|v| v == "1");
+    // Any value but empty or `0` counts — `TYC_NO_SYNC=true` used to be
+    // silently ignored, and this is a switch people set for safety.
+    let skip_sync =
+        args.no_sync || std::env::var_os("TYC_NO_SYNC").is_some_and(|v| !v.is_empty() && v != "0");
     // `--check` is documented as a dry run that touches nothing on disk. The
     // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
     // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
     // check mode and reported like every other write.
-    if unit_rel.is_some() || partial {
+    if unit_rel.is_some() || partial || !update_manifest {
+        // A scratch build (`run_scratch`) leaves the project untouched.
         // The manifest describes the whole project, and its dependencies
         // (pydantic for `model`, say) are derived from all of `src/`. A
         // partial build — another directory, or one file even inside
@@ -651,6 +669,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_shapes,
         );
         all_phase1_diags.extend(file_diags);
+        all_phase1_diags.extend(crate::commands::check::check_source_hygiene(
+            &path.to_string_lossy(),
+            source,
+        ));
         all_phase1_diags.extend(crate::commands::check::check_target_syntax(
             &path.to_string_lossy(),
             source,
@@ -1962,7 +1984,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Stale outputs: anything a previous build wrote that this one did not.
     if !check_mode {
-        remove_stale_outputs(&out_dir, &written_outputs, &project_root, partial);
+        remove_stale_outputs(&out_dir, &written_outputs, &project_root, &src_dir, partial);
     }
 
     // `tyc build` compiles the source tree; say so when tests sit beside it
@@ -2454,6 +2476,37 @@ fn canonical_or_lexical(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+/// `[project] src` may not be an absolute path or climb out with `..`
+/// (rejected when the config is loaded), and it may not get there through a
+/// symlink either: `src -> ../other-project` would compile that tree and copy
+/// its hand-written `.py` files into this project's build directory.
+pub(crate) fn refuse_src_symlink_outside_project(
+    src_dir: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Result<()> {
+    if !std::fs::symlink_metadata(src_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    let (Ok(real), Ok(root)) = (
+        std::fs::canonicalize(src_dir),
+        std::fs::canonicalize(project_root),
+    ) else {
+        // A dangling link: the "source directory does not exist" error
+        // that follows describes it better.
+        return Ok(());
+    };
+    if real.starts_with(&root) {
+        return Ok(());
+    }
+    Err(miette!(
+        "source directory '{}' is a symlink to '{}', outside the project '{}'; \
+         point [project] src at a directory inside the project",
+        src_dir.display(),
+        real.display(),
+        root.display()
+    ))
+}
+
 fn validate_output_confinement(
     root: &std::path::Path,
     root_label: &str,
@@ -2494,7 +2547,7 @@ fn validate_output_confinement(
     Ok(())
 }
 
-fn confine_output_path(
+pub(crate) fn confine_output_path(
     root: &std::path::Path,
     root_label: &str,
     dest: &std::path::Path,
@@ -3130,7 +3183,13 @@ const MANIFEST_HEADER: &str =
 /// `partial` marks a single-file build: it says nothing about the other
 /// sources, so nothing is removed and the previous manifest entries are
 /// carried forward alongside what this build wrote.
-fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path, partial: bool) {
+fn remove_stale_outputs(
+    out_dir: &Path,
+    written: &[PathBuf],
+    project_root: &Path,
+    src_dir: &Path,
+    partial: bool,
+) {
     let rel_of = |p: &Path| -> Option<String> {
         p.strip_prefix(out_dir)
             .ok()
@@ -3186,6 +3245,13 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
     // directory inside it (`build/old -> /elsewhere`) must not let a
     // manifest entry such as `old/victim.py` remove a file outside.
     let canon_out = out_dir.canonicalize().ok();
+    // Only meaningful when the sources are not themselves an ancestor of the
+    // output directory (`src = "."`, `out = "build"`), where every output
+    // would otherwise count as "inside the sources".
+    let canon_src = src_dir
+        .canonicalize()
+        .ok()
+        .filter(|src| !canon_out.as_ref().is_some_and(|out| out.starts_with(src)));
     let written_canon: std::collections::HashSet<PathBuf> = written
         .iter()
         .filter_map(|p| p.canonicalize().ok())
@@ -3196,7 +3262,22 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
         if rel.starts_with('/') || rel.split('/').any(|c| c == ".." || c.is_empty()) {
             continue;
         }
+        // The manifest is a file in the repository, so it is only a hint:
+        // an entry is honoured when it also *looks* like something `tyc`
+        // writes. With `out = "."` the output directory is the project
+        // itself, and a committed manifest listing `.git/config`, `LICENSE`
+        // or `src/main.ty` must not turn `tyc build` into `rm`.
+        if !is_generated_output_name(rel) {
+            continue;
+        }
         let path = out_dir.join(rel);
+        // Hand-written sources are never stale build output, wherever the
+        // output directory sits relative to them.
+        if let (Some(src), Some(Ok(parent))) = (&canon_src, path.parent().map(Path::canonicalize)) {
+            if parent.starts_with(src) {
+                continue;
+            }
+        }
         let parent_inside = match (&canon_out, path.parent().map(Path::canonicalize)) {
             (Some(out), Some(Ok(parent))) => parent.starts_with(out),
             _ => false,
@@ -3269,6 +3350,35 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
     }
 }
 
+/// Whether a manifest entry names the kind of file `tyc build` generates:
+/// a `.py` module, a `.pyi` stub, or a `.py.map` sidecar under
+/// `.sourcemaps/`. Nothing in any other hidden directory (`.git/`, `.venv/`,
+/// `.github/`) qualifies.
+fn is_generated_output_name(rel: &str) -> bool {
+    let mut parts = rel.split('/').peekable();
+    let mut first = true;
+    let mut in_sourcemaps = false;
+    while let Some(part) = parts.next() {
+        let is_last = parts.peek().is_none();
+        if is_last {
+            return if in_sourcemaps {
+                part.ends_with(".py.map")
+            } else {
+                !part.starts_with('.') && (part.ends_with(".py") || part.ends_with(".pyi"))
+            };
+        }
+        if part.starts_with('.') {
+            if first && part == ".sourcemaps" {
+                in_sourcemaps = true;
+            } else {
+                return false;
+            }
+        }
+        first = false;
+    }
+    false
+}
+
 /// Whether any directory between `out_dir` and `out_dir/rel` is a symlink.
 /// A stale manifest entry that reaches its file through an internal link
 /// (`build/old -> new`) names something this build may own under its real
@@ -3295,13 +3405,16 @@ const GENERATED_CONFTEST_HEADER: &str = "# Generated by tyc build";
 fn generated_conftest(rel_to_build: &Path) -> String {
     let rel = rel_to_build.to_string_lossy().replace('\\', "/");
     let rel = if rel.is_empty() { ".".to_owned() } else { rel };
+    // A Python literal, not Rust's `{:?}`: the two agree on ASCII but Rust
+    // writes other characters as `\u{…}`, which Python rejects.
+    let rel = crate::commands::debug::python_str_literal(&rel);
     format!(
         "{GENERATED_CONFTEST_HEADER}: puts the project's compiled modules on sys.path\n\
          # so these tests import them. Add your own conftest (.ty or .py) to replace it.\n\
          import sys\n\
          from pathlib import Path\n\
          \n\
-         _BUILD = (Path(__file__).resolve().parent / {rel:?}).resolve()\n\
+         _BUILD = (Path(__file__).resolve().parent / {rel}).resolve()\n\
          if str(_BUILD) not in sys.path:\n\
          \x20   sys.path.insert(0, str(_BUILD))\n"
     )
@@ -5192,16 +5305,25 @@ def _load_state():
 # Written as chr(10) because this module is emitted from a Rust string
 # literal, where a backslash escape would have to be doubled.
 _NL = chr(10)
+_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 
 
 def _ty_source(path, cache):
     # Lines of a `.ty` file, or None when it cannot be read.
+    #
+    # The path comes from a `.py.map` sidecar's `source` field. A traceback
+    # is written to stderr and from there into logs and bug reports, so a
+    # tampered map must not be able to name `/etc/passwd` or an `.env` file
+    # and have a line of it quoted: only Typhon source of a sane size is read.
     if path not in cache:
-        try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as fh:
-                cache[path] = fh.read().split(_NL)
-        except OSError:
-            cache[path] = None
+        cache[path] = None
+        if str(path).endswith(('.ty', '.dty')):
+            try:
+                if os.path.getsize(path) <= _MAX_SOURCE_BYTES:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                        cache[path] = fh.read().split(_NL)
+            except OSError:
+                pass
     return cache[path]
 
 
@@ -5430,6 +5552,116 @@ def _try_interpreters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_only_trusts_manifest_entries_that_look_generated() {
+        for ok in [
+            "main.py",
+            "pkg/mod.py",
+            "pkg/mod.pyi",
+            "typhon_runtime/result.py",
+            ".sourcemaps/pkg/mod.py.map",
+            "tests/conftest.py",
+        ] {
+            assert!(is_generated_output_name(ok), "{ok} should be sweepable");
+        }
+        for bad in [
+            ".git/config",
+            ".git/hooks/x.py",
+            "LICENSE",
+            "docs/notes.md",
+            "src/main.ty",
+            "typhon.toml",
+            ".hidden.py",
+            "pkg/.venv/lib/x.py",
+            ".sourcemaps/secret.txt",
+            "pkg/.sourcemaps/x.py.map",
+            "",
+        ] {
+            assert!(
+                !is_generated_output_name(bad),
+                "{bad} must not be sweepable"
+            );
+        }
+    }
+
+    /// With `out = "."` the output directory is the project itself. A
+    /// committed manifest must not be able to delete the repository's own
+    /// files — only stale generated modules.
+    #[test]
+    fn stale_sweep_with_out_dot_spares_project_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (src, _) = scaffold(root, "let x: int = 1\n");
+        std::fs::write(
+            root.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \".\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::write(root.join("LICENSE"), "MIT\n").unwrap();
+        std::fs::write(root.join("gone.py"), "# stale\n").unwrap();
+        std::fs::write(src.join("hand.py"), "# hand-written\n").unwrap();
+        std::fs::write(
+            root.join(BUILD_MANIFEST),
+            ".git/config\nLICENSE\nsrc/main.ty\nsrc/hand.py\ntyphon.toml\ngone.py\n",
+        )
+        .unwrap();
+        let mut args = build_args(root);
+        args.no_sync = true;
+        run(args).unwrap();
+        for kept in [
+            ".git/config",
+            "LICENSE",
+            "src/main.ty",
+            "src/hand.py",
+            "typhon.toml",
+        ] {
+            assert!(root.join(kept).is_file(), "{kept} must survive the sweep");
+        }
+        assert!(
+            !root.join("gone.py").exists(),
+            "a stale module is still swept"
+        );
+    }
+
+    /// `src -> <somewhere outside the project>` is refused rather than
+    /// compiled and copied into this project's build directory.
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_src_symlinked_outside_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("main.ty"), "let x: int = 1\n").unwrap();
+        std::fs::write(outside.path().join("settings.py"), "KEY = 'k'\n").unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::remove_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &src).unwrap();
+        let mut args = build_args(tmp.path());
+        args.no_sync = true;
+        let err = run(args).unwrap_err().to_string();
+        assert!(err.contains("outside the project"), "{err}");
+        assert!(!out.join("settings.py").exists());
+    }
+
+    /// A scratch build (`tyc check --with-ty`) leaves `pyproject.toml` alone.
+    #[test]
+    fn scratch_build_does_not_touch_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        let mut args = build_args(tmp.path());
+        args.out = Some(scratch.path().to_path_buf());
+        args.no_sync = true;
+        run_scratch(args).unwrap();
+        assert!(scratch.path().join("main.py").is_file());
+        assert!(
+            !tmp.path().join("pyproject.toml").exists(),
+            "a scratch build must not write pyproject.toml into the project"
+        );
+    }
 
     /// Scaffold a minimal project under `dir` and return the src and build paths.
     fn scaffold(
@@ -7264,6 +7496,19 @@ let pet: Animal = Dog(name=\"Rex\")
             tmp.path(),
             "comptime let API_KEY: str = env(\"FAKE_API_KEY\", \"test-value\")\nlet x: str = API_KEY\n",
         );
+        // A credential-named variable is not read at all unless the project
+        // allows it…
+        let refused = run(build_args(tmp.path()));
+        assert!(
+            refused.is_err(),
+            "reading FAKE_API_KEY must need [env] allow: {refused:?}"
+        );
+        assert!(!out_dir.join("main.py").exists());
+        // …and once it does, inlining it is a warning, not an error.
+        let toml = tmp.path().join("typhon.toml");
+        let mut config = std::fs::read_to_string(&toml).unwrap();
+        config = config.replace("[env]\n", "[env]\nallow = [\"FAKE_API_KEY\"]\n");
+        std::fs::write(&toml, config).unwrap();
         let result = run(BuildArgs {
             path: tmp.path().to_path_buf(),
             out: None,

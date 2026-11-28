@@ -278,6 +278,13 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
         Ok(None) => (TyphonConfig::default(), false, PathBuf::from(".")),
         Err(e) => return Err(miette!("{e}")),
     };
+    crate::commands::util::apply_comptime_env_policy(&config);
+    if has_project_config {
+        crate::commands::build::refuse_src_symlink_outside_project(
+            &project_root.join(&config.project.src),
+            &project_root,
+        )?;
+    }
 
     let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
@@ -611,6 +618,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                 },
             );
             diags.extend(analysis_diags);
+            diags.extend(check_source_hygiene(&path.to_string_lossy(), &source));
             // `lazy from` is stripped by the preprocessor, so its target
             // gate reads the `.ty` text.
             if let Some((major, minor)) = python_target_u8(&config.python.target) {
@@ -751,7 +759,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
         } else {
             let td = tempfile::tempdir()
                 .map_err(|e| miette!("failed to create temp build dir for --with-ty: {e}"))?;
-            crate::commands::build::run(crate::commands::build::BuildArgs {
+            crate::commands::build::run_scratch(crate::commands::build::BuildArgs {
                 path: project_root.clone(),
                 out: Some(td.path().to_path_buf()),
                 no_format: true,
@@ -1187,6 +1195,215 @@ pub(crate) fn python_target_u8(target: &str) -> Option<(u8, u8)> {
 /// `tyc::requires_newer_python` for `tyc build`, which does not run
 /// the editor-lint pass `tyc check` reports it from. See
 /// [`tyc_analyse::target_version_diagnostics`].
+/// How many findings of one kind [`check_source_hygiene`] reports per file.
+const MAX_HYGIENE_REPORTS: usize = 20;
+
+/// Bidirectional-control characters: embeddings, overrides and isolates.
+/// They reorder how the surrounding text is *displayed* without changing the
+/// order the compiler reads it in ("Trojan Source", CVE-2021-42574), so a
+/// comment can appear to end before code that is in fact still inside it,
+/// and vice versa. The same set rustc rejects.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Checks on the raw text of a `.ty` file, before any rewriting:
+///
+/// * `tyc::reserved_name` (error) — an identifier in the `__typhon_`
+///   namespace. The compiler emits its helpers and temporaries there, so a
+///   user `def __typhon_checked_cast__(v, t): return v` silently replaced
+///   the runtime check behind every `as!` in the module.
+/// * `tyc::hidden_source_character` (warning) — a bidirectional-control
+///   character, or a carriage return that is not part of a CRLF line ending
+///   (Python treats it as a line break; most editors do not show one, so
+///   `# comment\rprint("hidden")` displays as a single comment line).
+pub(crate) fn check_source_hygiene(path: &str, source: &str) -> Diagnostics {
+    use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
+    let mut diags = Diagnostics::new();
+
+    // Every diagnostic carries its own copy of the source, so reporting each
+    // of 50,000 control characters in a 150 KB comment held 7.5 GB. The first
+    // few of each kind are enough to find and fix the file.
+    let (mut bidi, mut returns, mut reserved) = (0usize, 0usize, 0usize);
+    let bytes = source.as_bytes();
+    for (offset, c) in source.char_indices() {
+        if is_bidi_control(c) {
+            bidi += 1;
+            if bidi > MAX_HYGIENE_REPORTS {
+                continue;
+            }
+            diags.push_warning(TycError::hidden_source_character(
+                format!(
+                    "bidirectional control character U+{:04X}: the text around it is \
+                     displayed in a different order from the one it is compiled in",
+                    c as u32
+                ),
+                path,
+                source,
+                offset,
+                c.len_utf8(),
+            ));
+        } else if c == '\r' && bytes.get(offset + 1) != Some(&b'\n') {
+            returns += 1;
+            if returns > MAX_HYGIENE_REPORTS {
+                continue;
+            }
+            diags.push_warning(TycError::hidden_source_character(
+                "carriage return that is not part of a CRLF line ending: Python starts a \
+                 new line here, but most editors show the text after it on the same line",
+                path,
+                source,
+                offset,
+                1,
+            ));
+        }
+    }
+
+    lone_surrogate_escapes(path, source, &mut diags);
+
+    if source.contains("__typhon_") {
+        let mut in_string = None;
+        let mut line_start = 0usize;
+        for line in source.split_inclusive('\n') {
+            let text = line.trim_end_matches(['\n', '\r']);
+            let kinds = scan_line_kinds(text, &mut in_string);
+            let mut search = 0usize;
+            while let Some(found) = text[search..].find("__typhon_") {
+                let start = search + found;
+                let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+                let end = start
+                    + text.as_bytes()[start..]
+                        .iter()
+                        .take_while(|b| is_ident(**b))
+                        .count();
+                search = end;
+                let starts_a_name = start == 0 || !is_ident(text.as_bytes()[start - 1]);
+                let is_code = matches!(
+                    kinds.get(start),
+                    Some(ByteKind::Code | ByteKind::FStringExpr)
+                );
+                if starts_a_name && is_code && reserved < MAX_HYGIENE_REPORTS {
+                    reserved += 1;
+                    diags.push_error(TycError::reserved_name(
+                        &text[start..end],
+                        path,
+                        source,
+                        line_start + start,
+                        end - start,
+                    ));
+                }
+            }
+            line_start += line.len();
+        }
+    }
+    diags
+}
+
+/// Report `\\uD800`..`\\uDFFF` escapes in (non-raw, non-bytes) string
+/// literals. CPython builds a `str` holding the lone surrogate; the compiler
+/// keeps literals as UTF-8 text, which cannot, so the value was silently
+/// replaced by U+FFFD and the emitted program differed from its source.
+fn lone_surrogate_escapes(path: &str, source: &str, diags: &mut Diagnostics) {
+    use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
+    if !(source.contains("\\u") || source.contains("\\U")) {
+        return;
+    }
+    let mut in_string = None;
+    let mut line_start = 0usize;
+    // Whether the string being scanned decodes `\\u` escapes at all (a raw or
+    // bytes literal does not); carried across the lines of a multi-line one.
+    let mut decodes = true;
+    // The same, for the f-string whose replacement field we may be inside.
+    let mut outer_decodes = true;
+    let mut reported = 0usize;
+    let mut previous = ByteKind::Code;
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        let kinds = scan_line_kinds(text, &mut in_string);
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let kind = kinds[i];
+            if kind != ByteKind::StringText {
+                previous = kind;
+                i += 1;
+                continue;
+            }
+            if previous == ByteKind::Code || previous == ByteKind::Comment {
+                // A literal opens here: read its prefix letters.
+                let quote = (i..bytes.len())
+                    .find(|&j| bytes[j] == b'"' || bytes[j] == b'\'')
+                    .unwrap_or(i);
+                let prefix_start = (0..quote)
+                    .rev()
+                    .take_while(|&j| bytes[j].is_ascii_alphabetic())
+                    .last()
+                    .unwrap_or(quote);
+                let prefix = &text[prefix_start..quote];
+                decodes = !prefix
+                    .bytes()
+                    .any(|b| matches!(b.to_ascii_lowercase(), b'r' | b'b'));
+                outer_decodes = decodes;
+            } else if previous == ByteKind::FStringExpr {
+                // String text reached from inside a replacement field is
+                // either the enclosing f-string resuming after the field's
+                // `}`, or a literal nested in the field (`f"{r'\\ud800'}"`).
+                // A nested literal has a prefix of its own that this scan
+                // does not track, so it is not judged at all: missing a real
+                // escape there is better than rejecting a raw string.
+                // (The field's closing brace is classified with the string
+                // in some positions and with the field in others.)
+                let resumes_outer = bytes[i] == b'}' || (i > 0 && bytes[i - 1] == b'}');
+                decodes = resumes_outer && outer_decodes;
+            }
+            previous = kind;
+            if bytes[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            let digits = match bytes.get(i + 1) {
+                Some(b'u') => 4,
+                Some(b'U') => 8,
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            };
+            let end = i + 2 + digits;
+            let in_this_string =
+                end <= bytes.len() && kinds[i..end].iter().all(|k| *k == ByteKind::StringText);
+            // `get`, not indexing: a malformed escape such as `"\\u123é"` puts
+            // `end` inside a multi-byte character.
+            let hex = text
+                .get(i + 2..end)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+            if let (true, true, Some(hex)) = (decodes, in_this_string, hex) {
+                if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                    if (0xD800..=0xDFFF).contains(&cp) && reported < MAX_HYGIENE_REPORTS {
+                        reported += 1;
+                        diags.push_error(TycError::parse(
+                            path,
+                            source,
+                            format!(
+                                "the escape `{}` spells a lone surrogate, which a Typhon string \
+                                 literal cannot hold (it would silently become U+FFFD); build it \
+                                 at run time with `chr(0x{cp:X})`",
+                                &text[i..end]
+                            ),
+                            line_start + i,
+                        ));
+                    }
+                }
+            }
+            i = end.min(bytes.len()).max(i + 2);
+        }
+        if in_string.is_none() {
+            previous = ByteKind::Code;
+        }
+        line_start += line.len();
+    }
+}
+
 pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Diagnostics {
     let Some((major, minor)) = python_target_u8(target) else {
         return Diagnostics::new();
@@ -1353,6 +1570,68 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn lone_surrogate_escapes_are_rejected_where_python_decodes_them() {
+        let errs = |src: &str| check_source_hygiene("t.ty", src).errors().len();
+        assert_eq!(errs("s: str = \"\\ud800\"\n"), 1);
+        assert_eq!(errs("s: str = 'a\\uDFFFb'\n"), 1);
+        assert_eq!(errs("s: str = \"\\U0000d83d\"\n"), 1);
+        assert_eq!(errs("s: str = \"\"\"x\n\\udc00\n\"\"\"\n"), 1);
+        assert_eq!(errs("s: str = f\"{n}\\ud800\"\n"), 1);
+        // Not decoded: raw and bytes literals, an escaped backslash, a
+        // comment, and ordinary escapes.
+        assert_eq!(errs("s: str = r\"\\ud800\"\n"), 0);
+        assert_eq!(errs("b: bytes = b\"\\ud800\"\n"), 0);
+        assert_eq!(errs("s: str = \"\\\\ud800\"\n"), 0);
+        assert_eq!(errs("x: int = 1  # \\ud800\n"), 0);
+        assert_eq!(errs("s: str = \"\\u00e9 \\U0001F600 \\n\"\n"), 0);
+        // A raw or bytes literal nested in an f-string field has its own
+        // prefix; the enclosing f-string's text is still checked.
+        assert_eq!(errs("s: str = f\"{r'\\ud800'}\"\n"), 0);
+        assert_eq!(errs("s: str = f\"{len(b'\\ud800')}\"\n"), 0);
+        assert_eq!(errs("s: str = f\"{n}\\ud800{r'\\ud800'}\"\n"), 1);
+        // A malformed escape running into a multi-byte character is the
+        // parser's to report, not a panic here.
+        assert_eq!(errs("s: str = \"\\u123\u{e9}\"\n"), 0);
+        assert_eq!(errs("s: str = \"\\U0000d83\u{e9}\"\n"), 0);
+    }
+
+    #[test]
+    fn hygiene_findings_are_capped_per_file() {
+        let many = format!("# {}\n", "\u{202E}".repeat(5_000));
+        assert_eq!(
+            check_source_hygiene("t.ty", &many).warnings().len(),
+            MAX_HYGIENE_REPORTS
+        );
+    }
+
+    #[test]
+    fn reserved_prefix_is_an_error_in_code_only() {
+        let src = "def __typhon_checked_cast__(v: object, t: object) -> object:\n    return v\n\n\
+                   s: str = \"__typhon_in_a_string\"  # __typhon_in_a_comment\n\
+                   doc: str = \"\"\"\n__typhon_in_a_docstring\n\"\"\"\n\
+                   my__typhon_x: int = 1\n";
+        let diags = check_source_hygiene("t.ty", src);
+        assert_eq!(diags.errors().len(), 1, "{:?}", diags.errors());
+        assert!(format!("{:?}", diags.errors()).contains("__typhon_checked_cast__"));
+    }
+
+    #[test]
+    fn bidi_controls_and_lone_carriage_returns_warn() {
+        let trojan = "if level != \"user\u{202E} \u{2066}# admin\u{2069} \u{2066}\":\n    pass\n";
+        let diags = check_source_hygiene("t.ty", trojan);
+        assert!(diags.errors().is_empty());
+        assert_eq!(diags.warnings().len(), 4);
+
+        let hidden = "# comment\rprint(\"x\")\n";
+        assert_eq!(check_source_hygiene("t.ty", hidden).warnings().len(), 1);
+
+        // CRLF line endings, right-to-left text and its ordinary marks are fine.
+        let fine = "x: int = 1\r\ny: str = \"\u{05E9}\u{05DC}\u{05D5}\u{05DD}\u{200F}\"\r\n";
+        let diags = check_source_hygiene("t.ty", fine);
+        assert!(diags.warnings().is_empty() && diags.errors().is_empty());
     }
 
     #[test]

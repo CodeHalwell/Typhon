@@ -970,6 +970,91 @@ impl Emitter {
         self.write("}");
     }
 
+    /// Emit the elements of one interpolated-string part — the shared body
+    /// of an f-string and a PEP 750 t-string. Literal text has its braces
+    /// doubled (`{{` / `}}`): the parser hands it over un-escaped, and
+    /// writing it back bare would turn inert text into a live interpolation.
+    /// Conversions (`!r`), format specs and `=` debug text are preserved.
+    fn emit_interpolated_elements(
+        &mut self,
+        elements: &ruff_python_ast::InterpolatedStringElements,
+        outer: char,
+    ) {
+        for elem in elements {
+            match elem {
+                InterpolatedStringElement::Literal(lit) => {
+                    self.write(&escape_python_fstring_literal(&lit.value, outer));
+                }
+                InterpolatedStringElement::Interpolation(interp) => {
+                    // PEP 501 debug f-string: `f"{x=}"` carries
+                    // the verbatim `x=` text on `debug_text`,
+                    // including the surrounding whitespace
+                    // (`f"{x = }"`). Emit it as-is so the
+                    // `=` marker survives the round-trip.
+                    // Verbatim text can never begin or end
+                    // with a bare brace (that would have been
+                    // the `{{` / `}}` escape in the source),
+                    // so the brace-separation spaces must not
+                    // fire — the debug output reproduces them
+                    // verbatim at runtime.
+                    if let Some(dt) = &interp.debug_text {
+                        self.write("{");
+                        self.write(dt.as_str());
+                    } else {
+                        self.open_interpolation(&interp.expression);
+                        self.emit_expr(&interp.expression);
+                    }
+                    // Emit `!r` / `!s` / `!a` conversion flags
+                    // — these are stripped by default by the
+                    // AST but carried on the `conversion`
+                    // field. Losing them silently changes
+                    // runtime output of `f"{x!r}"` etc.
+                    let conversion = interp.conversion.to_char();
+                    if let Some(c) = conversion {
+                        self.write("!");
+                        self.write_char(c);
+                    }
+                    // Emit `:FORMAT_SPEC` — the spec is
+                    // itself a mini-f-string that may
+                    // contain further interpolations
+                    // (`f"{n:>{width}}"`).
+                    if let Some(spec) = &interp.format_spec {
+                        self.write(":");
+                        for spec_elem in &spec.elements {
+                            match spec_elem {
+                                InterpolatedStringElement::Literal(lit) => {
+                                    self.write(&escape_python_fstring_literal(&lit.value, outer));
+                                }
+                                InterpolatedStringElement::Interpolation(nested) => {
+                                    self.open_interpolation(&nested.expression);
+                                    self.emit_expr(&nested.expression);
+                                    self.close_interpolation(&nested.expression);
+                                }
+                            }
+                        }
+                    }
+                    // The close separator only exists to keep
+                    // the *expression's* trailing `}` from
+                    // pairing with the closing brace into the
+                    // `}}` escape. Debug text, a conversion,
+                    // or a format spec already separates them
+                    // — and a space added after those lands
+                    // *inside* the conversion/spec (a
+                    // SyntaxError after `!r`; format code
+                    // `\x20` in a spec).
+                    if interp.debug_text.is_some()
+                        || conversion.is_some()
+                        || interp.format_spec.is_some()
+                    {
+                        self.write("}");
+                    } else {
+                        self.close_interpolation(&interp.expression);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn emit_expr(&mut self, node: &Expr) {
         // Only the outermost expression of a statement may be a bare
         // `yield`; anything reached recursively from here is nested.
@@ -1334,87 +1419,7 @@ impl Emitter {
                             self.write(&escape_python_fstring_literal(lit.as_str(), outer));
                         }
                         FStringPart::FString(inner) => {
-                            for elem in &inner.elements {
-                                match elem {
-                                    InterpolatedStringElement::Literal(lit) => {
-                                        self.write(&escape_python_fstring_literal(
-                                            &lit.value, outer,
-                                        ));
-                                    }
-                                    InterpolatedStringElement::Interpolation(interp) => {
-                                        // PEP 501 debug f-string: `f"{x=}"` carries
-                                        // the verbatim `x=` text on `debug_text`,
-                                        // including the surrounding whitespace
-                                        // (`f"{x = }"`). Emit it as-is so the
-                                        // `=` marker survives the round-trip.
-                                        // Verbatim text can never begin or end
-                                        // with a bare brace (that would have been
-                                        // the `{{` / `}}` escape in the source),
-                                        // so the brace-separation spaces must not
-                                        // fire — the debug output reproduces them
-                                        // verbatim at runtime.
-                                        if let Some(dt) = &interp.debug_text {
-                                            self.write("{");
-                                            self.write(dt.as_str());
-                                        } else {
-                                            self.open_interpolation(&interp.expression);
-                                            self.emit_expr(&interp.expression);
-                                        }
-                                        // Emit `!r` / `!s` / `!a` conversion flags
-                                        // — these are stripped by default by the
-                                        // AST but carried on the `conversion`
-                                        // field. Losing them silently changes
-                                        // runtime output of `f"{x!r}"` etc.
-                                        let conversion = interp.conversion.to_char();
-                                        if let Some(c) = conversion {
-                                            self.write("!");
-                                            self.write_char(c);
-                                        }
-                                        // Emit `:FORMAT_SPEC` — the spec is
-                                        // itself a mini-f-string that may
-                                        // contain further interpolations
-                                        // (`f"{n:>{width}}"`).
-                                        if let Some(spec) = &interp.format_spec {
-                                            self.write(":");
-                                            for spec_elem in &spec.elements {
-                                                match spec_elem {
-                                                    InterpolatedStringElement::Literal(lit) => {
-                                                        self.write(&escape_python_fstring_literal(
-                                                            &lit.value, outer,
-                                                        ));
-                                                    }
-                                                    InterpolatedStringElement::Interpolation(
-                                                        nested,
-                                                    ) => {
-                                                        self.open_interpolation(&nested.expression);
-                                                        self.emit_expr(&nested.expression);
-                                                        self.close_interpolation(
-                                                            &nested.expression,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // The close separator only exists to keep
-                                        // the *expression's* trailing `}` from
-                                        // pairing with the closing brace into the
-                                        // `}}` escape. Debug text, a conversion,
-                                        // or a format spec already separates them
-                                        // — and a space added after those lands
-                                        // *inside* the conversion/spec (a
-                                        // SyntaxError after `!r`; format code
-                                        // `\x20` in a spec).
-                                        if interp.debug_text.is_some()
-                                            || conversion.is_some()
-                                            || interp.format_spec.is_some()
-                                        {
-                                            self.write("}");
-                                        } else {
-                                            self.close_interpolation(&interp.expression);
-                                        }
-                                    }
-                                }
-                            }
+                            self.emit_interpolated_elements(&inner.elements, outer);
                         }
                     }
                 }
@@ -1422,27 +1427,23 @@ impl Emitter {
                 self.fstring_quote_stack.pop();
             }
 
-            // PEP 750 template strings — Phase 0 falls back to f-string-like
-            // rendering since `t"..."` is not yet part of the Phase 0 source
-            // subset.  Emitting as `t"..."` keeps semantics distinct from
-            // f-strings.
+            // PEP 750 template strings. Emitted through the same element
+            // printer as f-strings: literal braces stay doubled, and the
+            // conversion / format spec of each interpolation is kept — a
+            // template's consumer (SQL, HTML, shell quoting) reads both.
             Expr::TString(ts) => {
-                self.write("t\"");
-                for part in ts.value.iter() {
-                    for elem in &part.elements {
-                        match elem {
-                            InterpolatedStringElement::Literal(lit) => {
-                                self.write(&escape_python_string(&lit.value));
-                            }
-                            InterpolatedStringElement::Interpolation(interp) => {
-                                self.open_interpolation(&interp.expression);
-                                self.emit_expr(&interp.expression);
-                                self.close_interpolation(&interp.expression);
-                            }
-                        }
+                let outer = '"';
+                for (i, part) in ts.value.iter().enumerate() {
+                    if i > 0 {
+                        self.write(" ");
                     }
+                    self.fstring_quote_stack.push(outer);
+                    self.write("t");
+                    self.write_char(outer);
+                    self.emit_interpolated_elements(&part.elements, outer);
+                    self.write_char(outer);
+                    self.fstring_quote_stack.pop();
                 }
-                self.write("\"");
             }
 
             // Typed-literal arms — each was previously a `Constant` variant.
@@ -2188,16 +2189,6 @@ fn needs_paren_for_postfix(expr: &Expr) -> bool {
     )
 }
 
-/// Escape a string value for emission as a double-quoted Python literal.
-///
-/// Covers the characters that would otherwise terminate the literal or
-/// produce invalid Python: backslash, double quote, the common whitespace
-/// escapes (`\n`, `\r`, `\t`), and other ASCII control characters via
-/// `\xNN`.
-fn escape_python_string(s: &str) -> String {
-    escape_python_string_with_quote(s, '"')
-}
-
 /// Escape a Python string literal for output between the given quote
 /// character. Only the *active* quote is backslash-escaped — the opposite
 /// quote can appear verbatim, matching Black's quote-style policy.
@@ -2842,6 +2833,29 @@ mod tests {
         assert!(
             out.contains("{{"),
             "the literal brace must be doubled; got: {out}"
+        );
+    }
+
+    /// A t-string's literal `{{` / `}}` must stay doubled. Written back
+    /// bare, `t"{{run()}}"` became `t"{run()}"`: text a reviewer read as
+    /// inert was emitted as an interpolation that calls `run()`.
+    #[test]
+    fn tstring_literal_braces_stay_escaped() {
+        let out = round_trip("t = t\"{{run('id')}} and {name}\"\n");
+        assert!(
+            out.contains("t\"{{run('id')}} and {name}\""),
+            "literal braces must stay doubled; got: {out}"
+        );
+    }
+
+    /// A template consumer reads each interpolation's conversion and format
+    /// spec, so the emitter may not drop them.
+    #[test]
+    fn tstring_keeps_conversion_format_spec_and_debug_text() {
+        let out = round_trip("t = t\"{name!r:>10} {name:>{width}} {name=}\"\n");
+        assert!(
+            out.contains("{name!r:>10} {name:>{width}} {name=}"),
+            "got: {out}"
         );
     }
 

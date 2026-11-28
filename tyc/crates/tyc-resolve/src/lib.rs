@@ -149,6 +149,13 @@ pub struct Scope {
     pub kind: ScopeKind,
     pub parent: Option<ScopeId>,
     pub bindings: Vec<Binding>,
+    /// Position in `bindings` of the first binding of each name. Kept in
+    /// step by [`Scope::push_binding`], [`Scope::drain_bindings_from`] and
+    /// [`Scope::extend_bindings`] — the only ways the resolver changes
+    /// `bindings` — so that [`Scope::lookup_local`] is a hash lookup. It was
+    /// a linear scan, and declaring N names in one scope cost N² string
+    /// comparisons: a function of 20,000 `let` lines took 46 s to check.
+    first_by_name: std::collections::HashMap<String, usize>,
     /// Byte range covered by this scope in the preprocessed source.  The
     /// module scope spans the entire file; function/class/lambda/
     /// comprehension scopes span their AST node's range.  Used by
@@ -158,7 +165,42 @@ pub struct Scope {
 
 impl Scope {
     pub fn lookup_local(&self, name: &str) -> Option<&Binding> {
-        self.bindings.iter().find(|b| b.name == name)
+        let binding = self.bindings.get(*self.first_by_name.get(name)?)?;
+        debug_assert_eq!(binding.name, name);
+        Some(binding)
+    }
+
+    /// Position in `bindings` of the first binding named `name`.
+    fn first_index(&self, name: &str) -> Option<usize> {
+        self.first_by_name.get(name).copied()
+    }
+
+    fn push_binding(&mut self, binding: Binding) {
+        self.first_by_name
+            .entry(binding.name.clone())
+            .or_insert(self.bindings.len());
+        self.bindings.push(binding);
+    }
+
+    /// Remove and return every binding from position `from` on.
+    fn drain_bindings_from(&mut self, from: usize) -> Vec<Binding> {
+        let drained: Vec<Binding> = self.bindings.drain(from..).collect();
+        for binding in &drained {
+            if self
+                .first_by_name
+                .get(&binding.name)
+                .is_some_and(|i| *i >= from)
+            {
+                self.first_by_name.remove(&binding.name);
+            }
+        }
+        drained
+    }
+
+    fn extend_bindings(&mut self, bindings: Vec<Binding>) {
+        for binding in bindings {
+            self.push_binding(binding);
+        }
     }
 
     /// `true` when `offset` lies inside this scope's byte range.
@@ -1025,6 +1067,7 @@ impl<'a> Resolver<'a> {
             kind: ScopeKind::Module,
             parent: None,
             bindings: Vec::new(),
+            first_by_name: std::collections::HashMap::new(),
             span: (0, source.len()),
         };
         Self {
@@ -1077,6 +1120,7 @@ impl<'a> Resolver<'a> {
             kind,
             parent: Some(parent),
             bindings: Vec::new(),
+            first_by_name: std::collections::HashMap::new(),
             span,
         });
         id
@@ -1418,7 +1462,7 @@ impl<'a> Resolver<'a> {
         if kind == BindingKind::Value {
             self.mark_loop_origin(span);
         }
-        self.scopes[scope].bindings.push(Binding {
+        self.scopes[scope].push_binding(Binding {
             name: name.to_owned(),
             kind,
             mutability,
@@ -1481,14 +1525,13 @@ impl<'a> Resolver<'a> {
                     current = scope.parent;
                     continue;
                 }
-                if scope.bindings.iter().any(|b| b.name == r.name) {
+                if scope.lookup_local(&r.name).is_some() {
                     found = true;
                     break;
                 }
                 if scope
-                    .bindings
-                    .iter()
-                    .any(|b| b.name == "*" && b.kind == BindingKind::Import)
+                    .lookup_local("*")
+                    .is_some_and(|b| b.kind == BindingKind::Import)
                 {
                     wildcard_in_scope = true;
                 }
@@ -1543,7 +1586,7 @@ impl<'a> Resolver<'a> {
             let mut current = Some(r.scope);
             while let Some(id) = current {
                 let scope = &self.scopes[id];
-                if let Some(idx) = scope.bindings.iter().position(|b| b.name == r.name) {
+                if let Some(idx) = scope.first_index(&r.name) {
                     used_bindings.insert((id, idx));
                     break;
                 }
@@ -2490,7 +2533,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                     let mut current = Some(scope);
                     let mut found = false;
                     while let Some(id) = current {
-                        if r.scopes[id].bindings.iter().any(|b| b.name == target) {
+                        if r.scopes[id].lookup_local(target).is_some() {
                             found = true;
                             break;
                         }
@@ -2623,7 +2666,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for span in initial_uninit.difference(&r.uninit_let_spans) {
                 union_initialised.insert(*span);
             }
-            let drained: Vec<Binding> = r.scopes[scope].bindings.drain(pre_if_len..).collect();
+            let drained: Vec<Binding> = r.scopes[scope].drain_bindings_from(pre_if_len);
             branch_local_bindings.extend(drained);
             for clause in &i.elif_else_clauses {
                 r.uninit_let_spans = initial_uninit.clone();
@@ -2636,14 +2679,14 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for span in initial_uninit.difference(&r.uninit_let_spans) {
                     union_initialised.insert(*span);
                 }
-                let drained: Vec<Binding> = r.scopes[scope].bindings.drain(pre_if_len..).collect();
+                let drained: Vec<Binding> = r.scopes[scope].drain_bindings_from(pre_if_len);
                 branch_local_bindings.extend(drained);
             }
             r.uninit_let_spans = initial_uninit;
             for span in &union_initialised {
                 r.uninit_let_spans.remove(span);
             }
-            r.scopes[scope].bindings.extend(branch_local_bindings);
+            r.scopes[scope].extend_bindings(branch_local_bindings);
         }
         Stmt::While(w) => {
             walk_expr(r, scope, &w.test);
@@ -2746,14 +2789,14 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for span in initial_uninit.difference(&r.uninit_let_spans) {
                     union_initialised.insert(*span);
                 }
-                let drained: Vec<Binding> = r.scopes[scope].bindings.drain(body_len..).collect();
+                let drained: Vec<Binding> = r.scopes[scope].drain_bindings_from(body_len);
                 arm_bindings.extend(drained);
             }
             r.uninit_let_spans = initial_uninit;
             for span in &union_initialised {
                 r.uninit_let_spans.remove(span);
             }
-            r.scopes[scope].bindings.extend(arm_bindings);
+            r.scopes[scope].extend_bindings(arm_bindings);
             for s in &t.orelse {
                 walk_stmt(r, scope, s);
             }
@@ -2869,8 +2912,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for span in initial_uninit.difference(&r.uninit_let_spans) {
                     union_initialised.insert(*span);
                 }
-                let drained: Vec<Binding> =
-                    r.scopes[scope].bindings.drain(pre_match_len..).collect();
+                let drained: Vec<Binding> = r.scopes[scope].drain_bindings_from(pre_match_len);
                 arm_local_bindings.extend(drained);
             }
             // Restore the pre-match uninit snapshot, then remove the
@@ -2879,7 +2921,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for span in &union_initialised {
                 r.uninit_let_spans.remove(span);
             }
-            r.scopes[scope].bindings.extend(arm_local_bindings);
+            r.scopes[scope].extend_bindings(arm_local_bindings);
         }
         _ => {}
     }

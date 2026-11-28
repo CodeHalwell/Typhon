@@ -673,10 +673,10 @@ class Path(PurePosixPath):
                 raise
 
     def chmod(self, mode, *, follow_symlinks=True):
-        os.chmod(self._str, mode)
+        os.chmod(self._str, mode, follow_symlinks=follow_symlinks)
 
     def lchmod(self, mode):
-        os.chmod(self._str, mode)
+        os.chmod(self._str, mode, follow_symlinks=False)
 
     def unlink(self, missing_ok=False):
         try:

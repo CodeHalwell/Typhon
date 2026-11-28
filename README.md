@@ -79,7 +79,7 @@ Pre-built binaries ship on every release for **macOS (Apple Silicon + Intel)**, 
 **macOS / Linux:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
@@ -88,7 +88,7 @@ curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh |
 iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
 ```
 
-The installers detect your platform, resolve the latest release, verify the SHA-256 checksum, and drop `tyc` into a per-user directory (`$HOME/.local/bin` on macOS/Linux; `%LOCALAPPDATA%\Programs\Typhon` on Windows). On macOS the Gatekeeper quarantine attribute is cleared automatically; on Windows the install directory is added to your `PATH`.
+The installers detect your platform, resolve the latest release, verify the SHA-256 checksum (and, when the GitHub CLI is installed, the archive's [build provenance](docs/install.md#verifying-a-download)), and drop `tyc` into a per-user directory (`$HOME/.local/bin` on macOS/Linux; `%LOCALAPPDATA%\Programs\Typhon` on Windows). On macOS the Gatekeeper quarantine attribute is cleared automatically; on Windows the install directory is added to your `PATH`.
 
 `tyc` runs anywhere a modern Rust toolchain produces a binary; the emitted Python **requires CPython 3.13 or newer** at runtime. Prefer to build from source? See [Get started](#get-started) below. Longer-form install guide (custom dir, pinned version, uninstall, troubleshooting): [docs/install.md](docs/install.md).
 

@@ -179,7 +179,7 @@ Every comptime failure reports under the single `tyc::comptime` code, with the
 trigger spelled out in the message:
 
 - **Missing required env var** — `env("DATABASE_URL")` with `DATABASE_URL` unset and listed in `[env] required`: "required environment variable 'DATABASE_URL' is not set".
-- **Cast failure** — `int("abc")`: "cannot parse 'abc' as int".
+- **Cast failure** — `int("abc")`: "cannot parse a 3-character string as int". The string itself is not shown, because it usually comes from `env(...)` and diagnostics end up in CI logs.
 - **Recursion limit hit** — `comptime def` calls are recursion-checked (depth limit 64); a self-recursive call fails the build instead of hanging it.
 - **Unsupported form** — e.g. a `for` loop in a `comptime def` body: "`for-loop` is not supported inside a comptime function body".
 

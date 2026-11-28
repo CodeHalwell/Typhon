@@ -918,12 +918,19 @@ mod tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
             .into_syntax();
-        let (values, diags) = crate::evaluate_comptime_in_source(
+        // The lint under test only has something to report once the project
+        // has allowed the credential to be read at all.
+        let (values, diags) = crate::evaluate_comptime_in_source_with_policy(
             &module,
             "t.ty",
             &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,
+            &crate::ComptimeEnvPolicy {
+                allow_credentials: true,
+                allowed: Vec::new(),
+                strict: false,
+            },
         );
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         comptime_secret_bindings(&module, &values)

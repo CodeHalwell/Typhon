@@ -55,6 +55,10 @@ tokio = { version = "1", features = ["full"] }
 # rather than panic when its stdout is closed by `| head`.
 libc = "0.2"
 
+# The operating system's CSPRNG, for the VM's `os.urandom` (see
+# `tyc_vm::os_random`). Already in the dependency graph via `tempfile`.
+getrandom = "0.4"
+
 # File watching (used by `tyc ty --watch`)
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 

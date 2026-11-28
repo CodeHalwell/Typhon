@@ -1,0 +1,17 @@
+# Code owners for the supply-chain-sensitive parts of the repository.
+#
+# A change to any path below asks @CodeHalwell for review, and — once
+# "Require review from Code Owners" is enabled in the branch protection for
+# `main` — cannot merge without it. These are the files that decide what
+# users download and run: the CI/release pipeline, the two installers that
+# are piped into a shell, the dependency policy and lockfile, and the
+# security policy itself.
+#
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+/.github/        @CodeHalwell
+/install.sh      @CodeHalwell
+/install.ps1     @CodeHalwell
+/tyc/deny.toml   @CodeHalwell
+/tyc/Cargo.lock  @CodeHalwell
+/SECURITY.md     @CodeHalwell

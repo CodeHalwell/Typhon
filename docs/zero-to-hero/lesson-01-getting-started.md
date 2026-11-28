@@ -20,7 +20,7 @@ Install a pre-built binary:
 
 ```bash
 # macOS / Linux
-curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 
 # Windows (PowerShell)
 iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex

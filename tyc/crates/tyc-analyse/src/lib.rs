@@ -68,6 +68,40 @@ const MAX_COMPTIME_DEPTH: usize = 64;
 /// build-time constant and stops a runaway build-string well before that.
 const MAX_COMPTIME_STRING_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bytes charged for each comptime value besides its string content — a
+/// round figure for the enum and its `Vec` slot.
+const COMPTIME_VALUE_OVERHEAD: usize = 32;
+
+/// Approximate heap footprint of a comptime value, for the memory budget.
+fn comptime_value_size(value: &ComptimeValue) -> usize {
+    let inner = match value {
+        ComptimeValue::Str(s) => s.len(),
+        ComptimeValue::List(xs) | ComptimeValue::Tuple(xs) => xs
+            .iter()
+            .map(comptime_value_size)
+            .fold(0usize, usize::saturating_add),
+        ComptimeValue::Dict(items) => items
+            .iter()
+            .map(|(k, v)| comptime_value_size(k).saturating_add(comptime_value_size(v)))
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    };
+    inner.saturating_add(COMPTIME_VALUE_OVERHEAD)
+}
+
+/// The error for `int("…")` / `float("…")` on a string that is not a number.
+/// The string itself is deliberately not quoted: it is very often
+/// `env("…")`, and a diagnostic is printed by `tyc check` into terminals and
+/// CI logs — `int(env("AWS_SECRET_ACCESS_KEY", "0"))` in a project somebody
+/// was only *checking* printed the secret.
+fn unparsable_number(s: &str, ty: &str) -> String {
+    format!(
+        "cannot parse a {}-character string as {ty} (the value is not shown: \
+         it may come from the environment)",
+        s.chars().count()
+    )
+}
+
 /// Evaluation-step budget for one `comptime let` binding (every expression
 /// node and statement evaluated counts one step). The depth cap alone does
 /// not bound the work: `f(n) = f(n - 1) + f(n - 1)` stays within 64 frames
@@ -1346,7 +1380,13 @@ pub fn evaluate_comptime_with_functions(
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
-    evaluate_comptime_inner(module, None, bindings, comptime_function_names)
+    evaluate_comptime_inner(
+        module,
+        None,
+        bindings,
+        comptime_function_names,
+        &comptime_env_policy(),
+    )
 }
 
 /// [`evaluate_comptime_with_functions`] with the (preprocessed) source text
@@ -1373,7 +1413,130 @@ pub fn evaluate_comptime_in_source(
         Some((path, source)),
         bindings,
         comptime_function_names,
+        &comptime_env_policy(),
     )
+}
+
+/// [`evaluate_comptime_in_source`] under an explicit [`ComptimeEnvPolicy`]
+/// instead of the process-wide one.
+pub fn evaluate_comptime_in_source_with_policy(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+    bindings: &[ComptimeBinding],
+    comptime_function_names: &[String],
+    policy: &ComptimeEnvPolicy,
+) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    evaluate_comptime_inner(
+        module,
+        Some((path, source)),
+        bindings,
+        comptime_function_names,
+        policy,
+    )
+}
+
+/// Which environment variables `comptime env(...)` may read.
+///
+/// A comptime value is written into the build output as a literal, and
+/// `comptime` runs for `tyc check` and in the editor, not only for a build.
+/// A project somebody has merely cloned could therefore name
+/// `env("AWS_SECRET_ACCESS_KEY", "")` and have the builder's own credential
+/// inlined into an artifact (or a CI log) without being asked. So a variable
+/// whose *name* marks it as a credential is refused unless the project's
+/// `typhon.toml` — a file the person building it can read — says otherwise:
+/// it is listed under `[env] allow` or `[env] required`, or
+/// `[strictness] allow-secret-comptime = true`. Every other variable
+/// (`PORT`, `BUILD_TAG`, `FEATURE_X`) is read as before.
+#[derive(Debug, Clone, Default)]
+pub struct ComptimeEnvPolicy {
+    /// `[strictness] allow-secret-comptime = true`: no variable is refused.
+    pub allow_credentials: bool,
+    /// `[env] allow` plus `[env] required`: names readable whatever they
+    /// look like.
+    pub allowed: Vec<String>,
+    /// `[env] strict = true`: *only* the names in `allowed` are readable.
+    /// The credential check above is a name heuristic; this is the
+    /// allow-list for projects that want the guarantee — a build then
+    /// depends on exactly the variables its `typhon.toml` names.
+    pub strict: bool,
+}
+
+impl ComptimeEnvPolicy {
+    /// Why reading `name` (currently holding `value`, if set) is refused,
+    /// or `None` when it is allowed. The value never appears in the message.
+    fn refusal(&self, name: &str, value: Option<&str>) -> Option<String> {
+        if self.allowed.iter().any(|a| a == name) {
+            return None;
+        }
+        if self.strict {
+            return Some(format!(
+                "comptime env() may not read '{name}': `[env] strict = true` limits build-time \
+                 reads to the variables listed under `[env] allow` and `[env] required` in \
+                 typhon.toml"
+            ));
+        }
+        if self.allow_credentials {
+            return None;
+        }
+        let credential = match secrets::secret_name_strength(name)? {
+            secrets::SecretNameStrength::Clear => true,
+            secrets::SecretNameStrength::Ambiguous => {
+                value.is_some_and(secrets::secret_value_is_credential_shaped)
+            }
+        };
+        credential.then(|| {
+            format!(
+                "comptime env() may not read '{name}': the name marks it as a credential, \
+                 and a comptime value is written into the build output. Read it at runtime \
+                 with os.environ[...]; or, if it must be baked in, list it under \
+                 `[env] allow` in typhon.toml"
+            )
+        })
+    }
+}
+
+static COMPTIME_ENV_POLICY: std::sync::RwLock<Option<ComptimeEnvPolicy>> =
+    std::sync::RwLock::new(None);
+
+thread_local! {
+    /// The policy of the project *this thread* is working on. A command
+    /// handles one project on one thread, so this is exact; the process-wide
+    /// slot above only serves helper threads that never loaded a config.
+    static THREAD_COMPTIME_ENV_POLICY: std::cell::RefCell<Option<ComptimeEnvPolicy>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the policy — called by `tyc build` / `check` / `run` and the
+/// language server once the project's `typhon.toml` is read. Until then the
+/// default applies: credential-named variables are refused.
+///
+/// It is recorded for the calling thread and, as a fallback for threads
+/// that have none of their own, for the process.
+pub fn set_comptime_env_policy(policy: ComptimeEnvPolicy) {
+    THREAD_COMPTIME_ENV_POLICY.with(|slot| *slot.borrow_mut() = Some(policy.clone()));
+    if let Ok(mut slot) = COMPTIME_ENV_POLICY.write() {
+        *slot = Some(policy);
+    }
+}
+
+/// Install the policy for the calling thread only — for a process that
+/// serves several projects (the language server), where a process-wide
+/// value would let one project's `[env] allow` list apply to another's file.
+pub fn set_comptime_env_policy_for_thread(policy: ComptimeEnvPolicy) {
+    THREAD_COMPTIME_ENV_POLICY.with(|slot| *slot.borrow_mut() = Some(policy));
+}
+
+fn comptime_env_policy() -> ComptimeEnvPolicy {
+    THREAD_COMPTIME_ENV_POLICY
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| {
+            COMPTIME_ENV_POLICY
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+        })
+        .unwrap_or_default()
 }
 
 /// A comptime diagnostic for `name`, anchored at `range` when the caller
@@ -1431,8 +1594,13 @@ fn evaluate_comptime_inner(
     anchor: Option<(&str, &str)>,
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
+    env_policy: &ComptimeEnvPolicy,
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
     let source = anchor.map(|(_, source)| source);
+    // One step budget for the whole file. It used to restart for every
+    // binding, so two hundred `comptime let N: int = slow(40)` lines each
+    // spent a full budget and `tyc check` ran for minutes.
+    let mut steps_spent: u64 = 0;
     let mut values = HashMap::new();
     let mut diags = Diagnostics::new();
 
@@ -1492,6 +1660,8 @@ fn evaluate_comptime_inner(
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
                 ctx.source = source;
+                ctx.env_policy = Some(env_policy);
+                ctx.steps = steps_spent;
                 // Seed the evaluator's scope with previously-evaluated
                 // comptime constants so a later binding can reference an
                 // earlier one (FINDINGS #48). Bindings are evaluated in
@@ -1499,7 +1669,9 @@ fn evaluate_comptime_inner(
                 for (name, value) in &values {
                     ctx.locals.insert(name.clone(), value.clone());
                 }
-                match eval_expr(expr, &mut ctx) {
+                let result = eval_expr(expr, &mut ctx);
+                steps_spent = ctx.steps;
+                match result {
                     Ok(v) => {
                         values.insert(binding.name.clone(), v);
                     }
@@ -1546,6 +1718,9 @@ struct EvalContext<'a> {
     /// The source the module was parsed from, when the caller has it (see
     /// [`evaluate_comptime_in_source`]).
     source: Option<&'a str>,
+    /// Which variables `env(...)` may read; `None` only in unit tests that
+    /// build a context by hand.
+    env_policy: Option<&'a ComptimeEnvPolicy>,
     /// Range of the innermost expression of the binding's own initialiser
     /// (call depth 0) whose evaluation failed — the diagnostic's anchor. A
     /// failure inside a `comptime def` body anchors at the call in the
@@ -1563,6 +1738,7 @@ impl<'a> EvalContext<'a> {
             string_bytes: 0,
             steps: 0,
             source: None,
+            env_policy: None,
             error_range: None,
         }
     }
@@ -1584,6 +1760,14 @@ impl<'a> EvalContext<'a> {
     /// Account for a freshly-produced string of `bytes` length; error out once
     /// the cumulative total crosses the budget so a runaway concatenation /
     /// replacement fails the build with a diagnostic instead of OOM-aborting.
+    /// Charge a value placed into a list, tuple or dict literal. Containers
+    /// copy their elements, so `[x, x, x, x, x, x, x, x]` in a recursive
+    /// `comptime def` multiplies memory eightfold per call without ever
+    /// building a string; the same budget covers both.
+    fn charge_value(&mut self, value: &ComptimeValue) -> Result<(), String> {
+        self.charge_string(comptime_value_size(value))
+    }
+
     fn charge_string(&mut self, bytes: usize) -> Result<(), String> {
         self.string_bytes = self.string_bytes.saturating_add(bytes);
         if self.string_bytes > MAX_COMPTIME_STRING_BYTES {
@@ -1801,14 +1985,18 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
         Expr::List(l) => {
             let mut elts = Vec::with_capacity(l.elts.len());
             for e in &l.elts {
-                elts.push(eval_expr(e, ctx)?);
+                let v = eval_expr(e, ctx)?;
+                ctx.charge_value(&v)?;
+                elts.push(v);
             }
             Ok(ComptimeValue::List(elts))
         }
         Expr::Tuple(t) => {
             let mut elts = Vec::with_capacity(t.elts.len());
             for e in &t.elts {
-                elts.push(eval_expr(e, ctx)?);
+                let v = eval_expr(e, ctx)?;
+                ctx.charge_value(&v)?;
+                elts.push(v);
             }
             Ok(ComptimeValue::Tuple(elts))
         }
@@ -1831,6 +2019,8 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
                 };
                 let k = eval_expr(key_expr, ctx)?;
                 let v = eval_expr(&item.value, ctx)?;
+                ctx.charge_value(&k)?;
+                ctx.charge_value(&v)?;
                 if let Some(existing) = items.iter_mut().find(|(ek, _)| values_equal(ek, &k)) {
                     existing.1 = v;
                 } else {
@@ -1902,7 +2092,12 @@ fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeVal
                                         );
                                     }
                                     let v = eval_expr(&interp.expression, ctx)?;
-                                    out.push_str(&comptime_str(&v)?);
+                                    let rendered = comptime_str(&v)?;
+                                    // An interpolation copies its value, so
+                                    // `f"{s}{s}"` doubles exactly like `s + s`
+                                    // and is charged the same way.
+                                    ctx.charge_string(rendered.len())?;
+                                    out.push_str(&rendered);
                                 }
                             }
                         }
@@ -2191,7 +2386,7 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .trim()
                     .parse::<i64>()
                     .map(ComptimeValue::Int)
-                    .map_err(|_| format!("cannot parse '{}' as int", s)),
+                    .map_err(|_| unparsable_number(&s, "int")),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(n)),
                 // Rust's `as i64` *saturates* at `i64::MIN`/`i64::MAX` and maps
                 // NaN to 0, so `int(1e30)` silently folded the constant
@@ -2232,7 +2427,7 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                     .trim()
                     .parse::<f64>()
                     .map(ComptimeValue::Float)
-                    .map_err(|_| format!("cannot parse '{}' as float", s)),
+                    .map_err(|_| unparsable_number(&s, "float")),
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Float(n as f64)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(f)),
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Float(if b { 1.0 } else { 0.0 })),
@@ -2364,12 +2559,22 @@ fn eval_method_call(
             expect_arity(method, 2, &args)?;
             let needle = expect_str(method, &args[0])?;
             let replacement = expect_str(method, &args[1])?;
-            let out = s.replace(needle, replacement);
-            // `replace` can grow the string (a longer replacement than needle);
-            // charge it so a recursive `grow(s.replace(a, aaaa), n)` hits the
-            // budget rather than OOM-aborting.
-            ctx.charge_string(out.len())?;
-            Ok(ComptimeValue::Str(out))
+            // `replace` can grow the string (a longer replacement than needle).
+            // The size of the result is computed and charged *before* it is
+            // built: `s.replace("a", s)` on a 1 MiB string of `a`s asks for a
+            // terabyte in one call, and charging afterwards meant the
+            // allocation had already aborted the process.
+            let matches = if needle.is_empty() {
+                s.chars().count() + 1
+            } else {
+                s.matches(needle).count()
+            };
+            let out_len = s
+                .len()
+                .saturating_sub(matches.saturating_mul(needle.len()))
+                .saturating_add(matches.saturating_mul(replacement.len()));
+            ctx.charge_string(out_len)?;
+            Ok(ComptimeValue::Str(s.replace(needle, replacement)))
         }
         (ComptimeValue::Str(s), "startswith") => {
             expect_arity(method, 1, &args)?;
@@ -2387,6 +2592,11 @@ fn eval_method_call(
             if sep.is_empty() {
                 return Err("comptime str.split() requires a non-empty separator".into());
             }
+            // One owned copy of every piece, plus a list slot each.
+            ctx.charge_string(
+                s.len()
+                    .saturating_add(s.matches(sep).count().saturating_mul(COMPTIME_VALUE_OVERHEAD)),
+            )?;
             let parts: Vec<ComptimeValue> = s
                 .split(sep)
                 .map(|p| ComptimeValue::Str(p.to_owned()))
@@ -2422,6 +2632,14 @@ fn eval_method_call(
                     )
                 }
             };
+            // Charged before the join allocates: a long separator between
+            // many empty pieces multiplies just as `replace` does.
+            let joined_len = items
+                .iter()
+                .map(|i| i.len())
+                .fold(0usize, usize::saturating_add)
+                .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
+            ctx.charge_string(joined_len)?;
             Ok(ComptimeValue::Str(items.join(sep)))
         }
         (ComptimeValue::Str(_), other) => Err(format!(
@@ -2715,7 +2933,14 @@ fn eval_env_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeV
         _ => return Err("env() first argument must be a string literal".into()),
     };
 
-    match std::env::var(&var_name) {
+    let current = std::env::var(&var_name).ok();
+    if let Some(refusal) = ctx
+        .env_policy
+        .and_then(|policy| policy.refusal(&var_name, current.as_deref()))
+    {
+        return Err(refusal);
+    }
+    match current.ok_or(()) {
         Ok(val) => Ok(ComptimeValue::Str(val)),
         Err(_) => {
             if args.len() == 2 {
@@ -3393,6 +3618,41 @@ comptime let X: str = grow(\"aaaa\", 40)
         );
     }
 
+    /// `replace`, `join` and container literals multiply memory without a
+    /// `+`. Each must be charged *before* it allocates: these three programs
+    /// used to abort `tyc check` (and the language server) with an
+    /// allocation failure instead of reporting a diagnostic.
+    #[test]
+    fn replace_join_and_container_growth_hit_the_budget_not_oom() {
+        let grow = "\
+comptime def grow(s: str, n: int) -> str:
+    if n == 0:
+        return s
+    return grow(s + s, n - 1)
+";
+        for tail in [
+            "comptime def boom(s: str) -> str:\n    return s.replace(\"a\", s)\n\n\
+             comptime let X: str = boom(grow(\"a\", 20))\n",
+            "comptime def k(s: str) -> str:\n    return s.join(s.split(\"a\"))\n\n\
+             comptime let X: str = k(grow(\"a\", 20))\n",
+            "comptime def n(x: list[int], d: int) -> int:\n    if d == 0:\n        return 0\n\
+             \x20   return n([x, x, x, x, x, x, x, x], d - 1)\n\n\
+             comptime let X: int = n([], 30)\n",
+        ] {
+            let (_values, diags) = eval(&format!("{grow}\n{tail}"));
+            assert!(diags.has_errors(), "must be rejected, not OOM:\n{tail}");
+        }
+    }
+
+    /// A failed `int(...)` / `float(...)` must not quote its argument: it is
+    /// usually `env(...)`, and the diagnostic goes to the terminal and CI log.
+    #[test]
+    fn unparsable_number_does_not_echo_the_value() {
+        let msg = unparsable_number("placeholder-xyz", "int");
+        assert!(!msg.contains("placeholder-xyz"), "{msg}");
+        assert!(msg.contains("15-character"), "{msg}");
+    }
+
     #[test]
     fn modest_string_concat_still_succeeds() {
         // The budget must not reject an ordinary build-time string.
@@ -3438,6 +3698,138 @@ comptime let X: str = grow(\"aaaa\", 40)
         let (_, diags) =
             eval("comptime let DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
         assert!(diags.has_errors(), "missing env var must be a build error");
+    }
+
+    fn eval_with_policy(
+        src: &str,
+        policy: &ComptimeEnvPolicy,
+    ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        evaluate_comptime_in_source_with_policy(
+            &module,
+            "t.ty",
+            &prep.python_source,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+            policy,
+        )
+    }
+
+    /// A credential-named variable is not readable by default — whatever
+    /// the binding is called and however the key is spelled — and the
+    /// refusal never quotes the value.
+    #[test]
+    fn comptime_env_refuses_credential_named_variables_by_default() {
+        let _guard = lock_env();
+        std::env::set_var(
+            "TYPHON_T_AWS_SECRET_ACCESS_KEY",
+            "typhon-test-placeholder-value",
+        );
+        let deny = ComptimeEnvPolicy::default();
+        for src in [
+            "comptime let REGION: str = env(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\", \"\")\n",
+            "comptime let REGION: str = env(\"TYPHON_T_AWS_SECRET\" + \"_ACCESS_KEY\", \"\")\n",
+            "comptime let TAGS: list[str] = [env(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\", \"\")]\n",
+            "comptime def cfg(k: str) -> str:\n    return env(k, \"\")\n\n\
+             comptime let CHANNEL: str = cfg(\"TYPHON_T_AWS_SECRET_ACCESS_KEY\")\n",
+        ] {
+            let (values, diags) = eval_with_policy(src, &deny);
+            assert!(diags.has_errors(), "must be refused:\n{src}");
+            assert!(values.is_empty(), "nothing may be inlined:\n{src}");
+            let rendered = format!("{:?}", diags.errors());
+            assert!(
+                !rendered.contains("typhon-test-placeholder-value"),
+                "{rendered}"
+            );
+        }
+        std::env::remove_var("TYPHON_T_AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    fn comptime_env_reads_a_credential_the_project_allows() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_API_TOKEN", "abc");
+        let src = "comptime let T: str = env(\"TYPHON_T_API_TOKEN\")\n";
+        let listed = ComptimeEnvPolicy {
+            allow_credentials: false,
+            allowed: vec!["TYPHON_T_API_TOKEN".to_owned()],
+            strict: false,
+        };
+        let blanket = ComptimeEnvPolicy {
+            allow_credentials: true,
+            allowed: Vec::new(),
+            strict: false,
+        };
+        for policy in [&listed, &blanket] {
+            let (values, diags) = eval_with_policy(src, policy);
+            assert!(!diags.has_errors(), "{:?}", diags.errors());
+            assert!(matches!(values.get("T"), Some(ComptimeValue::Str(s)) if s == "abc"));
+        }
+        std::env::remove_var("TYPHON_T_API_TOKEN");
+    }
+
+    /// `[env] strict`: only listed names, whatever they look like.
+    #[test]
+    fn comptime_env_strict_reads_only_listed_variables() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_STRICT_PORT", "8080");
+        std::env::set_var("TYPHON_T_STRICT_HOME", "/home/someone");
+        let policy = ComptimeEnvPolicy {
+            allow_credentials: true,
+            allowed: vec!["TYPHON_T_STRICT_PORT".to_owned()],
+            strict: true,
+        };
+        let (values, diags) = eval_with_policy(
+            "comptime let PORT: int = int(env(\"TYPHON_T_STRICT_PORT\"))\n",
+            &policy,
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(8080))));
+        let (values, diags) = eval_with_policy(
+            "comptime let WHO: str = env(\"TYPHON_T_STRICT_HOME\", \"\")\n",
+            &policy,
+        );
+        assert!(diags.has_errors() && values.is_empty());
+        std::env::remove_var("TYPHON_T_STRICT_PORT");
+        std::env::remove_var("TYPHON_T_STRICT_HOME");
+    }
+
+    /// Ordinary configuration is unaffected by the default policy.
+    #[test]
+    fn comptime_env_still_reads_ordinary_variables() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_PORT", "8080");
+        std::env::set_var("TYPHON_T_TOKEN_LIMIT", "5");
+        let src = "comptime let PORT: int = int(env(\"TYPHON_T_PORT\"))\n\
+                   comptime let LIMIT: int = int(env(\"TYPHON_T_TOKEN_LIMIT\"))\n\
+                   comptime let TAG: str = env(\"TYPHON_T_UNSET_BUILD_TAG\", \"dev\")\n";
+        let (values, diags) = eval_with_policy(src, &ComptimeEnvPolicy::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(values.len(), 3);
+        std::env::remove_var("TYPHON_T_PORT");
+        std::env::remove_var("TYPHON_T_TOKEN_LIMIT");
+    }
+
+    /// The step budget is shared by every binding in the file.
+    #[test]
+    fn comptime_step_budget_is_per_file_not_per_binding() {
+        let mut src = String::from(
+            "comptime def f(n: int) -> int:\n    if n == 0:\n        return 1\n    return f(n - 1) + f(n - 1)\n\n",
+        );
+        for i in 0..40 {
+            src.push_str(&format!("comptime let N{i}: int = f(40)\n"));
+        }
+        let started = std::time::Instant::now();
+        let (_values, diags) = eval(&src);
+        assert!(diags.has_errors());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "forty runaway bindings must share one budget, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
