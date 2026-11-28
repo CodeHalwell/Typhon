@@ -232,7 +232,11 @@ class SpooledTemporaryFile:
             # becomes is positioned in encoded bytes. Carrying the character
             # count over put the cursor inside the text after any multi-byte
             # character, and the next write overwrote what was there.
-            pos = len(data[:pos].encode(self._encoding or "utf-8"))
+            # Encoded with the spool's own error policy (the text was
+            # accepted under it), and a cursor parked past the end keeps
+            # its distance from the end.
+            encoded = len(data[:pos].encode(self._encoding or "utf-8", self._errors or "strict"))
+            pos = encoded + max(0, pos - len(data))
         new.seek(pos, 0)
         self._file = new
         self._rolled = True
@@ -330,25 +334,25 @@ class SpooledTemporaryFile:
             self.rollover()
         return self._file.truncate(size)
 
-    def _validate(self, s):
-        # The in-memory buffer holds text as-is; the configured encoding
-        # only applied once the spool rolled over to a real file, so
-        # `SpooledTemporaryFile(mode="w+", encoding="ascii").write("é")`
-        # succeeded here and raises `UnicodeEncodeError` in CPython.
-        if not self._rolled and "b" not in self._mode and self._encoding is not None and isinstance(s, str):
-            s.encode(self._encoding, self._errors or "strict")
+    def _coerce(self, s):
+        # The in-memory buffer holds text; CPython's holds *encoded* bytes,
+        # so its encoding and error policy apply at every write, not only
+        # once the spool rolls over to a real file. Round-tripping through
+        # the codec gives the same result: "strict" raises
+        # `UnicodeEncodeError` for text the encoding cannot hold, and
+        # "ignore" / "replace" / "xmlcharrefreplace" change the text now.
+        if self._rolled or "b" in self._mode or self._encoding is None or not isinstance(s, str):
+            return s
+        return s.encode(self._encoding, self._errors or "strict").decode(self._encoding)
 
     def write(self, s):
-        self._validate(s)
-        rv = self._file.write(s)
+        rv = self._file.write(self._coerce(s))
         self._check()
-        return rv
+        # The count is of the characters given, whatever the codec kept.
+        return len(s) if isinstance(s, str) else rv
 
     def writelines(self, iterable):
-        lines = list(iterable)
-        for line in lines:
-            self._validate(line)
-        rv = self._file.writelines(lines)
+        rv = self._file.writelines([self._coerce(line) for line in iterable])
         self._check()
         return rv
 

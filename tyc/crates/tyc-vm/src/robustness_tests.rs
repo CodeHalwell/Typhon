@@ -342,6 +342,21 @@ with tempfile.SpooledTemporaryFile(mode="w+", encoding="ascii") as s:
     s.write("ok")
     s.seek(0)
     show(s.read())
+with tempfile.SpooledTemporaryFile(max_size=100, mode="w+", encoding="utf-8") as s:
+    # A cursor past the end stays past the end across a rollover.
+    s.write("abc")
+    s.seek(10)
+    s.rollover()
+    s.write("X")
+    s.seek(0)
+    show(s.read())
+with tempfile.SpooledTemporaryFile(mode="w+", encoding="ascii", errors="ignore") as s:
+    # Text accepted under a lenient error policy must still roll over.
+    show(s.write("\u00e9A"))
+    s.rollover()
+    s.write("B")
+    s.seek(0)
+    show(s._rolled, s.read())
 shutil.rmtree(d)
 show("cleaned", not os.path.exists(d))
 "#,
