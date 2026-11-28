@@ -225,7 +225,14 @@ class SpooledTemporaryFile:
         buffering, suffix, prefix, dir = self._args
         new = TemporaryFile(self._mode, buffering, self._encoding, self._newline, suffix, prefix, dir, errors=self._errors)
         pos = old.tell()
-        new.write(old.getvalue())
+        data = old.getvalue()
+        new.write(data)
+        if "b" not in self._mode:
+            # The in-memory text buffer counts characters; the file it
+            # becomes is positioned in encoded bytes. Carrying the character
+            # count over put the cursor inside the text after any multi-byte
+            # character, and the next write overwrote what was there.
+            pos = len(data[:pos].encode(self._encoding or "utf-8"))
         new.seek(pos, 0)
         self._file = new
         self._rolled = True

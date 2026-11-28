@@ -304,6 +304,12 @@ with tempfile.SpooledTemporaryFile(max_size=100, mode="w+") as s:
     # the codec, not its spelling.
     show(s.readline(), s._rolled, s.mode, s.encoding.lower())
     show(list(s))
+with tempfile.SpooledTemporaryFile(max_size=1, mode="w+", encoding="utf-8") as s:
+    # Rolling over after multi-byte text must leave the cursor at the end.
+    s.write("\u00e9\u00e9")
+    s.write("X")
+    s.seek(0)
+    show(s._rolled, s.read())
 shutil.rmtree(d)
 show("cleaned", not os.path.exists(d))
 "#,
