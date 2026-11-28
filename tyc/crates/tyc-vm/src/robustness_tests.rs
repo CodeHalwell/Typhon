@@ -299,7 +299,10 @@ show(s.closed)
 with tempfile.SpooledTemporaryFile(max_size=100, mode="w+") as s:
     s.write("hi\nthere\n")
     s.seek(0)
-    show(s.readline(), s._rolled, s.mode, s.encoding)
+    # The *name* CPython reports for the default encoding follows the
+    # locale ("utf-8" under C.UTF-8, "UTF-8" on the CI runners): compare
+    # the codec, not its spelling.
+    show(s.readline(), s._rolled, s.mode, s.encoding.lower())
     show(list(s))
 shutil.rmtree(d)
 show("cleaned", not os.path.exists(d))

@@ -6654,6 +6654,53 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            // Change a symlink's own mode. Returns `False` where the
+            // platform has no `lchmod` (Linux), so the shim can raise
+            // CPython's `NotImplementedError` instead of touching the
+            // link's target.
+            "_fs_lchmod",
+            nf("_fs_lchmod", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "chmod")?;
+                let mode = args
+                    .get(1)
+                    .map(|v| v.to_int())
+                    .transpose()?
+                    .unwrap_or(0o644);
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly"
+                ))]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                        .map_err(|_| value_error("embedded null byte"))?;
+                    // SAFETY: `c_path` is a valid NUL-terminated string that
+                    // outlives the call; `lchmod` reads it and nothing else.
+                    let rc = unsafe { libc::lchmod(c_path.as_ptr(), mode as libc::mode_t) };
+                    if rc != 0 {
+                        return Err(fs_unwind(&display, std::io::Error::last_os_error()));
+                    }
+                    Ok(Value::Bool(true))
+                }
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly"
+                )))]
+                {
+                    let _ = (path, display, mode);
+                    Ok(Value::Bool(false))
+                }
+            }),
+        ),
+        (
             "_fs_getpid",
             nf("_fs_getpid", |_i, _args| {
                 Ok(Value::Int(VmInt::from(std::process::id() as i64)))
