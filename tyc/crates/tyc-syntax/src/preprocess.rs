@@ -6603,7 +6603,7 @@ pub fn expand_sugar_mapped(source: &str, rewrite_lazy_imports: bool) -> (String,
         stage.1 = compose_line_maps(&map, &stage.1);
         stage.0 = text;
     }
-    let defused = defuse_question_heavy_lines(source);
+    let defused = defuse_hostile_input(source);
     let mut stage = expand_typed_let_unpack_mapped(&defused);
     if rewrite_lazy_imports {
         step(&mut stage, expand_lazy_imports_mapped);
@@ -7085,7 +7085,7 @@ pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
             identity_line_map(text_line_count(source)),
         );
     }
-    let defused = defuse_question_heavy_lines(source);
+    let defused = defuse_hostile_input(source);
     let source: &str = &defused;
     // Every pipeline runs this pass, so it is where a one-line compound
     // statement or a `;`-joined line carrying a `?` is split first (a no-op
@@ -7285,6 +7285,71 @@ fn flush_lifted_statement(
         out.mark(buf_start + k);
         out.push_str(&l);
     }
+}
+
+/// Both pre-scans below, applied before any rewriting pass sees the text.
+fn defuse_hostile_input(source: &str) -> std::borrow::Cow<'_, str> {
+    match truncate_past_block_limit(source) {
+        Some(truncated) => {
+            std::borrow::Cow::Owned(defuse_question_heavy_lines(&truncated).into_owned())
+        }
+        None => defuse_question_heavy_lines(source),
+    }
+}
+
+/// Cut a file off where its blocks nest deeper than the parser allows.
+///
+/// The parser rejects more than `MAX_BLOCK_DEPTH` nested blocks, but only
+/// after every preprocessing pass has run over the whole text — and a file
+/// of 10,000 nested `try:` blocks is 150 MB, which took `tyc check` 24 s and
+/// `tyc run` over 90 s to say no to. Everything from the first line past
+/// the limit on is replaced by blank lines, so the passes see only the few
+/// hundred lines before it and the parser still reports "too many levels of
+/// indentation" at the same line. The line count is unchanged.
+///
+/// Returns `None` — the common case, decided without lexing — when no run
+/// of lines indents that deep.
+fn truncate_past_block_limit(source: &str) -> Option<String> {
+    let limit = ruff_python_parser::MAX_BLOCK_DEPTH as usize + 2;
+    // Each nested block indents by at least one column, so a file whose
+    // deepest line has fewer leading blanks than the limit cannot exceed it.
+    let indent_of = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
+    if source.split('\n').map(indent_of).max().unwrap_or(0) < limit {
+        return None;
+    }
+    let mask = LexMask::new(source);
+    let mut stack: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for (number, line) in source.split_inclusive('\n').enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let indent = indent_of(body);
+        // Blank lines, comment-only lines, and lines inside a string or an
+        // open bracket do not open or close blocks.
+        let structural = indent < body.len()
+            && !body[indent..].starts_with('#')
+            && !mask.line_starts_in_string(number)
+            && mask.line_entry_depth(number) == 0;
+        if structural {
+            while stack.last().is_some_and(|top| *top > indent) {
+                stack.pop();
+            }
+            if stack.last().is_none_or(|top| *top < indent) {
+                stack.push(indent);
+            }
+            if stack.len() > limit {
+                let mut out = String::with_capacity(offset + 64);
+                out.push_str(&source[..offset]);
+                // Keep this one line (the parser reports the limit here),
+                // blank the rest.
+                out.push_str(line);
+                let rest = &source[offset + line.len()..];
+                out.extend(rest.bytes().filter(|b| *b == b'\n').map(|_| '\n'));
+                return Some(out);
+            }
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Upper bound on (code `?` on a line) × (bytes in that line).
@@ -10984,6 +11049,41 @@ mod tests {
     /// `MAX_QUESTION_LINE_WORK` is replaced by a `$`, so the file is rejected
     /// at that line; everything else — every real file — is passed through
     /// untouched (and unlexed).
+    #[test]
+    fn files_are_cut_off_past_the_block_limit() {
+        let nested = |depth: usize| -> String {
+            let mut text = String::new();
+            for level in 0..depth {
+                text.push_str(&" ".repeat(level));
+                text.push_str("if x:\n");
+            }
+            text.push_str(&" ".repeat(depth));
+            text.push_str("pass\n");
+            text
+        };
+        // At and below the limit: untouched.
+        assert!(truncate_past_block_limit(&nested(100)).is_none());
+        assert!(truncate_past_block_limit(&nested(500)).is_none());
+        // Far past it: same number of lines, only the shallow prefix kept.
+        let deep = nested(3000);
+        let cut = truncate_past_block_limit(&deep).expect("must be truncated");
+        assert_eq!(cut.matches('\n').count(), deep.matches('\n').count());
+        assert!(cut.trim_end().len() < deep.len() / 4);
+        assert!(cut.starts_with("if x:\n if x:\n"));
+        // Deep indentation that is not block structure is left alone: a
+        // staircase inside a string, and inside an open bracket.
+        let mut in_string = String::from("s = \"\"\"\n");
+        let mut in_call = String::from("f(\n");
+        for level in 0..1000 {
+            in_string.push_str(&format!("{}x\n", " ".repeat(level)));
+            in_call.push_str(&format!("{}1,\n", " ".repeat(level)));
+        }
+        in_string.push_str("\"\"\"\n");
+        in_call.push_str(")\n");
+        assert!(truncate_past_block_limit(&in_string).is_none());
+        assert!(truncate_past_block_limit(&in_call).is_none());
+    }
+
     #[test]
     fn question_heavy_lines_are_defused() {
         let ordinary = "def f(a: int?, b: str?) -> int?:\n    return g(a)? + h(b)?\n";

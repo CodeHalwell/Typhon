@@ -126,6 +126,13 @@ release pipeline and the installers. No language change.
   in about 2 s instead of 7 (20,000: 7 s instead of 41); a diagnostic on a
   line longer than 8 KB names its line and column in words instead of
   printing the line.
+- **`[env] strict = true`** (opt-in) limits `comptime env()` to exactly the
+  variables listed under `[env] allow` and `[env] required`.
+- Files nested past the block limit are cut off before preprocessing, so a
+  150 MB file of nested `try:` blocks is rejected in about 6 s instead of 24
+  (`tyc run`: 12 s instead of over 90).
+- `os.chmod(link, follow_symlinks=False)` under the VM changes the link's
+  own mode on macOS and the BSDs, as CPython does.
 - `deny.toml` treats a yanked crate as an error.
 
 ### Release pipeline and packaging

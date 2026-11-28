@@ -2598,6 +2598,7 @@ fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
                     tyc_analyse::set_comptime_env_policy(tyc_analyse::ComptimeEnvPolicy {
                         allow_credentials: config.strictness.allow_secret_comptime,
                         allowed,
+                        strict: config.env.strict,
                     });
                     let src_dir = dir.join(&config.project.src);
                     WorkspaceLookup::Project(dir, src_dir)

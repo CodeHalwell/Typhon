@@ -16,6 +16,7 @@ pub fn apply_comptime_env_policy(config: &crate::config::TyphonConfig) {
     tyc_analyse::set_comptime_env_policy(tyc_analyse::ComptimeEnvPolicy {
         allow_credentials: config.strictness.allow_secret_comptime,
         allowed,
+        strict: config.env.strict,
     });
 }
 

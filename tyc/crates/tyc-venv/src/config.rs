@@ -414,6 +414,9 @@ pub struct EnvConfig {
     /// Anything in `required` is allowed too. See `ComptimeEnvPolicy` in
     /// `tyc-analyse`.
     pub allow: Vec<String>,
+    /// When `true`, `comptime env()` may read *only* the variables listed
+    /// in `allow` and `required`; any other name is a build error.
+    pub strict: bool,
 }
 
 /// `[checker]` — second-stage type-checking over the emitted Python.

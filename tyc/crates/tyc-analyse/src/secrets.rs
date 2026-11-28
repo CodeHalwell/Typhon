@@ -929,6 +929,7 @@ mod tests {
             &crate::ComptimeEnvPolicy {
                 allow_credentials: true,
                 allowed: Vec::new(),
+                strict: false,
             },
         );
         assert!(!diags.has_errors(), "{:?}", diags.errors());

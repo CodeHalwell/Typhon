@@ -59,6 +59,7 @@ external-args = []          # extra flags forwarded verbatim to the external che
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
 allow = []                   # credential-named variables comptime env() may read
+strict = false               # true: comptime env() reads ONLY names in allow / required
 
 # Inline dependency management — synced with `tyc add` / `tyc remove` / `tyc sync`,
 # which write a generated `pyproject.toml` and shell out to `uv`.
@@ -174,6 +175,7 @@ auto-parallel = false       # …but this explicit entry keeps auto-parallel off
 |-----|------|-------------|
 | `required` | list of strings | Environment variables that **must** resolve at build time. Any `comptime env()` lookup on a missing required variable fails the build. |
 | `allow` | list of strings | Credential-named variables that `comptime env()` may read. By default a variable whose name marks it as a credential (`API_KEY`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`; an ambiguous name such as `STRIPE_KEY` when its value looks like one) is refused with `tyc::comptime`: a comptime value is written into the build output, and `comptime` also runs for `tyc check` and in the editor, so a project you have only cloned could otherwise have your credentials inlined into an artifact or a log. Listing a name here (or under `required`) is the project saying, in a file you can read, that it bakes that value in. Ordinary variables (`PORT`, `BUILD_TAG`, `FEATURE_X`, `TOKEN_LIMIT`) need no entry. |
+| `strict` | bool | Default `false`. When `true`, `comptime env()` may read *only* the variables listed under `allow` and `required`; any other name — credential-shaped or not — fails the build with `tyc::comptime`. The default credential check is a name heuristic; this is the guarantee: a build depends on exactly the variables `typhon.toml` names. |
 
 ### `[checker]`
 

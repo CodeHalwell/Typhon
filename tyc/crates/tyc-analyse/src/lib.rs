@@ -1455,13 +1455,28 @@ pub struct ComptimeEnvPolicy {
     /// `[env] allow` plus `[env] required`: names readable whatever they
     /// look like.
     pub allowed: Vec<String>,
+    /// `[env] strict = true`: *only* the names in `allowed` are readable.
+    /// The credential check above is a name heuristic; this is the
+    /// allow-list for projects that want the guarantee — a build then
+    /// depends on exactly the variables its `typhon.toml` names.
+    pub strict: bool,
 }
 
 impl ComptimeEnvPolicy {
     /// Why reading `name` (currently holding `value`, if set) is refused,
     /// or `None` when it is allowed. The value never appears in the message.
     fn refusal(&self, name: &str, value: Option<&str>) -> Option<String> {
-        if self.allow_credentials || self.allowed.iter().any(|a| a == name) {
+        if self.allowed.iter().any(|a| a == name) {
+            return None;
+        }
+        if self.strict {
+            return Some(format!(
+                "comptime env() may not read '{name}': `[env] strict = true` limits build-time \
+                 reads to the variables listed under `[env] allow` and `[env] required` in \
+                 typhon.toml"
+            ));
+        }
+        if self.allow_credentials {
             return None;
         }
         let credential = match secrets::secret_name_strength(name)? {
@@ -3728,10 +3743,12 @@ comptime def grow(s: str, n: int) -> str:
         let listed = ComptimeEnvPolicy {
             allow_credentials: false,
             allowed: vec!["TYPHON_T_API_TOKEN".to_owned()],
+            strict: false,
         };
         let blanket = ComptimeEnvPolicy {
             allow_credentials: true,
             allowed: Vec::new(),
+            strict: false,
         };
         for policy in [&listed, &blanket] {
             let (values, diags) = eval_with_policy(src, policy);
@@ -3739,6 +3756,32 @@ comptime def grow(s: str, n: int) -> str:
             assert!(matches!(values.get("T"), Some(ComptimeValue::Str(s)) if s == "abc"));
         }
         std::env::remove_var("TYPHON_T_API_TOKEN");
+    }
+
+    /// `[env] strict`: only listed names, whatever they look like.
+    #[test]
+    fn comptime_env_strict_reads_only_listed_variables() {
+        let _guard = lock_env();
+        std::env::set_var("TYPHON_T_STRICT_PORT", "8080");
+        std::env::set_var("TYPHON_T_STRICT_HOME", "/home/someone");
+        let policy = ComptimeEnvPolicy {
+            allow_credentials: true,
+            allowed: vec!["TYPHON_T_STRICT_PORT".to_owned()],
+            strict: true,
+        };
+        let (values, diags) = eval_with_policy(
+            "comptime let PORT: int = int(env(\"TYPHON_T_STRICT_PORT\"))\n",
+            &policy,
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(8080))));
+        let (values, diags) = eval_with_policy(
+            "comptime let WHO: str = env(\"TYPHON_T_STRICT_HOME\", \"\")\n",
+            &policy,
+        );
+        assert!(diags.has_errors() && values.is_empty());
+        std::env::remove_var("TYPHON_T_STRICT_PORT");
+        std::env::remove_var("TYPHON_T_STRICT_HOME");
     }
 
     /// Ordinary configuration is unaffected by the default policy.

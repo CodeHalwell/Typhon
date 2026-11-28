@@ -39,7 +39,9 @@ i.e. as code you are about to run:
   lists it under `[env] allow` / `[env] required`, so a cloned project cannot
   inline your credentials without saying so in a file you can read. That
   check is a name heuristic, not a guarantee: any other variable (`HOME`,
-  `USER`, an oddly named secret) is still readable. Do not place secrets in
+  `USER`, an oddly named secret) is still readable — unless the project sets
+  `[env] strict = true`, which limits build-time reads to exactly the
+  variables it lists. Do not place secrets in
   `comptime let`; read them at runtime via `os.environ[...]`.
 
 None of this is unusual for a language toolchain (it mirrors `pip install` and

@@ -1405,6 +1405,7 @@ external-args = []               # extra flags forwarded verbatim to the externa
 [env]
 required = ["DATABASE_URL"]      # comptime env() lookups that must resolve at build
 allow = []                       # credential-named variables comptime env() may read (required ones are allowed too)
+strict = false                   # true: comptime env() may read ONLY names in allow / required
 
 [dependencies]
 requests = ">=2.31"
