@@ -141,6 +141,10 @@ release pipeline and the installers. No language change.
   policy on the thread that checks it; VM `re.sub(count=…)` /
   `re.split(maxsplit=…)` stop matching at the limit, and many matches over
   one haystack no longer re-scan it for newlines.
+- VM: `bytes.split` / `bytes.rsplit` honour `maxsplit` (it was ignored); a
+  bounded `split` of a very large string is no longer refused with
+  `MemoryError`; `SpooledTemporaryFile` in text mode enforces its encoding
+  before rollover and keeps the cursor in the right place after it.
 - `deny.toml` treats a yanked crate as an error.
 
 ### Release pipeline and packaging

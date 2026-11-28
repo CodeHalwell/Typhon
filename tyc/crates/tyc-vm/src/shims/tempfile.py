@@ -330,13 +330,25 @@ class SpooledTemporaryFile:
             self.rollover()
         return self._file.truncate(size)
 
+    def _validate(self, s):
+        # The in-memory buffer holds text as-is; the configured encoding
+        # only applied once the spool rolled over to a real file, so
+        # `SpooledTemporaryFile(mode="w+", encoding="ascii").write("é")`
+        # succeeded here and raises `UnicodeEncodeError` in CPython.
+        if not self._rolled and "b" not in self._mode and self._encoding is not None and isinstance(s, str):
+            s.encode(self._encoding, self._errors or "strict")
+
     def write(self, s):
+        self._validate(s)
         rv = self._file.write(s)
         self._check()
         return rv
 
     def writelines(self, iterable):
-        rv = self._file.writelines(iterable)
+        lines = list(iterable)
+        for line in lines:
+            self._validate(line)
+        rv = self._file.writelines(lines)
         self._check()
         return rv
 

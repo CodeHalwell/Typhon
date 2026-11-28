@@ -12109,6 +12109,115 @@ fn keep_unchanged_str(s: &Rc<String>, name: &str, args: &[Value], out: Value) ->
     }
 }
 
+/// The most separators a `split` / `rsplit` call can act on: its `maxsplit`
+/// argument when that is a non-negative integer, otherwise no bound. Used to
+/// size the memory check for the result — counting every separator in the
+/// receiver made `("a " * 9_000_000).split(None, 1)` raise `MemoryError` for
+/// a result of two strings.
+/// `bytes.split` / `bytes.rsplit` with CPython's `maxsplit` semantics.
+///
+/// With a separator, at most `maxsplit` splits are made from the left
+/// (`rsplit`: from the right) and the rest is one piece. Without one, runs of
+/// ASCII whitespace separate the pieces and empty pieces are dropped; once
+/// the bound is reached the remainder is kept whole, minus the whitespace on
+/// the side the scan came from.
+fn split_bytes_bounded(
+    b: &[u8],
+    sep: Option<&[u8]>,
+    maxsplit: Option<usize>,
+    from_right: bool,
+) -> Vec<Vec<u8>> {
+    let limit = maxsplit.unwrap_or(usize::MAX);
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match (sep, from_right) {
+        (Some(sep), false) => {
+            let mut start = 0;
+            while parts.len() < limit {
+                let Some(at) = find_bytes(&b[start..], sep) else {
+                    break;
+                };
+                parts.push(b[start..start + at].to_vec());
+                start += at + sep.len();
+            }
+            parts.push(b[start..].to_vec());
+        }
+        (Some(sep), true) => {
+            let mut end = b.len();
+            while parts.len() < limit {
+                let Some(at) = rfind_bytes(&b[..end], sep) else {
+                    break;
+                };
+                parts.push(b[at + sep.len()..end].to_vec());
+                end = at;
+            }
+            parts.push(b[..end].to_vec());
+            parts.reverse();
+        }
+        (None, false) => {
+            let mut i = 0;
+            loop {
+                while i < b.len() && ascii_is_space(b[i]) {
+                    i += 1;
+                }
+                if i == b.len() {
+                    break;
+                }
+                if parts.len() == limit {
+                    parts.push(b[i..].to_vec());
+                    break;
+                }
+                let start = i;
+                while i < b.len() && !ascii_is_space(b[i]) {
+                    i += 1;
+                }
+                parts.push(b[start..i].to_vec());
+            }
+        }
+        (None, true) => {
+            let mut i = b.len();
+            loop {
+                while i > 0 && ascii_is_space(b[i - 1]) {
+                    i -= 1;
+                }
+                if i == 0 {
+                    break;
+                }
+                if parts.len() == limit {
+                    parts.push(b[..i].to_vec());
+                    break;
+                }
+                let end = i;
+                while i > 0 && !ascii_is_space(b[i - 1]) {
+                    i -= 1;
+                }
+                parts.push(b[i..end].to_vec());
+            }
+            parts.reverse();
+        }
+    }
+    parts
+}
+
+/// First index of `needle` (non-empty) in `hay`.
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Last index of `needle` (non-empty) in `hay`.
+fn rfind_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+fn split_piece_cap(name: &str, args: &[Value]) -> usize {
+    if !matches!(name, "split" | "rsplit") {
+        return usize::MAX;
+    }
+    match args.get(1) {
+        Some(Value::Int(n)) => n.to_usize().unwrap_or(usize::MAX),
+        _ => usize::MAX,
+    }
+}
+
 fn str_method(
     interp: &mut Interpreter,
     s: &Rc<String>,
@@ -12116,10 +12225,15 @@ fn str_method(
     args: &[Value],
     _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
+    // A bounded split makes at most `maxsplit + 1` pieces, however many
+    // separators the string holds: `big.split(None, 1)` needs room for two.
+    let piece_cap = split_piece_cap(name, args);
     crate::limits::ensure_text_result(s.len(), name, || match args.first() {
-        Some(Value::Str(sep)) if !sep.is_empty() => s.matches(sep.as_str()).count() + 1,
+        Some(Value::Str(sep)) if !sep.is_empty() => {
+            s.matches(sep.as_str()).take(piece_cap).count() + 1
+        }
         _ if name == "splitlines" => s.lines().count() + 1,
-        _ => s.split_whitespace().count() + 1,
+        _ => s.split_whitespace().take(piece_cap).count() + 1,
     })?;
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
@@ -12985,10 +13099,13 @@ fn bytes_method(
     args: &[Value],
     _kwargs: &HashMap<String, Value>,
 ) -> Result<Value, Unwind> {
+    let piece_cap = split_piece_cap(name, args);
     crate::limits::ensure_text_result(b.len(), name, || match args.first() {
-        Some(Value::Bytes(sep)) if sep.len() == 1 => b.iter().filter(|c| **c == sep[0]).count() + 1,
+        Some(Value::Bytes(sep)) if sep.len() == 1 => {
+            b.iter().filter(|c| **c == sep[0]).take(piece_cap).count() + 1
+        }
         // An upper bound: no split yields more pieces than bytes.
-        _ => b.len() / 2 + 1,
+        _ => (b.len() / 2).min(piece_cap) + 1,
     })?;
     Ok(match name {
         // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
@@ -13320,22 +13437,23 @@ fn bytes_method(
         // `.split(sep=None)` — on whitespace when no separator, else on the
         // separator bytes. Returns a list of bytes.
         "split" | "rsplit" => {
-            let parts: Vec<Vec<u8>> = match args.first() {
-                None | Some(Value::None) => {
-                    // Split on ASCII whitespace runs, dropping empties.
-                    b.split(|c| ascii_is_space(*c))
-                        .filter(|p| !p.is_empty())
-                        .map(|p| p.to_vec())
-                        .collect()
-                }
+            let sep = match args.first() {
+                None | Some(Value::None) => None,
                 Some(sep) => {
                     let sep = bytes_arg(sep)?;
                     if sep.is_empty() {
                         return Err(value_error("empty separator"));
                     }
-                    split_bytes(b, &sep)
+                    Some(sep)
                 }
             };
+            // `maxsplit`: a non-negative count bounds the splits; a negative
+            // one (the default, -1) means no bound. It was ignored.
+            let maxsplit = match args.get(1) {
+                Some(Value::Int(n)) => n.to_usize(),
+                _ => None,
+            };
+            let parts = split_bytes_bounded(b, sep.as_deref(), maxsplit, name == "rsplit");
             Value::List(Rc::new(RefCell::new(
                 parts
                     .into_iter()
@@ -13611,17 +13729,6 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return Some(0);
     }
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-fn split_bytes(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut rest = hay;
-    while let Some(i) = find_subslice(rest, sep) {
-        out.push(rest[..i].to_vec());
-        rest = &rest[i + sep.len()..];
-    }
-    out.push(rest.to_vec());
-    out
 }
 
 fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8], max: usize) -> Vec<u8> {

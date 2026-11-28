@@ -32,6 +32,28 @@ const BIG_STACK: usize = 256 * 1024 * 1024;
 
 // ── 1. Allocation failure ────────────────────────────────────────────────
 
+/// The memory check for a split result is sized by `maxsplit`, not by the
+/// number of separators in the receiver.
+#[test]
+fn bounded_splits_are_not_refused_for_memory() {
+    assert_matches_cpython(
+        "bounded_splits_are_not_refused_for_memory",
+        r#"big = "a " * (9 * 1024 * 1024)
+parts = big.split(None, 1)
+show(len(parts), len(parts[0]), len(parts[1]))
+parts = big.rsplit(" ", 2)
+show(len(parts), len(parts[-1]))
+raw = b"a " * (9 * 1024 * 1024)
+show(len(raw.split(b" ", 1)), len(raw.split(None, 3)))
+show("a b c".split(None, 0), "a b c".split(" ", -1))
+for b in [b" a  b  c ", b"a,b,,c", b"", b"   ", b"abc"]:
+    for n in [-1, 0, 1, 2, 5]:
+        show(b.split(None, n), b.rsplit(None, n), b.split(b",", n), b.rsplit(b",", n))
+show(b"a--b--c".split(b"--", 1), b"a--b--c".rsplit(b"--", 1), b"a--b--c".split(b"--"))
+"#,
+    );
+}
+
 #[test]
 fn unallocatable_results_raise_memory_error_like_cpython() {
     // Each of these aborted the process ("memory allocation of N bytes
@@ -310,6 +332,16 @@ with tempfile.SpooledTemporaryFile(max_size=1, mode="w+", encoding="utf-8") as s
     s.write("X")
     s.seek(0)
     show(s._rolled, s.read())
+with tempfile.SpooledTemporaryFile(mode="w+", encoding="ascii") as s:
+    # The encoding applies before rollover too.
+    try:
+        s.write("\u00e9")
+        show("accepted")
+    except UnicodeEncodeError as e:
+        show("UnicodeEncodeError", s._rolled)
+    s.write("ok")
+    s.seek(0)
+    show(s.read())
 shutil.rmtree(d)
 show("cleaned", not os.path.exists(d))
 "#,
