@@ -23,6 +23,6 @@ jobs:
           persist-credentials: false
 
       - name: Dependency audit (advisories + licences + bans)
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
         with:
           manifest-path: tyc/Cargo.toml
