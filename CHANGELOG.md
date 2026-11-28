@@ -119,6 +119,13 @@ release pipeline and the installers. No language change.
   `os.system` returns the raw wait status; the pydantic shim honours
   `model_config`'s `extra`; under `--no-fallback`, `re`'s `$` and
   `fullmatch` follow CPython.
+- More front-end bounds from the same pass: blocks nest at most 500 deep
+  (CPython stops at 100); a line whose `?` operators would take quadratic
+  work to lower is a `tyc::parse` error; scopes are copy-on-write and the
+  resolver looks names up by hash, so a function of 10,000 `let` lines checks
+  in about 2 s instead of 7 (20,000: 7 s instead of 41); a diagnostic on a
+  line longer than 8 KB names its line and column in words instead of
+  printing the line.
 - `deny.toml` treats a yanked crate as an error.
 
 ### Release pipeline and packaging
